@@ -33,12 +33,14 @@ _Every choice below is justified against one requirement: the system must stay c
 | `products` | Catalog from the supplied JSON | `sku` UNIQUE |
 | `orders` | Order and its lifecycle | `client_request_id` UNIQUE |
 | `payment_events` | Durable webhook inbox | `event_id` PRIMARY KEY; **no FK** to `orders` |
-| `issuance_attempts` | One row per supplier call | `request_id` UNIQUE |
-| `deliveries` | The issued key bound to an order | `order_id` UNIQUE, `request_id` UNIQUE |
+| `issuance_attempts` | One row per supplier call | `request_id` UNIQUE; FK to `orders` |
+| `deliveries` | The issued key bound to an order | `order_id` UNIQUE, `request_id` UNIQUE; FK to `orders` |
 | `promo_codes` | Supplied promo definitions | `code` UNIQUE, `used_count <= max_uses` CHECK |
 | `promo_redemptions` | Which order used which promo | UNIQUE (`promo_id`, `order_id`) |
 | `supplier_keys` | The fifty keys — **supplier-side** inventory | `code` UNIQUE, `claimed_by_request_id` UNIQUE |
 | `supplier_requests` | Supplier's own idempotency ledger | `request_id` UNIQUE |
+
+**The foreign-key asymmetry is deliberate and load-bearing.** `deliveries.order_id` and `issuance_attempts.order_id` reference `orders`; `payment_events.order_id` does not. The rule is *who can write this row before the order exists*: a delivery or an attempt can only ever be written by code that has already read the order, so a dangling reference there is a bug worth refusing. A payment event can legitimately arrive first — the client's `POST /orders` and the provider's webhook are separate connections in separate processes with no ordering guarantee — so refusing it would turn a millisecond race into a `500`, and a `5xx` is how you ask a payment provider to redeliver. Both the schema and the migration carry a boxed comment saying so, and the two FKs ten lines away are what stop the omission reading as forgetfulness.
 
 The last two tables belong to the simulated suppliers, not to the shop. Keeping them separate is deliberate: it forces our code to earn its guarantees over an unreliable network boundary instead of quietly sharing state with the thing it is supposed to distrust.
 
@@ -215,19 +217,39 @@ RETURNING *;
 
 ## 7. Testing & Verification
 
-- **Race and recovery scripts:** standalone Node scripts (`pnpm race:webhooks`, `race:same-event`, `race:create-order`, `race:promo`, `recover:out-of-stock`, `recover:timeout`, `webhook:before-order`), each firing concurrent requests and asserting the invariant it defends. They take a base URL, so the identical script runs against localhost and against the deployed system.
-- **Assertions query the database directly** — one delivery row, one claimed key, one promo redemption — because an API response can look correct while the underlying state is wrong.
-- **Unit and integration tests:** Vitest against a real Postgres instance. Transitions and the supplier retry policy are tested directly; nothing about concurrency is tested against a mock.
-- **Browser tests:** Playwright for the five required interactions and the purchase flow through to the delivered key.
-- **Coverage target:** the five acceptance scenarios each map to a named script. That mapping is the deliverable, and it lives in the README.
+- **Concurrency proofs must run across separate API processes.** This is the single most important rule in this section, and it was learned by measurement rather than reasoning. `packages/db` sets the connection pool to `max: 1` per instance — the serverless shape — so within one process a transaction holds the only connection for the whole of `BEGIN … COMMIT` and a second concurrent claim queues **in Node, before a byte reaches Postgres**. `FOR UPDATE SKIP LOCKED` never skips, because nothing else holds a row lock when the subquery looks. The consequence: a claim written with **no locking at all** behaves identically to the correct one. Measured, with the key claim weakened to an unlocked `SELECT`-then-`UPDATE` and twenty distinct request ids:
+
+  | Harness | Codes handed out | Distinct | Errors |
+  | --- | --- | --- | --- |
+  | 1 process, pool of `max: 1` | 20 | **20** | 0 |
+  | 4 processes, pool of `max: 1` each | 20 | **9** | 0 |
+
+  The same broken code is flawless in one process and hands eleven customers a key somebody else also holds in four — with nothing raised or logged in either case. A single-instance run measures the connection pool, not the constraint. **Raising the pool size in tests is not the fix**: `max: 1` is the production shape, and a test that changes the configuration under test proves some other system correct.
+
+- **RED validation is a property of the harness, not only of the code under test.** Weakening the mechanism a concurrency test defends must make that test fail. If it does not, the harness is serialising and the test is worthless — and no number of green runs will say so. A race test that cannot fail is worse than no test: it is a false statement about the system that grows more convincing every time it passes. Record the RED output; a count that varies between runs (9, then 12, of 20) is the signature of a genuine race.
+
+- **Assertions query the database directly** as well as reading the API response — one delivery row, one claimed key, one promo redemption. The two disagree in *both* directions, and only asserting both distinguishes them: a mis-classified driver error once returned `500` to nineteen of twenty callers while the database stayed perfectly correct, and a broken delivered-key gate once returned a self-consistent `null` to every read while the key sat committed in `deliveries`. Response-only would call the first a correctness failure; database-only would call the second a pass.
+
+- **Test layout:** Vitest, configured in `apps/api/vitest.config.ts`, with tests under `apps/api/test/`:
+  - `test/concurrency/` — the race proofs. `key-claim-race.test.ts` plus a `support/` harness that spawns real compiled API processes on dedicated ports, waits on `/api/health`, tears them down on `SIGTERM`, and samples `pg_stat_activity` for distinct backend pids as a smoke check that the processes genuinely overlapped.
+  - `test/acceptance/` — feature-level tests mapping the functional spec's criteria, run against one API process, since nothing there needs overlapping requests.
+  - Both assert the seeded baseline before and after, and clean up what they wrote, so they are re-runnable with no manual reset. Restoring `claimed_by_request_id = null` is a thing **only a test may do** — production has no un-claim, by design.
+  - Reviewer commands: `pnpm test` (both suites), `pnpm test:concurrency`, `pnpm test:acceptance`.
+
+- **Adversarial scripts taking a base URL** (`race:webhooks` for fifty webhooks on one order, `race:same-event`, `race:create-order`, `race:promo`, `recover:out-of-stock`, `recover:timeout`, `webhook:before-order`) arrive with the phases that own their scenarios. Written against a configurable base URL so the identical script runs locally and against the deployed system — which is the strongest form of the claim, since serverless instances share neither kernel nor clock.
+
+- **Browser tests:** deliberately none as of Phase 1. Every DOM-visible fact in the spec's criteria is a branch-free rendering of data the integration tests already assert at the API and database boundary, so a browser-test project would add infrastructure without adding coverage. What would change that judgement: a conditional in the rendering path that *derives* a fact rather than mirroring one — a client-computed discount, a status label with a `default` branch. Phase 4 rebuilds the UI and is the place to revisit it.
+
+- **Coverage target:** the five acceptance scenarios each map to a named, runnable test or script. That mapping is the deliverable, and it lives in the README.
 
 ---
 
 ## 8. Observability & Configuration
 
-- **Logging:** Pino, structured JSON, with `order_id`, `event_id` and `request_id` on every line in the payment and issuance paths. _Alternative: console logging — adequate, but correlation ids are what make a race reproduction readable after the fact._
+- **Logging:** NestJS's built-in `Logger` with structured object payloads carrying `order_id`, `event_id` and `request_id` on every line in the payment and issuance paths. _Pino was specified here originally and deliberately not adopted: adding a logging dependency is an infrastructure decision that no Phase 1 task owned, and Nest's logger already gives the correlation ids, which are the part that matters — they are what make a race reproduction readable after the fact. Revisit if structured log shipping is ever needed._
 - **Request correlation:** an incoming request id is generated or accepted, then carried through logs and into supplier calls.
 - **Error handling:** typed domain errors distinguishing *definite failure* from *unknown outcome*, because that distinction is what drives the retry policy rather than being merely descriptive.
+- **Configuration is validated at startup, not at first use** (`apps/api/src/config/`). A shop that boots without knowing where its supplier lives looks healthy and cannot deliver anything, so a missing or malformed value stops the process rather than surfacing as a `500` on the first paid order. Two traps this catches that a naive read does not: `SUPPLIER_A_URL=localhost:3000/…` — a forgotten `http://` — **parses cleanly** as scheme `localhost:` and would fail only inside `fetch`; and a timeout of `2e3`, `0x7d0` or `2000ms` is silently accepted by `Number()`. One caveat worth knowing: this is right *by consequence, not by construction* — the reads sit in constructors, and constructors are startup-time only because Nest instantiates default-scoped providers eagerly. A `Scope.REQUEST` would relocate the check to first use with no test noticing. On Vercel, boot **is** the first invocation, so this guarantee is load-bearing locally and advisory in deployment.
 - **Metrics and alerting:** out of scope. The admin panel's paid-but-undelivered list is the operational surface.
 
 ---
