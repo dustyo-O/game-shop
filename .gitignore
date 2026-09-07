@@ -1,0 +1,32 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+.vite/
+
+# TypeScript incremental build cache
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Deployment
+.vercel/
+
+# Test / tooling output
+coverage/
+playwright-report/
+test-results/
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# OS
+.DS_Store
+Thumbs.db

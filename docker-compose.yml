@@ -1,0 +1,48 @@
+# Local development database.
+#
+# Postgres 16 — the same major version Neon runs in production, so
+# `FOR UPDATE SKIP LOCKED`, partial unique indexes and `ON CONFLICT ... RETURNING`
+# behave identically in development and in the deployed system.
+#
+# Only the database is containerised. The API and the web app run on the host
+# through `pnpm dev`, because they are deployed to Vercel as a function and a
+# static build rather than as containers — keeping them out of Compose means the
+# local stack exercises the same code path the deployment does.
+#
+# Values come from the environment (repo-root `.env`, which Compose reads
+# automatically) and fall back to the defaults below, which match `.env.example`.
+
+name: game-shop
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: game-shop-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-game_shop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-game_shop}
+      POSTGRES_DB: ${POSTGRES_DB:-game_shop}
+      # Deterministic encoding and collation, so ordering and unique comparisons
+      # do not depend on the host's locale.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    ports:
+      # 5433 on the host by default: 5432 is routinely taken by another local
+      # Postgres. Override with POSTGRES_PORT; the container port never changes.
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      # Named volume, so `docker compose down` (without -v) keeps the data and a
+      # restart comes back with the migrated, seeded database intact.
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `$$` escapes the substitution so the container's own environment supplies
+      # the credentials at check time rather than the host's.
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
+volumes:
+  postgres-data:
+    name: game-shop-postgres-data

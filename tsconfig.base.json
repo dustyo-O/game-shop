@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2023",
+    "lib": ["ES2023"],
+
+    // Node 22 ESM. Packages that are bundled instead of run by Node
+    // (apps/web) override module/moduleResolution locally.
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+
+    // Non-negotiable: never disable individual strict flags.
+    "strict": true,
+
+    // Additional safety flags. `exactOptionalPropertyTypes` is deliberately
+    // left off — it fights Drizzle/Nest DTO shapes without buying correctness
+    // that the database constraints do not already guarantee.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitOverride": true,
+
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "skipLibCheck": true
+  }
+}

@@ -1,0 +1,38 @@
+{
+  "name": "@game-shop/api",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/main.js",
+    "dev": "nest start --watch",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "test:concurrency": "vitest run test/concurrency/key-claim-race.test.ts",
+    "test:acceptance": "vitest run test/acceptance/purchase-and-key-delivery.test.ts",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@game-shop/contracts": "workspace:*",
+    "@game-shop/db": "workspace:*",
+    "@nestjs/common": "^11.1.6",
+    "@nestjs/core": "^11.1.6",
+    "@nestjs/platform-express": "^11.1.6",
+    "drizzle-orm": "^0.45.2",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2",
+    "ulid": "3.0.2"
+  },
+  "devDependencies": {
+    "@nestjs/cli": "^11.0.10",
+    "@nestjs/schematics": "^11.0.8",
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.18.8",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.0",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.0"
+  }
+}

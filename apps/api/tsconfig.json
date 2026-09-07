@@ -1,0 +1,18 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+
+    // NestJS dependency injection reads parameter types from the metadata
+    // TypeScript emits for decorated classes.
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    // With target >= ES2022 this would default to true, which turns declared
+    // class fields into `defineProperty` calls that overwrite values Nest's
+    // decorators set. Keep the assignment semantics Nest expects.
+    "useDefineForClassFields": false
+  },
+  "include": ["src", "test"]
+}

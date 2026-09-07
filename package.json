@@ -1,0 +1,35 @@
+{
+  "name": "game-shop",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.18.0",
+  "engines": {
+    "node": ">=22.18"
+  },
+  "scripts": {
+    "prepare": "pnpm run build:packages",
+    "build": "pnpm -r run build",
+    "build:packages": "pnpm --filter \"./packages/**\" run build",
+    "typecheck": "pnpm run build:packages && pnpm run typecheck:scripts && pnpm -r run typecheck",
+    "typecheck:scripts": "tsc -p tsconfig.scripts.json",
+    "dev": "node scripts/with-env.ts pnpm -r --parallel run dev",
+    "dev:stack": "pnpm run db:setup && pnpm run dev",
+    "db:up": "node scripts/with-env.ts docker compose up -d --wait",
+    "db:down": "node scripts/with-env.ts docker compose down",
+    "db:wipe": "node scripts/with-env.ts docker compose down -v --remove-orphans",
+    "db:reset": "pnpm run db:wipe && pnpm run db:setup",
+    "db:setup": "pnpm run db:up && pnpm run db:migrate && pnpm run db:seed",
+    "db:migrate": "node scripts/with-env.ts pnpm --filter @game-shop/db run migrate",
+    "db:seed": "node scripts/with-env.ts pnpm --filter @game-shop/db run seed",
+    "db:psql": "node scripts/with-env.ts docker compose exec postgres sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"'",
+    "clean": "pnpm -r run clean",
+    "test:concurrency": "node scripts/with-env.ts pnpm --filter @game-shop/api run test:concurrency",
+    "test:acceptance": "node scripts/with-env.ts pnpm --filter @game-shop/api run test:acceptance",
+    "test": "node scripts/with-env.ts pnpm --filter @game-shop/api run test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.8",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@game-shop/web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "pnpm run typecheck && vite build",
+    "dev": "vite",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "clean": "rm -rf dist"
+  },
+  "dependencies": {
+    "@game-shop/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.8",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9"
+  }
+}

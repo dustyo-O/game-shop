@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+
+    // Vite bundles this app, so bundler resolution applies rather than
+    // Node's. Node's `types` are deliberately absent: browser code must not
+    // reach for `process` or `node:` builtins.
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": []
+  },
+  "include": ["src"]
+}

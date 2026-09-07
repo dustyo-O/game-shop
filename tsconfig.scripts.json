@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    // Root-level operational scripts (the env wrapper now, the race and
+    // recovery scripts later). Node runs these straight from source through
+    // type stripping, so nothing is emitted — tsc is here purely to typecheck
+    // them under the same strict settings as the rest of the workspace.
+    "noEmit": true,
+    "types": ["node"],
+
+    // Type stripping erases annotations without evaluating types, so anything
+    // that would need real emit — enums, parameter properties, namespaces — is
+    // rejected here rather than at run time.
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true,
+    "allowImportingTsExtensions": true
+  },
+  "include": ["scripts"]
+}

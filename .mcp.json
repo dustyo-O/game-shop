@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "awos-recruitment": {
+      "type": "http",
+      "url": "https://recruitment.awos.provectus.pro/mcp"
+    },
+    "figma": {
+      "type": "http",
+      "url": "https://mcp.figma.com/mcp"
+    },
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "-y",
+        "@playwright/mcp@latest"
+      ]
+    }
+  }
+}

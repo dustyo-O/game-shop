@@ -1,0 +1,181 @@
+/**
+ * The whole stylesheet, and it is meant to stay this small.
+ *
+ * Phase 1's pages are explicitly plain (functional spec §3); Phase 4 replaces
+ * the storefront with the one built from the design and brings its own styles.
+ * Everything here exists only so twelve rows are legible — spacing, a readable
+ * measure, and a visible boundary between items. No colours beyond the
+ * browser's, no fonts to download, no layout that would have to be undone.
+ *
+ * The order page's rules are plainer still, and permanently: Phase 4 redresses
+ * the storefront and leaves the status page alone, because
+ * technical-considerations §2.6 gives it a working view and nothing more.
+ */
+
+body {
+  margin: 0;
+  font-family: system-ui, sans-serif;
+  line-height: 1.5;
+}
+
+.catalog {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 3rem;
+}
+
+.catalog__title {
+  font-size: 1.5rem;
+}
+
+.catalog__status {
+  padding: 1rem 0;
+}
+
+.catalog__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.product-card {
+  padding: 0.75rem 0;
+  border-top: 1px solid #ddd;
+}
+
+.product-card__name {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.product-card__price {
+  margin: 0.25rem 0 0.5rem;
+}
+
+.product-card__buy {
+  font: inherit;
+  padding: 0.4rem 1rem;
+  cursor: pointer;
+}
+
+/* While the order is being created. The control is disabled for the length of
+   the request (see features/buy-product), and this is the only sign a shopper
+   would otherwise get that pressing it did something. */
+.product-card__buy:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* A failed purchase, next to the control that failed. Red because it is the one
+   place on this page where something went wrong, and the shopper has to find it
+   among twelve otherwise identical rows. */
+.buy-product__error {
+  margin: 0.5rem 0 0;
+  color: #b00020;
+}
+
+/* --- The order page at /order/:id ---------------------------------------- */
+
+.order {
+  max-width: 40rem;
+  margin: 0 auto;
+  padding: 1.5rem 1rem 3rem;
+}
+
+.order__title {
+  font-size: 1.5rem;
+}
+
+.order__status {
+  padding: 1rem 0;
+}
+
+/* Label above value, so a long Russian product name is never squeezed into a
+   column. Margins reset because a <dl>'s defaults indent the value away from
+   the label it belongs to. */
+.order-details {
+  margin: 0;
+}
+
+.order-details__label {
+  margin-top: 1rem;
+  color: #555;
+  font-size: 0.875rem;
+}
+
+.order-details__value {
+  margin: 0.125rem 0 0;
+}
+
+.order-details__value--status {
+  font-weight: 600;
+}
+
+/* The order id is a machine string among sentences — a monospace face keeps a
+   shopper reading it aloud to support from confusing 0 with O. */
+.order-details__value--id {
+  font-family: ui-monospace, monospace;
+}
+
+/* The key. Monospace for the same reason the order id is — this is a string a
+   shopper retypes into Steam, where I and l and 1 have to be told apart — and a
+   size up because it is the thing they came for. `user-select: all` makes one
+   click select the whole key rather than a word of it. */
+.order-details__value--code {
+  font-family: ui-monospace, monospace;
+  font-size: 1.125rem;
+  font-weight: 600;
+  user-select: all;
+}
+
+/* The connection notice, shown under an order that is already on screen while
+   the page keeps retrying. Grey rather than red: nothing was lost, and the page
+   recovers by itself. */
+.order__notice {
+  margin: 1.5rem 0 0;
+  color: #555;
+}
+
+/* The two payment controls, offered only while the order awaits payment
+   (features/simulate-payment). Laid out like the catalogue's «Купить» control
+   because they are the same kind of thing: a plain button a shopper presses. */
+.payment-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+}
+
+.payment-controls__button {
+  font: inherit;
+  padding: 0.4rem 1rem;
+  cursor: pointer;
+}
+
+/* Both controls are disabled for the length of the request, and this is the
+   only sign a shopper would otherwise get that pressing one did something. */
+.payment-controls__button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* A payment that could not be sent, under the controls that failed. Red, and on
+   its own line: `flex-basis: 100%` makes it wrap below both buttons rather than
+   squeezing in beside them. */
+.payment-controls__error {
+  flex-basis: 100%;
+  margin: 0.5rem 0 0;
+  color: #b00020;
+}
+
+/* What stands where the controls were once the answer is in. */
+.payment-controls__note {
+  margin: 1.5rem 0 0;
+}
+
+/* The failed note reads as the consequence of the «Оплата не прошла» status
+   above it, which is already the bold line on this page, so it is toned down
+   rather than competing with it. */
+.payment-controls__note--failed {
+  color: #555;
+}
