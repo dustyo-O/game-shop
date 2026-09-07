@@ -1,7 +1,7 @@
 # Technical Specification: Purchase and Key Delivery
 
 - **Functional Specification:** `context/spec/001-purchase-and-key-delivery/functional-spec.md`
-- **Status:** Draft
+- **Status:** Completed
 - **Author(s):** Alexander Shleyko
 
 ---

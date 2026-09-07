@@ -14,16 +14,16 @@ _Rough budget: 13–19 hours, with the phase estimates below summing to ~17. The
 
 _The spine. Everything downstream exists to make this pipeline unbreakable, so it is built first — plainly, with no cleverness and no styling._
 
-- [ ] **A Catalog to Buy From** _(~1h)_
-  - [ ] **Seeded Product Catalog:** Load the twelve supplied products (top-ups, keys, subscriptions, gift cards) so the storefront and the purchase flow have real data to work with, priced in RUB.
-  - [ ] **Seeded Key Pool:** Load the fifty supplied keys as issuable inventory, with the standing guarantee that one key can never reach two orders.
+- [x] **A Catalog to Buy From** _(~1h)_
+  - [x] **Seeded Product Catalog:** Load the twelve supplied products (top-ups, keys, subscriptions, gift cards) so the storefront and the purchase flow have real data to work with, priced in RUB.
+  - [x] **Seeded Key Pool:** Load the fifty supplied keys as issuable inventory, with the standing guarantee that one key can never reach two orders.
 
-- [ ] **The Purchase Pipeline** _(~2h)_
-  - [ ] **Order Creation:** A buyer clicks Купить on a product and gets an order awaiting payment. Working flow is required for one product only; the rest of the catalog may stay static.
-  - [ ] **Simulated Payment:** A button or endpoint marks a payment as succeeded or failed and emits a webhook matching the supplied contract — the same mechanism later used to drive the race checks.
-  - [ ] **Automatic Key Issuance:** A confirmed payment causes a key to be drawn from the pool and bound to the order, without human involvement.
-  - [ ] **Order Status Page:** The buyer watches the order move through its lifecycle and sees the delivered key at the end. Working view only; no design.
-  - [ ] **Throwaway UI Shell:** The minimum page needed to click Купить and reach the status page, so the pipeline is exercisable end-to-end before the real storefront exists.
+- [x] **The Purchase Pipeline** _(~2h)_
+  - [x] **Order Creation:** A buyer clicks Купить on a product and gets an order awaiting payment. Working flow is required for one product only; the rest of the catalog may stay static.
+  - [x] **Simulated Payment:** A button or endpoint marks a payment as succeeded or failed and emits a webhook matching the supplied contract — the same mechanism later used to drive the race checks.
+  - [x] **Automatic Key Issuance:** A confirmed payment causes a key to be drawn from the pool and bound to the order, without human involvement.
+  - [x] **Order Status Page:** The buyer watches the order move through its lifecycle and sees the delivered key at the end. Working view only; no design.
+  - [x] **Throwaway UI Shell:** The minimum page needed to click Купить and reach the status page, so the pipeline is exercisable end-to-end before the real storefront exists.
 
 _Concepts to walk away able to explain: the order lifecycle as a state machine, and why the issuance decision belongs to the server rather than the page._
 
