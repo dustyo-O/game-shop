@@ -35,11 +35,23 @@
  * ---------------------------------------------------------------------------
  * WHAT THIS DELIBERATELY DOES NOT DO
  * ---------------------------------------------------------------------------
- *   - **No `SELECT ... FOR UPDATE`.** The row lock is invariant I4 and belongs
- *     to the caller that needs it (Phase 2, `architecture.md` §3.1). The lock
- *     serialises workers; this guard makes the transition idempotent. They are
- *     different jobs, and a lock taken here would be held for exactly the
- *     duration of one statement, which is no lock at all.
+ *   - **No `SELECT ... FOR UPDATE`.** The row lock is the *other* half of
+ *     invariant I4 and it lives in `./order-lock.service.ts`, taken by the
+ *     caller that owns the transaction. The lock serialises workers; this guard
+ *     makes the transition idempotent. They are different jobs, and a lock taken
+ *     here would be held for exactly the duration of one statement — which is no
+ *     lock at all, since {@link OrderTransitionService.transition} opens no
+ *     transaction and {@link OrderTransitionService.transitionWithin} is handed
+ *     one whose boundaries it does not control.
+ *
+ *     So the pairing is a call-site pairing, and it reads the way §3.1 writes
+ *     it (`architecture.md`, I4):
+ *
+ *         await database.transaction(async (tx) => {
+ *           await lock.lockOrder(tx, orderId);                    // FOR UPDATE
+ *           return transitions.transitionWithin(tx, orderId, "beginIssuance");
+ *         });                                                     // guard
+ *
  *   - **No read-then-write.** Nothing reads the status and then decides. The
  *     `WHERE` clause is the decision, evaluated by Postgres against the row as
  *     it is at that instant, which is the only version of it anyone can trust.

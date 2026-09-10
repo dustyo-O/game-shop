@@ -64,16 +64,29 @@ export async function getJson(path: string, signal?: AbortSignal): Promise<unkno
  * format, not the shape. `JSON.stringify` of a request object is the whole of
  * what it adds over `fetch`.
  *
- * **No `Idempotency-Key` header.** Phase 2 adds one here, paired with
- * `orders.client_request_id UNIQUE`, and that pair — not anything in this file
- * and not any state held in the page — is what will make a repeated create
- * return the original order instead of a second one. Named now so the omission
- * is a deferral on the roadmap rather than something nobody noticed.
+ * **`headers` is how `Idempotency-Key` reaches the wire**, and it is the whole
+ * of what this file knows about it. Phase 2's guarantee — a repeated create
+ * returning the original order rather than a second one — is made by
+ * `orders.client_request_id UNIQUE` at the write, and the *value* of the key is
+ * decided by the feature that owns the shopper's purchase intent
+ * (`features/buy-product/lib/purchase-intent.ts`). Neither decision belongs in
+ * `shared/`: a transport that minted or remembered a key would be a transport
+ * with an opinion about what two requests mean, and it would hold that opinion
+ * for every caller of every endpoint.
+ *
+ * The extras are spread **after** the two defaults, so a caller can replace
+ * `Accept` if it ever needs to, and are typed as a plain record because that is
+ * what every call site has: `Headers` and `[string, string][]` are the other two
+ * shapes `fetch` accepts and nothing here produces either.
  */
-export async function postJson(path: string, body: unknown): Promise<unknown> {
+export async function postJson(
+  path: string,
+  body: unknown,
+  headers: Readonly<Record<string, string>> = {},
+): Promise<unknown> {
   const response = await fetch(path, {
     method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
     body: JSON.stringify(body),
   });
 

@@ -221,7 +221,7 @@ Exact SQL: `architecture.md` §3.1.
 | I1 | One client request → one order | `client_request_id` UNIQUE; `INSERT … ON CONFLICT DO NOTHING`, then read the winner back | A double-click makes two orders and two charges |
 | I2 | One payment event applied once | `event_id` PRIMARY KEY; winning the insert *is* "first sight", losing it *is* "duplicate" | A redelivered webhook re-runs issuance |
 | I3 | One order → at most one delivery | `deliveries.order_id` UNIQUE | Two workers both see "not delivered" and both issue |
-| I4 | Only one worker advances an order | `SELECT … FOR UPDATE` on the order row **plus** `UPDATE … WHERE status = 'paid'` | Fifty webhooks start fifty issuances |
+| I4 | Only one worker advances an order | `SELECT … FOR UPDATE` on the order row **plus** `UPDATE … WHERE status = 'paid'` | Fifty webhooks make fifty supplier calls — and still exactly one key, because I5's ledger and I3's UNIQUE do the key-count work. Measured in Phase 2: widening the guard cost 49 avoidable supplier calls, not a second key |
 | I5 | One supplier request → one code | Supplier stores `request_id → code`; a repeat returns the stored code | A retry after a timeout issues a second key |
 | I6 | One key → at most one request | `supplier_keys.claimed_by_request_id` UNIQUE; one conditional `UPDATE … RETURNING` claims it | The same key is sold twice |
 | I7 | A promo is used at most N times | `UPDATE … SET used_count = used_count + 1 WHERE used_count < max_uses RETURNING` | Parallel redemptions overshoot the limit |

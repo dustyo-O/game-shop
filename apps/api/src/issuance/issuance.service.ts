@@ -14,8 +14,22 @@
  * ---------------------------------------------------------------------------
  *
  *     1. WRITE   record the attempt as `unknown`      (one statement, no tx)
- *     2. CALL    POST {SUPPLIER_A_URL}/issue          (no transaction open)
- *     3. WRITE   resolve the attempt + bind + finish  (one short transaction)
+ *     2. CALL    POST {SUPPLIER_A_URL}/issue          (no transaction, no lock)
+ *     3. WRITE   resolve the attempt + bind + finish  (TX B: lock, then write)
+ *
+ * Step 3 is **transaction B of invariant I4** (`architecture.md` §3, §3.1). Its
+ * first statement is `SELECT … FROM orders WHERE id = $1 FOR UPDATE`; transaction
+ * A is the claim that let this service be entered at all
+ * ({@link PaymentEventProcessor.claimForIssuance}). The two bracket the supplier
+ * call and neither one spans it — see "Why no transaction spans the call" below,
+ * and `../orders/order-lock.service.ts` for why the shape has to be two short
+ * transactions rather than one long one.
+ *
+ * **Step 1 deliberately takes no lock.** It is a single statement in its own
+ * implicit transaction, so a lock taken there would be released before the next
+ * line of TypeScript ran — protection in name only. The row it writes is not a
+ * decision anybody races over; it is a note that we are about to ask, and
+ * `ON CONFLICT (request_id) DO NOTHING` already makes writing it twice a no-op.
  *
  * **Why the attempt row is written before the call.** A timeout must have
  * somewhere to be written down, and the place has to exist *before* the thing it
@@ -38,10 +52,14 @@
  * whole of `transaction()`. A transaction held across an HTTP round trip
  * therefore stalls every other statement this instance wants to run, for as long
  * as the supplier takes — up to `SUPPLIER_TIMEOUT_MS`. The constraint is stated
- * three times in the codebase (the client, {@link OrderTransitionService}, and
- * the seam in {@link PaymentEventProcessor}) because it is the one that is
- * easiest to violate by accident and hardest to diagnose afterwards: the symptom
- * is unrelated requests timing out.
+ * four times in the codebase (the client, {@link OrderTransitionService},
+ * {@link OrderLockService}, and the seam in {@link PaymentEventProcessor})
+ * because it is the one that is easiest to violate by accident and hardest to
+ * diagnose afterwards: the symptom is unrelated requests timing out.
+ *
+ * It is also the reason the lock is taken **twice**, in two transactions, rather
+ * than once across the call. Two acquisitions of a short lock cost two round
+ * trips; one acquisition held across the supplier call would cost the instance.
  *
  * ---------------------------------------------------------------------------
  * WHAT THIS SLICE DOES NOT DO
@@ -75,6 +93,7 @@ import {
 } from "@game-shop/db";
 
 import { DATABASE_CLIENT } from "../database/database.module.js";
+import { OrderLockService } from "../orders/order-lock.service.js";
 import { OrderTransitionOutcome, OrderTransitionService } from "../orders/order-transition.service.js";
 import type { OrderTransitionName } from "../orders/order-transitions.js";
 import { IssuanceAttemptStatus } from "./issuance-attempt-status.js";
@@ -169,6 +188,7 @@ export class IssuanceService {
     @Inject(DATABASE_CLIENT) private readonly database: DatabaseClient,
     private readonly supplier: SupplierAClient,
     private readonly transitions: OrderTransitionService,
+    private readonly orderLock: OrderLockService,
   ) {}
 
   /**
@@ -325,14 +345,34 @@ export class IssuanceService {
   }
 
   /**
-   * §2.5 steps 5 and 6, success path — **resolve the attempt, bind the key,
-   * finish the order**, in one short transaction.
+   * §2.5 steps 5 and 6, success path — **transaction B**: take the order row
+   * lock, then resolve the attempt, bind the key and finish the order, in one
+   * short transaction.
    *
    * These three writes are one fact about the world. An order that is
    * `delivered` with no key, or that holds a key while still reading
    * `delivering`, is a support ticket either way — so they commit together or
    * not at all. The transaction is opened only now, *after* the network call has
    * returned, which is the whole reason the supplier call is not inside it.
+   *
+   * ### The lock comes first, before any of the three
+   *
+   * `SELECT … FOR UPDATE` on the order row is the first statement, because it is
+   * the serialisation point: a lock taken after a write protects a write that
+   * has already happened, which is nothing. Holding it for the whole body is
+   * what makes the outcome atomic against a second worker — the claim in
+   * transaction A excluded every other worker from *reaching the supplier*, and
+   * this lock excludes them from *writing the answer* while this one is
+   * mid-write. In Phase 1 no second worker can be here (only the claim winner
+   * enters this service); Phase 3's admin re-issue and the retry path are two
+   * more, and the lock is what they will arrive into rather than something added
+   * for them later.
+   *
+   * It also means the `FOR KEY SHARE` that the `deliveries` foreign key takes on
+   * this same order row a statement later is already held by this transaction,
+   * so it cannot wait on itself. That ordering — parent first, then its children,
+   * taken only by a transaction that already holds the parent — is the whole of
+   * the deadlock argument (`../orders/order-lock.service.ts`, "Lock ordering").
    *
    * A rollback here is safe and self-healing rather than lossy: the attempt row
    * reverts to `unknown`, no delivery is bound, the order stays `delivering`,
@@ -341,7 +381,20 @@ export class IssuanceService {
    * and binds it. Nothing is lost because nothing about the code was ours to
    * lose.
    *
-   * ### The three statements
+   * ### The four statements
+   *
+   * **(0) Take the lock — I4, `architecture.md` §3.1.**
+   *
+   *   select "id", "client_request_id", "sku", "amount_minor", "currency",
+   *          "status", "created_at", "updated_at"
+   *   from "orders" where "orders"."id" = $1 for update;
+   *   -- 1 row  => this transaction owns the order row until it commits. Any
+   *   --           other worker that reaches an order-locking statement for this
+   *   --           id waits here.
+   *   -- 0 rows => the order vanished between the claim and now. Nothing is
+   *   --           locked; the `deliveries` insert below would fail its foreign
+   *   --           key and the whole transaction rolls back, which is the honest
+   *   --           outcome — see {@link finishOrder}'s `order_not_found` branch.
    *
    * **(a) Resolve the attempt.**
    *
@@ -399,7 +452,12 @@ export class IssuanceService {
    *   --           swallowed — see {@link finishOrder}.
    */
   private async bindDelivery(order: Order, requestId: string, code: string): Promise<IssuanceResult> {
-    const { delivery, bound, finished } = await this.database.transaction(async (tx) => {
+    const { delivery, bound, finished, lockedStatus } = await this.database.transaction(async (tx) => {
+      // (0) — THE LOCK. First statement in the transaction, always. Nothing
+      // branches on the row that comes back; it is here so the log line can say
+      // what state this worker found the order in when it took the lock.
+      const locked = await this.orderLock.lockOrder(tx, order.id);
+
       // (a)
       await tx
         .update(issuanceAttempts)
@@ -428,10 +486,15 @@ export class IssuanceService {
       // (c)
       const outcome = await this.finishOrder(tx, order, requestId, "completeDelivery");
 
-      return { delivery: existing, bound: inserted !== undefined, finished: outcome };
+      return {
+        delivery: existing,
+        bound: inserted !== undefined,
+        finished: outcome,
+        lockedStatus: locked?.status,
+      };
     });
 
-    return this.reportDelivery(order, requestId, code, delivery, bound, finished);
+    return this.reportDelivery(order, requestId, code, delivery, bound, finished, lockedStatus);
   }
 
   /**
@@ -447,6 +510,7 @@ export class IssuanceService {
     delivery: Delivery | undefined,
     bound: boolean,
     finished: OrderStatus | undefined,
+    lockedStatus: OrderStatus | undefined,
   ): IssuanceResult {
     if (finished !== OrderStatus.Delivered) {
       return {
@@ -465,6 +529,11 @@ export class IssuanceService {
       provider: this.provider,
       status: OrderStatus.Delivered,
       bound_by_this_call: bound,
+      // What the order read the instant transaction B's lock was granted.
+      // `delivering` on every ordinary run; anything else means a second worker
+      // reached the outcome first, which is exactly what the lock exists to make
+      // visible rather than invisible.
+      locked_status: lockedStatus,
     });
 
     // The bound row's code, not the one just fetched. They are the same value on
@@ -483,7 +552,15 @@ export class IssuanceService {
    * would fail identically every time; and the shopper's order page would show
    * an error instead of an honest state (functional spec, Slice 6).
    *
-   * Two statements in one transaction, the same shape as the success path:
+   * Three statements in one transaction — **transaction B again**, the same
+   * shape as the success path and for the same reason: the lock first, then the
+   * writes it makes atomic against another worker.
+   *
+   *   select "id", "client_request_id", "sku", "amount_minor", "currency",
+   *          "status", "created_at", "updated_at"
+   *   from "orders" where "orders"."id" = $1 for update;
+   *   -- I4, `architecture.md` §3.1. Held until COMMIT, which is three
+   *   -- statements and no network I/O away.
    *
    *   update "issuance_attempts" set "status" = $1, "last_error" = $2
    *   where "issuance_attempts"."request_id" = $3;
@@ -511,13 +588,20 @@ export class IssuanceService {
   ): Promise<IssuanceResult> {
     const transition = this.transitionForReason(failure.reason);
 
-    const finished = await this.database.transaction(async (tx) => {
+    const { finished, lockedStatus } = await this.database.transaction(async (tx) => {
+      // THE LOCK, first — see {@link bindDelivery}. A definite refusal is still
+      // an outcome being written to the order, so it is serialised exactly like
+      // a success.
+      const locked = await this.orderLock.lockOrder(tx, order.id);
+
       await tx
         .update(issuanceAttempts)
         .set({ status: IssuanceAttemptStatus.Failed, lastError: failure.reason })
         .where(eq(issuanceAttempts.requestId, failure.requestId));
 
-      return this.finishOrder(tx, order, failure.requestId, transition);
+      const outcome = await this.finishOrder(tx, order, failure.requestId, transition);
+
+      return { finished: outcome, lockedStatus: locked?.status };
     });
 
     if (finished !== OrderStatus.OutOfStock) {
@@ -536,6 +620,7 @@ export class IssuanceService {
       reason: failure.reason,
       attempt_status: failure.attemptStatus,
       status: OrderStatus.OutOfStock,
+      locked_status: lockedStatus,
     });
 
     return {

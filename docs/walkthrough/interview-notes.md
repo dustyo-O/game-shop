@@ -137,24 +137,51 @@ Then volunteer:
 
 Don't get defensive. The follow-up will be technical, and that's a gift.
 
-**"What isn't finished?"** — offer this unprompted if the moment fits.
+**"What isn't finished?"** — offer this unprompted if the moment fits. Written at the close of Phase 1;
+the `→` lines record what Phase 2 did about each, and that pairing is itself the answer to "how do you
+decide what to defer?"
 
 - **No idempotency key on order creation.** Two concurrent POSTs still make two orders. Column and unique
   index are in the schema; the header and the read-back are not.
+  → **Closed, Phase 2 Slice 1.** The client mints a `client_request_id` per SKU and holds it until the
+  create call *resolves*; the server inserts `ON CONFLICT (client_request_id) DO NOTHING` and reads back on
+  zero rows. The column was in the schema from day one because the shape of the fix was known before the fix
+  was scheduled.
 - **Webhook processing runs inline**, so the intermediate states are real but unobservable — **19 ms** from
   event to `delivered`, by the database's clock. Rather than leave the spec overpromising, §2.4 was reworded
   with a dated Change Log entry; slowing the supplier to 1500 ms made the page follow `created → delivering →
   delivered` live.
+  → **Closed, Phase 2 Slice 2**, and the reword reversed in Slice 4 with a second dated entry. The webhook
+  now records the event, answers `200`, and completes the order on a tracked continuation. Worth saying out
+  loud: the spec was walked back honestly for one phase and then walked forward again, both times dated —
+  which is a better story than a criterion that was quietly always true.
 - **Nineteen of twenty losing events stay pending** until a Phase 2 drain. Deliberate: a loser can't tell
   "another worker is mid-call" from "another worker died". A needless pending row costs a no-op; a needless
   settle loses the payment result.
+  → **Closed, Phase 2 Slice 3.** Four triggers now drain the inbox — the webhook's own continuation, order
+  creation, the shopper's status poll, and an operator sweep. The sweep re-examines the losers later, finds
+  the order `delivered`, and settles them `no_op`. Only the sweep is tied to nothing happening, which is
+  what makes the set closed.
 - **`SELECT … FOR UPDATE`, half of I4, is absent.** The guard makes the *transition* idempotent; the lock
-  serialises *workers*. Phase 1 has one entry point into issuance, so there's no second worker. Phase 3's
-  retry adds one, and two workers in `delivering` with different attempt numbers is how a second key leaves
-  the pool.
+  serialises *workers*. Phase 1 has one entry point into issuance, so there's no second worker.
+  → **Closed, Phase 2 Slice 5**, and the reasoning is worth more than the fix. The Phase 1 note expected
+  Phase 3's retry to introduce the second worker; Phase 2's drain arrived first. But when the lock was
+  actually implemented, the assumed exposure turned out **not** to exist: all four drain triggers funnel
+  through one guarded `paid → delivering`, and `deriveIssuanceRequestId` is deterministic per attempt, so
+  even a double entry would send the same `req_{order}_a_1`, collapse to one code in the supplier's ledger,
+  and un-claim on rollback. **Do not cite slice-1 §5's twenty-keys measurement here** — that arm used twenty
+  *distinct* request ids and no claim at all, and an interviewer who reads it will catch the mismatch. The
+  real case is forward-looking: Phase 3's `attempt + 1` retry and supplier-B fall-through make the request id
+  stop being derivable from the order alone, and that classify-then-choose step is a multi-statement
+  read-then-act only a row lock protects. The lock went in **before** that code, so Phase 3 lands on an
+  already-serialised path. Measured after the change: 20 webhooks, 4 processes → 1 delivery, 1 attempt,
+  1 supplier request, **1 key claimed.**
 - **No retry policy, no supplier B, no admin panel.** A timeout rests in `delivering` and nothing re-drives
   it. But an out-of-stock refusal writes no ledger row, so after a restock the same derived id issues
   cleanly — verified.
+  → **Still Phase 3**, except that `POST /api/admin/payment-events/sweep` now exists behind a shared bearer
+  token. That is the operator's answer to "someone paid and got nothing"; the panel and manual retry are
+  still to come.
 
 Two more traps. *"So `ON CONFLICT DO NOTHING` is your guarantee?"* — no, the unique index is; `ON CONFLICT`
 only stops the loser raising. *"Why `SKIP LOCKED`, not `SERIALIZABLE`?"* — both are correct; plain

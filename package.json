@@ -26,7 +26,12 @@
     "clean": "pnpm -r run clean",
     "test:concurrency": "node scripts/with-env.ts pnpm --filter @game-shop/api run test:concurrency",
     "test:acceptance": "node scripts/with-env.ts pnpm --filter @game-shop/api run test:acceptance",
-    "test": "node scripts/with-env.ts pnpm --filter @game-shop/api run test"
+    "test": "node scripts/with-env.ts pnpm --filter @game-shop/api run test",
+    "race": "node scripts/with-env.ts node scripts/race/run-checks.ts",
+    "race:create-order": "pnpm race create-order",
+    "race:webhooks": "pnpm race webhooks",
+    "race:same-event": "pnpm race same-event",
+    "race:before-order": "pnpm race before-order"
   },
   "devDependencies": {
     "@types/node": "^22.18.8",

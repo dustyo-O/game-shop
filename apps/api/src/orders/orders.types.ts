@@ -17,7 +17,7 @@
 import type { Currency, MinorUnits, OrderStatus } from "@game-shop/contracts";
 
 /**
- * The request body: **a SKU and nothing else**.
+ * The request body: **a SKU, and — behind a flag — an id.**
  *
  * This interface is the whole of the "never trust a client-supplied amount"
  * rule, stated as a type. There is no `amount`, no `price`, no `discount` and no
@@ -31,14 +31,47 @@ import type { Currency, MinorUnits, OrderStatus } from "@game-shop/contracts";
  * adds promo codes, and they arrive the same way — as a *code* the server prices,
  * never as a discount the client computes.
  *
- * Phase 2 adds the `Idempotency-Key` **header**, not a body field, and stores it
- * as `orders.client_request_id` (I1). Nothing sends it today, so the column stays
- * NULL — which its UNIQUE index tolerates, since Postgres treats NULLs as
- * distinct from one another.
+ * `id` is the one deliberate exception to that "ignored, not rejected" stance,
+ * and the reason is the reason itself does not apply to it: `amount` and
+ * `discount` can *never* be honoured, by any caller, under any configuration —
+ * the server never reads a client-supplied number, full stop, so silently
+ * dropping them costs a well-behaved client nothing it could have had. `id` is
+ * different. It genuinely *would* be honoured with `ALLOW_CLIENT_SUPPLIED_ORDER_ID`
+ * set, so a caller sending it while the flag is off — almost certainly a
+ * misconfigured seed or race script, not a shopper — must not be told `201`
+ * while a random id was substituted underneath it. See {@link
+ * CreateOrderRequest.id} and `OrdersController`'s `parseRequestedOrderId`.
+ *
+ * The `Idempotency-Key` is a **header**, not a body field, and is stored as
+ * `orders.client_request_id` (I1). Deliberately not here: it names the shopper's
+ * *intent*, and the body describes *what is being bought*. Two deliberate
+ * purchases of the same game send identical bodies and different keys, so a
+ * field on this interface would be a field whose value could not be derived
+ * from the rest of it. A request that omits the header still creates an order
+ * and leaves the column NULL — which its UNIQUE index tolerates, since Postgres
+ * treats NULLs as distinct from one another.
  */
 export interface CreateOrderRequest {
   /** The catalogue handle, e.g. `KEY-CS2-PRIME`. `products.sku`, UNIQUE. */
   readonly sku: string;
+
+  /**
+   * A caller-chosen order id, in place of the server-minted `ord_` + ULID
+   * (`./order-id.ts`). Optional, and — deliberately unlike every other field an
+   * ordinary caller might add to this body — **not** covered by this
+   * interface's own "extra fields are ignored" precedent above: whether `id` is
+   * honoured, ignored, or rejected is a runtime decision gated by
+   * `ALLOW_CLIENT_SUPPLIED_ORDER_ID`, and the type here only says the field is
+   * *shaped* like an id, not that it will be used.
+   *
+   * See `../config/client-supplied-order-id.ts` for the flag and
+   * `architecture.md` §9 ("A test affordance on order creation") for why it
+   * exists at all: `webhook:before-order` has to name an order id *before* the
+   * order exists, and nothing else in this codebase lets a caller do that. This
+   * is a test affordance for seeds and that script, off by default, and it must
+   * never be reachable by a real shopper.
+   */
+  readonly id?: string;
 }
 
 /**
@@ -77,6 +110,55 @@ export interface CreatedOrder {
    */
   readonly status: typeof OrderStatus.Created;
 }
+
+/**
+ * The `200` body: the order this `Idempotency-Key` **already** created.
+ *
+ * Same five fields as {@link CreatedOrder}, and on the wire the two are one
+ * shape — a client reads `id` from either without asking which it got. They are
+ * two types for exactly one reason, and it is the `status` field.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY `status` WIDENS HERE AND NOWHERE ELSE
+ * ---------------------------------------------------------------------------
+ * {@link CreatedOrder} can promise the literal `"created"` because the statement
+ * that produces it binds `'created'` itself. This body is produced by a *read*
+ * of a row somebody else's request wrote, possibly some time ago, and an order
+ * does not stand still: the ordinary repeat lands milliseconds later and reads
+ * `created`, but a shopper who returns to a stale tab and clicks Buy again
+ * re-sends the same key against an order that has since become `paid` or
+ * `delivered`. Both are the same news — *this key already made an order, here
+ * it is* — and answering the second with a `500` because the row failed to
+ * still say `created` would turn a correctly-recognised retry into an outage.
+ *
+ * So the widening is a fact about where the value comes from, not a relaxation.
+ * The literal type stays exactly where it is true.
+ *
+ * `Omit<CreatedOrder, "status">` rather than a copied field list: the four
+ * remaining fields *are* {@link CreatedOrder}'s, documented once there, and a
+ * field added to the `201` body must appear in the `200` body or the endpoint
+ * would publish two different orders depending on which call you made.
+ */
+export interface ExistingOrder extends Omit<CreatedOrder, "status"> {
+  /**
+   * Wherever the order has got to since the key first created it — any member
+   * of the lifecycle, not just `created`. See this interface's header.
+   */
+  readonly status: OrderStatus;
+}
+
+/**
+ * What `POST /api/orders` answers with, in either of its two successful cases.
+ *
+ * The union is what the *status code* distinguishes, not the body: `201` is a
+ * {@link CreatedOrder} and means "this call created it"; `200` is an
+ * {@link ExistingOrder} and means "this call found it". A caller that cannot
+ * tell those apart cannot detect its own retry — which is the whole point of
+ * sending an `Idempotency-Key` — so the split is carried by the one part of the
+ * response every HTTP client already inspects, rather than by a flag in the
+ * body that half of them would ignore.
+ */
+export type CreateOrderResponse = CreatedOrder | ExistingOrder;
 
 /**
  * The fields an order view carries in **every** state, delivered or not.

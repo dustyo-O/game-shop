@@ -63,26 +63,40 @@
  *   flag away while the first request is still on its way; a request that timed
  *   out at the client but succeeded at the server, retried by a shopper who was
  *   shown the failure message; and any client that is not this page at all —
- *   `curl`, a script, a mobile browser that double-submits. The verification
- *   for this task demonstrates the last of those on purpose: two concurrent
- *   `POST /api/orders` for one SKU create two orders, and no state held in a
+ *   `curl`, a script, a mobile browser that double-submits. Phase 1's
+ *   verification demonstrated the last of those on purpose: two concurrent
+ *   `POST /api/orders` for one SKU created two orders, and no state held in a
  *   page could have stopped it.
  *
- * **Where the real boundary has to sit.** Not in the page: the page is one
- * client among many and the only one that cooperates. Not in the API process
- * either — a "have I seen this already?" check followed by an insert races with
- * itself the moment two requests are in flight together, and in the deployed
- * shape they are served by two function instances that share no memory. It has
- * to be at the write, in the database, which is the first and only place every
- * concurrent attempt meets the same row. Phase 2 puts it there:
+ * **Where the real boundary has to sit, and now does.** Not in the page: the
+ * page is one client among many and the only one that cooperates. Not in the API
+ * process either — a "have I seen this already?" check followed by an insert
+ * races with itself the moment two requests are in flight together, and in the
+ * deployed shape they are served by two function instances that share no memory.
+ * It has to be at the write, in the database, which is the first and only place
+ * every concurrent attempt meets the same row. Phase 2 puts it there:
  * `orders.client_request_id UNIQUE` plus an `Idempotency-Key` header naming the
  * shopper's intent, so the second insert loses the race and the original order
- * comes back instead of a new one (architecture.md §3, I1). Deliberately not
- * built here — this slice's job is to get the shopper to their order page — and
- * the disabled button below must not be read as standing in for it.
+ * comes back instead of a new one (architecture.md §3, I1).
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THIS FILE CONTRIBUTES TO THAT: THE KEY IS NOT MINTED HERE
+ * ---------------------------------------------------------------------------
+ * The database can only fold two requests into one order if they arrive wearing
+ * the same name, and choosing that name is the browser's half of the mechanism —
+ * the half that is easy to get wrong invisibly. `crypto.randomUUID()` written
+ * into `buy` below would name the *click*: a double-click would send two names
+ * and buy two copies, with the server behaving perfectly throughout.
+ *
+ * So the name comes from `../lib/purchase-intent.js`, where it is a property of
+ * the shopper's intent to buy this SKU — minted once, shared by every later
+ * click, by a second tab and by a retry after a visible failure, and forgotten
+ * only once an order for it exists. That file carries the reasoning; the two
+ * calls below are the whole of its use.
  */
 import { createOrder, ProductNotPurchasableError } from "../../../entities/order/index.js";
 import { createElement } from "../../../shared/lib/dom.js";
+import { forgetPurchaseIntent, purchaseIntentKey } from "../lib/purchase-intent.js";
 
 /**
  * The two sentences a shopper can be shown when a purchase does not start
@@ -144,13 +158,24 @@ function showMessage(button: HTMLButtonElement, message: string): void {
  * button, bookmarking and reload right without re-implementing any of them. It
  * also discards this page and everything it was holding, which is why success
  * has no state to unwind — the disabled button leaves with the document.
+ *
+ * **The intent key is read, not made, and is dropped only on success.** Reading
+ * it inside the `try` means a browser that cannot mint one becomes the ordinary
+ * Russian failure rather than a click that does nothing. Dropping it after
+ * `createOrder` resolves — before the navigation, because `location.assign` does
+ * not stop this function and a storage write is synchronous — is the one moment
+ * an order for this intent is known to exist. Every failure path below leaves it
+ * in place on purpose, which is what makes clicking «Купить» again after a
+ * failure produce the *same* order instead of a second one.
  */
 async function buy(button: HTMLButtonElement, sku: string): Promise<void> {
   clearMessage(button);
   button.disabled = true;
 
   try {
-    const orderId = await createOrder(sku);
+    const orderId = await createOrder(sku, purchaseIntentKey(sku));
+
+    forgetPurchaseIntent(sku);
 
     // Deliberately still disabled: see the note above on what that does and
     // does not mean.

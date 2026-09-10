@@ -434,28 +434,71 @@ describe("functional spec 001-purchase-and-key-delivery — feature acceptance",
   });
 
   describe("§2.3 — paying for an order", () => {
-    it("choosing the successful payment control moves the order out of awaiting-payment immediately (§2.3 AC1)", async () => {
-      const orderIds: string[] = [];
-      try {
-        const created = await createOrder(instance.baseUrl, PURCHASABLE_SKU);
-        orderIds.push(created.id);
+    it(
+      "choosing the successful payment control gets the payment accepted for processing, and the order " +
+        "does leave awaiting-payment once that processing runs (§2.3 AC1)",
+      async () => {
+        const orderIds: string[] = [];
+        try {
+          const created = await createOrder(instance.baseUrl, PURCHASABLE_SKU);
+          orderIds.push(created.id);
 
-        await payOrder(instance.baseUrl, created.id, "success");
+          const ack = await payOrder(instance.baseUrl, created.id, "success");
 
-        // In this phase the whole webhook chain runs inline, inside the
-        // payment call itself (technical-considerations §2.5; Change Log,
-        // 2026-09-07): by the time payOrder's response lands the order has
-        // already moved off `created`. That is the always-true, non-flaky
-        // proxy for "shows that the order is being processed" this suite
-        // asserts — the specific intermediate states (`paid`, `delivering`)
-        // are real but, per the Change Log, not reliably observable by a
-        // poller in this version, and this test does not pretend otherwise.
-        const view = await getOrder(instance.baseUrl, created.id);
-        expect(view.status, "the order left `created` after a successful payment").not.toBe(OrderStatus.Created);
-      } finally {
-        await cleanupTestOrders(db, orderIds);
-      }
-    });
+          // The webhook persists the event, answers `200`, and schedules the
+          // rest of the chain as a continuation that runs *after* that
+          // response — it no longer runs inline inside the payment call
+          // (payment-webhook.controller.ts: "The fourth step is scheduled,
+          // not awaited"). `ack` above is already the whole synchronous
+          // proof §2.3 AC1 needs (see below); this wait exists so that
+          // nothing asserted from here on — on `ack`, on the database, or on
+          // a fresh `GET /api/orders/:id` — can throw while the continuation
+          // is still running. An assertion failure inside `try` does not
+          // cancel `finally`: cleanup below would still fire immediately,
+          // and would then race a continuation still writing to
+          // `deliveries` / `issuance_attempts` / `supplier_keys` /
+          // `supplier_requests` for this order — the exact leak
+          // `assertBaseline` in `../concurrency/support/db.ts` exists to
+          // catch. Waiting first, before any assertion, is the same
+          // ordering every other paying test in this suite already uses
+          // (§2.4's, in particular) and is what keeps this test's own
+          // cleanup honest regardless of which assertion below might fail.
+          const settled = await waitUntilSettled(instance.baseUrl, created.id);
+
+          // What §2.3 AC1 actually promises ("the order page shows that the
+          // order is being processed") is proxied here by two facts, neither
+          // of which depends on timing this test cannot control:
+          //
+          //   1. The shop accepted the payment for processing at all — a
+          //      fresh event was stored, not silently dropped, bounced, or
+          //      folded into a duplicate. This was already true the instant
+          //      `payOrder` resolved, above; it is only *asserted* here,
+          //      after the wait, so a failure here cannot strand cleanup
+          //      mid-continuation (see the comment on the wait itself).
+          expect(ack.webhook_outcome, "the payment was accepted (stored), not rejected or replayed").toBe(
+            "stored",
+          );
+
+          //   select status from payment_events where event_id = $1;
+          const dbEvent = await db.pool.query<{ status: string }>(
+            `select status from payment_events where event_id = $1`,
+            [ack.event_id],
+          );
+          expect(dbEvent.rowCount, "the accepted event is durably recorded in the inbox").toBe(1);
+          expect(dbEvent.rows[0]?.status, "the database agrees it was a paid event").toBe("paid");
+
+          //   2. The order does leave `created` once that acceptance is
+          //      acted on — proven with the same bounded poll every other
+          //      paying test in this suite uses, rather than by reading the
+          //      response of `payOrder` as if the work were already done.
+          expect(settled.status, "the order left `created` once payment was processed").not.toBe(
+            OrderStatus.Created,
+          );
+        } finally {
+          await cleanupTestOrders(db, orderIds);
+        }
+      },
+    );
 
     it("choosing the failing payment control settles the order as failed, with no key ever bound (§2.3 AC2)", async () => {
       const orderIds: string[] = [];

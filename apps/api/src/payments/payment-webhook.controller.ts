@@ -12,26 +12,35 @@
  * order and settles it.
  *
  * The ordering is the pattern, and it is not negotiable: nothing is decided
- * before the row exists, so a crash between the two steps loses no event. What
- * *is* negotiable, and temporary, is that the second step runs inline here.
+ * before the row exists, so a crash between the two steps loses no event.
  *
- * ### Inline now; asynchronous in Phase 2
+ * ### The fourth step is scheduled, not awaited
  *
- * `architecture.md` §4 lists four processing triggers — `waitUntil` after the
- * response is sent, a drain on order creation, a drain on the status poll, and
- * an admin sweep — layered so that no single one is load-bearing. None of them
- * exists yet, so processing happens here, before the `200`, which trades a few
- * milliseconds of provider-visible latency for a system that has exactly one
- * path and no way to lose an event.
+ * `architecture.md` §4 lists four processing triggers — a continuation after
+ * the response is sent, a drain on order creation, a drain on the status poll,
+ * and an admin sweep — layered so that no single one is load-bearing. This
+ * endpoint owns the first: it hands the committed row to the
+ * {@link ContinuationScheduler} and returns, so the `200` reaches the provider
+ * while the issuance is still running. That is functional spec §2.4's first
+ * criterion in one sentence — the shop "confirms receipt promptly and completes
+ * the order as separate work rather than making the payment service wait for
+ * it" — and technical-considerations §2.2's "the webhook persists the event,
+ * answers `200`, and schedules processing. It no longer awaits the work."
  *
- * When those triggers arrive, **this call site moves and nothing else does**.
- * `PaymentEventProcessor` is written against a stored row rather than a request
- * body precisely so that it does not care who calls it: the webhook today, a
- * `waitUntil` continuation and a `FOR UPDATE SKIP LOCKED` drain tomorrow. The
- * one thing that must survive the move is the rule below about status codes,
- * because an asynchronous processor cannot influence a response that has
- * already been sent — which is the direction this endpoint's error handling is
- * already written for.
+ * **This call site moved and nothing else did.** `PaymentEventProcessor` is
+ * written against a stored row rather than a request body precisely so that it
+ * does not care who calls it: this continuation today, a
+ * `FOR UPDATE SKIP LOCKED` drain tomorrow.
+ *
+ * ### What the continuation is *not*
+ *
+ * It is not a guarantee, and nothing here is written as though it were. A
+ * `SIGTERM` can abandon it (bounded and logged —
+ * `../scheduling/tracked-continuation-scheduler.ts`), and the deployment
+ * implementation promises no more than best effort. The cost of losing one is
+ * latency and never a key: the row is still in `payment_events` with
+ * `processed_at` NULL, which is not an error state but the queue, and the other
+ * three triggers find exactly that row.
  *
  * ---------------------------------------------------------------------------
  * WHAT THE STATUS CODE MEANS TO A PAYMENT PROVIDER
@@ -50,6 +59,16 @@
  *     provider's power to fix, and neither may ask for a retry. Turning a
  *     duplicate we correctly ignored into a `500` is how you ask for the
  *     duplicate again (`docs/walkthrough/slice-2-order-lifecycle.md` §4).
+ *
+ *     The last of those used to be a decision this file made, in a `try/catch`
+ *     around the inline processing. It is now **structural**: the processing
+ *     runs after the response has been sent, so there is no longer a status
+ *     code for it to influence even in principle. The reasoning did not move —
+ *     it lives in `guardContinuation`, which swallows and logs at `error` with
+ *     the same two correlation ids and the same argument
+ *     (`../scheduling/continuation-scheduler.ts`). Two layers doing that job
+ *     would mean two log lines for one failure and a reader guessing which one
+ *     owns the rule, so this file no longer has one.
  *   - **`400` = "sending it again will not help."** A body that cannot become a
  *     row — see {@link parsePaymentWebhookPayload}. Not a `5xx`, because the
  *     identical bytes would fail identically on every retry; a client error is
@@ -65,13 +84,16 @@ import {
   Controller,
   HttpCode,
   HttpStatus,
-  Logger,
+  Inject,
   Post,
 } from "@nestjs/common";
 
 import { majorToMinor, majorUnits } from "@game-shop/contracts";
-import type { PaymentEvent } from "@game-shop/db";
 
+import {
+  CONTINUATION_SCHEDULER,
+  type ContinuationScheduler,
+} from "../scheduling/continuation-scheduler.js";
 import { PaymentEventProcessor } from "./payment-event-processor.service.js";
 import { PaymentEventsService, RecordPaymentEventOutcome } from "./payment-events.service.js";
 import {
@@ -221,15 +243,23 @@ function assertNever(value: never): never {
 
 @Controller("api/webhooks/payment")
 export class PaymentWebhookController {
-  private readonly logger = new Logger(PaymentWebhookController.name);
-
   constructor(
     private readonly paymentEvents: PaymentEventsService,
     private readonly processor: PaymentEventProcessor,
+    // Injected by symbol because the scheduler is an interface, not a class —
+    // there is no constructor to name, and which implementation arrives is an
+    // environment decision made in `../scheduling/scheduling.module.ts`. This
+    // controller cannot tell the two apart and must not try to.
+    //
+    // There is deliberately no `logger` field any more: the only thing this
+    // class used to log was a failure inside the processing it awaited, and
+    // that logging now belongs to `guardContinuation`.
+    @Inject(CONTINUATION_SCHEDULER)
+    private readonly continuations: ContinuationScheduler,
   ) {}
 
   /**
-   * Store the event and acknowledge it.
+   * Store the event, schedule the work, and acknowledge — in that order.
    *
    * **`200`, not Nest's default `201` for `@Post`.** Technical-considerations
    * §2.3 specifies `200`, and it is the right code on its own terms: the
@@ -241,6 +271,13 @@ export class PaymentWebhookController {
    * whole design and the one sentence worth remembering from it: **a duplicate
    * we correctly ignored is a success.** The two differ only in the body, and
    * only for the benefit of a human or a race script reading the response.
+   *
+   * The two `await`s that remain are the two the provider is genuinely owed:
+   * parsing the body, and committing the row. Everything after the commit is
+   * scheduled, so the only work that can delay this response is work whose
+   * failure the provider could actually do something about — which is exactly
+   * the set of failures the status-code rule in this file's header hands back
+   * as a `5xx`.
    */
   @Post()
   @HttpCode(HttpStatus.OK)
@@ -253,7 +290,30 @@ export class PaymentWebhookController {
       case RecordPaymentEventOutcome.Stored:
         // The row is committed. Exactly one caller per `event_id` ever reaches
         // this line (I2), and it is the one that owns applying the event.
-        await this.processStoredEvent(result.event);
+        //
+        // ################################################################
+        // # NO `await`. THE `return` BELOW RACES THE WORK, AND WINS.
+        // ################################################################
+        //
+        // A thunk rather than a started promise, because a promise handed over
+        // already running can reject in the window before the scheduler
+        // attaches its `catch` — and an unhandled rejection terminates the
+        // process in Node 22. `schedule` returns `void` for a matching reason:
+        // there is nothing to `await`, so the inline processing this replaces
+        // cannot come back by accident.
+        //
+        // `processStoredEvent` resolves to a `ProcessPaymentEventResult`, which
+        // nobody is left to read — the response has gone. `.then(() =>
+        // undefined)` discards it to meet `() => Promise<void>`; the outcome is
+        // already on the processor's own log lines.
+        this.continuations.schedule(
+          () => this.processor.processStoredEvent(result.event).then(() => undefined),
+          {
+            name: "payment webhook continuation",
+            orderId: result.event.orderId,
+            eventId: result.event.eventId,
+          },
+        );
 
         return { event_id: result.event.eventId, outcome: PaymentWebhookAckOutcome.Stored };
 
@@ -268,53 +328,6 @@ export class PaymentWebhookController {
 
       default:
         return assertNever(result);
-    }
-  }
-
-  /**
-   * Apply the freshly-stored event — and **never let that turn into a `5xx`**.
-   *
-   * ### The decision this `catch` encodes
-   *
-   * A failure while *applying* an event we already hold is not a failure to
-   * receive it. The row is committed and durable; what failed is work that can
-   * be done again later against exactly the same row. So the acknowledgement is
-   * still `200`, and the reasoning is stronger than "be lenient":
-   *
-   *   - **A retry could not fix it.** A redelivered copy loses the
-   *     `ON CONFLICT (event_id)` insert, comes back `already_seen`, and — see
-   *     the case above — is deliberately not processed. Answering `5xx` would
-   *     therefore buy a stream of redeliveries that are guaranteed to do
-   *     nothing, on the provider's backoff schedule, until it disables the
-   *     endpoint (`docs/walkthrough/slice-2-order-lifecycle.md` §4).
-   *   - **Something else already will fix it.** The failure left
-   *     `processed_at` NULL, which is not an error state — it is the queue. The
-   *     event sits in `payment_events_unprocessed_order_idx` waiting for the
-   *     Phase 2 drain, exactly as an event that arrived before its order does.
-   *   - **The two questions have different answers.** `5xx` means "we do not
-   *     have this event". We do have it. Reporting otherwise is not caution, it
-   *     is a false statement to the one system whose retry behaviour depends on
-   *     the answer.
-   *
-   * Swallowed at the boundary, not inside {@link PaymentEventProcessor}: `200`
-   * is an HTTP decision, and a drain calling the same processor needs the error
-   * to propagate so it can back off and retry. The `catch` therefore belongs to
-   * the caller that has a response to protect, which is this one.
-   *
-   * It is logged at `error` level with both correlation ids, because "the
-   * webhook succeeded and the order did not move" is precisely the incident
-   * that is invisible without it.
-   */
-  private async processStoredEvent(event: PaymentEvent): Promise<void> {
-    try {
-      await this.processor.processStoredEvent(event);
-    } catch (error: unknown) {
-      this.logger.error({
-        msg: "payment webhook: event stored but could not be applied; left pending for the drain",
-        event_id: event.eventId,
-        order_id: event.orderId,
-        error: error instanceof Error ? error.message : String(error),
-      });
     }
   }
 }

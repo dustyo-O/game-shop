@@ -61,7 +61,7 @@ A repeated attempt is shown **silently**: the shopper sees their order page exac
 
 ### 2.5 Watching my purchase progress
 
-Spec 001 §2.4 promised that the page shows each change as it happens, and was reworded during verification because the whole sequence finished in about a tenth of a second — the stages were real but nobody could see them. Completing the order as separate work (§2.4 above) makes them observable again, so the original promise can be restored.
+Spec 001 §2.4 promised that the page shows each change as it happens, and was reworded during verification because the whole sequence finished in about a tenth of a second — the stages were real but nobody could see them. Confirming receipt before doing the work (§2.4 above) makes them observable again, so the original promise can be restored. The reason is not that the stages became longer — they did not — but that the shop now answers at the *start* of the work rather than at the end, so a page that refreshes itself on hearing that answer looks while the work is still happening.
 
 - **As a** shopper, **I want to** watch my order move through its stages, **so that** I can see the shop is working rather than wondering whether it has stalled.
   - **Acceptance Criteria:**

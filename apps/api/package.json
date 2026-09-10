@@ -10,7 +10,7 @@
     "dev": "nest start --watch",
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
-    "test:concurrency": "vitest run test/concurrency/key-claim-race.test.ts",
+    "test:concurrency": "vitest run test/concurrency/",
     "test:acceptance": "vitest run test/acceptance/purchase-and-key-delivery.test.ts",
     "test": "vitest run"
   },

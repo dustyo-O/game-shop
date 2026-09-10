@@ -3,10 +3,12 @@
  * `POST /api/orders`, and reading one back from `GET /api/orders/:id`.
  *
  * `GET` answers a single JSON object with snake_case wire fields, or a `404`
- * for an id that identifies nothing. `POST` takes `{ sku }` and answers `201`
- * with the created order, or `422` for a SKU the shop will not sell
- * (technical-considerations §2.3). This file is the only place that knows any of
- * that, and the only place where an untyped `unknown` becomes an {@link Order}.
+ * for an id that identifies nothing. `POST` takes `{ sku }` and an
+ * `Idempotency-Key` header, and answers `201` with the order it created, `200`
+ * with the order that key had already created, or `422` for a SKU the shop will
+ * not sell (technical-considerations §2.1 and §2.3). This file is the only place
+ * that knows any of that, and the only place where an untyped `unknown` becomes
+ * an {@link Order}.
  *
  * **Why creation lives here rather than in the feature that calls it.**
  * `features/buy-product` owns the *behaviour* — disable the control, navigate,
@@ -281,15 +283,47 @@ export async function fetchOrder(orderId: string, signal?: AbortSignal): Promise
  * that calls this shows one Russian sentence for the first and one for the rest,
  * which is the only distinction a shopper can act on.
  *
- * **Nothing in this function makes calling it twice safe**, and nothing in the
- * browser could. Two calls are two orders, by design: this sends a create
- * instruction and the server carries it out. Phase 2's `Idempotency-Key` header
- * paired with `orders.client_request_id UNIQUE` is what changes that, and it has
- * to live at the database — the one place where two simultaneous requests meet.
+ * ### `idempotencyKey` — what makes calling this twice safe
+ *
+ * The header names the shopper's *intent* to buy this thing once, and
+ * `orders.client_request_id UNIQUE` is what turns two requests carrying it into
+ * one order: the second insert loses at the index and the API reads the winner
+ * back. That is the only place the guarantee can live — two simultaneous
+ * requests meet at the row and nowhere else — and this function's whole part in
+ * it is putting the value on the wire.
+ *
+ * **Required, not optional.** The API accepts the header's absence and still
+ * creates an order (assumption A3, kept for the scripts and for Phase 1's
+ * callers), so an optional parameter here would compile at every call site and
+ * silently give up the guarantee at any one that forgot. There is exactly one
+ * caller, it is `features/buy-product`, and it has a key.
+ *
+ * **This function does not mint it and must not.** A key minted here would be
+ * minted per *call*, which is the failure the header exists to prevent: a
+ * double-click would produce two keys, two orders, and a mechanism that looks
+ * like it is working. The key is a property of the shopper's intent, so it is
+ * owned by the feature that owns the click — see
+ * `features/buy-product/lib/purchase-intent.ts`.
+ *
+ * ### `201` and `200` are both success here, deliberately
+ *
+ * The API answers `201` when this call created the order and `200` when the key
+ * had already created it (`OrdersController.createOrder`). `postJson` gates on
+ * `response.ok`, so both arrive here as a body, and both bodies carry the same
+ * `id`. The caller navigates to the same page either way and says nothing about
+ * which it got — functional spec §2.1's last criterion: a repeated attempt reads
+ * exactly as a first one would have.
+ *
+ * The distinction is not lost, only unused by the storefront: the race scripts
+ * and the API tests read the status code, which is what makes "one intent, one
+ * order" observable rather than assumed.
  */
-export async function createOrder(sku: string): Promise<string> {
+export async function createOrder(sku: string, idempotencyKey: string): Promise<string> {
   try {
-    return readString(asRecord(await postJson("/api/orders", { sku })), "id");
+    return readString(
+      asRecord(await postJson("/api/orders", { sku }, { "Idempotency-Key": idempotencyKey })),
+      "id",
+    );
   } catch (error: unknown) {
     if (error instanceof HttpError && error.status === unprocessableStatus) {
       throw new ProductNotPurchasableError(sku);

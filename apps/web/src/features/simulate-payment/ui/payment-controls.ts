@@ -188,11 +188,29 @@ export interface PaymentControlsOptions {
    *
    * The page is already reading the order once a second — every order this page
    * shows a control for is, by definition, still in flight — so this does not
-   * start anything. It only spends the remainder of the current second, so the
-   * shopper sees «Оплачен, готовим ключ» the moment the shop says so rather than
-   * up to a second later. Remove it tomorrow and the page still gets there on
-   * the next tick, which is the property that makes it a courtesy rather than a
-   * mechanism.
+   * start anything. It only spends the remainder of the current second.
+   *
+   * DO NOT REMOVE IT. An earlier version of this comment called it a courtesy
+   * rather than a mechanism, on the reasoning that the page still reaches
+   * `delivered` on the next scheduled tick either way. That is true and it is
+   * not the point. This callback is the only reason a shopper ever sees an
+   * intermediate state at all, and spec 002 §2.5 is a criterion about exactly
+   * that.
+   *
+   * Measured, Phase 2 Slice 4: the shop takes 25-65ms to get from answering the
+   * webhook to `delivered`. The scheduled poll fires once a second, so it will
+   * essentially never land inside that window. This callback fires ~10ms in —
+   * the moment the simulator's request resolves, which is the moment the webhook
+   * answered `200` — and its read lands mid-flight. The intermediate state then
+   * stays on screen until the next scheduled read, which is where the ~1s of
+   * legibility comes from: the poll's period, not the state's lifetime.
+   *
+   * Proven by removing it: 3 runs, 3 collapses straight from «Ожидает оплаты» to
+   * «Ключ выдан» at ~990ms, no intermediate state — which is precisely the
+   * Phase 1 behaviour that forced spec 001 §2.4 to be reworded for a phase.
+   * Restored byte-identical: 3 of 3 intermediate states back.
+   *
+   * See docs/walkthrough/phase-2-slice-4-watching-the-stages.md §2 and §4.
    */
   readonly onOrderMayHaveChanged: () => void;
 }

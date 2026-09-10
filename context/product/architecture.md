@@ -57,7 +57,7 @@ The centre of the system. Each invariant names the mechanism that enforces it an
 | I1 | One client request → one order | `client_request_id` UNIQUE; `INSERT … ON CONFLICT DO NOTHING`, then read the winner back | A double-click creates two orders and two charges |
 | I2 | One payment event is applied once | `event_id` PRIMARY KEY; `INSERT … ON CONFLICT DO NOTHING` decides duplicate vs. first sight | A redelivered webhook re-runs issuance |
 | I3 | One order → at most one delivery | `deliveries.order_id` UNIQUE | Two concurrent workers both see "not delivered" and both issue |
-| I4 | Only one worker advances an order | `SELECT … FOR UPDATE` on the order row, plus status-guarded updates (`WHERE status = 'paid'`) | Fifty webhooks start fifty issuances |
+| I4 | Only one worker advances an order | `SELECT … FOR UPDATE` on the order row, plus status-guarded updates (`WHERE status = 'paid'`) | Fifty webhooks make fifty supplier calls — and still exactly one key, because I5's ledger and I3's UNIQUE do the key-count work. Measured in Phase 2: widening the guard cost 49 avoidable supplier calls, not a second key |
 | I5 | One supplier request → one code | Supplier stores `request_id → code`; a repeat returns the stored code | A retry after timeout issues a second key |
 | I6 | One key → at most one request | `supplier_keys.claimed_by_request_id` UNIQUE; claim by conditional `UPDATE … RETURNING` | The same key is sold twice |
 | I7 | A promo is used at most N times | `UPDATE … SET used_count = used_count + 1 WHERE used_count < max_uses RETURNING` | Parallel redemptions overshoot the limit |
@@ -68,25 +68,54 @@ The centre of the system. Each invariant names the mechanism that enforces it an
 
 Each mechanism above, as the statement Postgres actually executes. These pairings live beside the code as comments and are reproduced in the README.
 
+**These blocks are copied from the code's own `.toSQL()` output, not written by hand.** I1 and I2 drifted once — they carried a hand-written `VALUES` insert with an `amount` column while the code emitted `INSERT … SELECT` with `amount_minor` — and the drift was caught by an audit of `docs/walkthrough/phase-2.md`, which had quoted the code correctly and therefore disagreed with this file. When a statement changes, re-copy it from the service's `Emitted SQL` comment rather than editing it here.
+
 **I1 — one client request → one order.** The insert itself decides the winner; nobody reads first.
 
 ```sql
-INSERT INTO orders (id, client_request_id, sku, amount, currency, status)
-VALUES ($1, $2, $3, $4, $5, 'created')
-ON CONFLICT (client_request_id) DO NOTHING
-RETURNING *;
--- 0 rows => another request won the race; read that order back and return it with 200
+insert into "orders" ("id", "client_request_id", "sku", "amount_minor",
+                      "currency", "status", "created_at", "updated_at")
+select $1 as "id", $2 as "client_request_id", "sku", "price_minor",
+       "currency", $3 as "status",
+       now() as "created_at", now() as "updated_at"
+from "products"
+where ("products"."sku" = $4 and "products"."purchasable" = $5)
+on conflict ("client_request_id") do nothing
+returning "id", "sku", "amount_minor", "currency", "status";
+-- $1 the application-minted `ord_` + ULID, $2 the Idempotency-Key or NULL,
+-- $3 the literal 'created', $4 the SKU from the request body, $5 true.
+-- 1 row  => THIS call created the order, priced from the catalogue row in
+--           the same statement. 201.
+-- 0 rows => TWO DIFFERENT THINGS, and they must not be conflated: either the
+--           client_request_id already made an order (read it back, 200), or the
+--           SKU is not purchasable, so the conflict clause was never reached
+--           (422). A follow-up SELECT on client_request_id tells them apart, and
+--           runs only on this path.
 ```
+
+It is `INSERT … SELECT` rather than `INSERT … VALUES` for a reason worth stating: the price is copied
+out of the catalogue row **column-to-column, inside the same statement**, so no client-supplied amount
+ever participates and there is no window in which the price could be read and then changed.
 
 **I2 — one payment event applied once.** The same shape, and it is also how duplicate detection works: winning the insert means "first sight", losing it means "already seen".
 
 ```sql
-INSERT INTO payment_events (event_id, order_id, status, amount, currency, payload)
-VALUES ($1, $2, $3, $4, $5, $6)
-ON CONFLICT (event_id) DO NOTHING
-RETURNING *;
--- 0 rows => redelivery; acknowledge 200 and stop
+insert into "payment_events" ("event_id", "order_id", "status",
+                              "amount_minor", "currency", "payload",
+                              "received_at", "processed_at")
+values ($1, $2, $3, $4, $5, $6, default, default)
+on conflict ("event_id") do nothing
+returning "event_id", "order_id", "status", "amount_minor", "currency",
+          "payload", "received_at", "processed_at";
+-- 1 row  => FIRST SIGHT of this event. It is durable now, with processed_at
+--           NULL, and this call is the one that must process it. Exactly one
+--           caller ever sees this per event_id, across every process.
+-- 0 rows => REDELIVERY. Acknowledge 200 and stop.
 ```
+
+The conflict target is **named** (`event_id`) rather than left bare, so this clause forgives exactly one
+constraint. A future `NOT NULL` or `CHECK` failure still raises, instead of being silently reported to the
+payment provider as a duplicate.
 
 **I3 — one order → at most one delivery.** The constraint is the guarantee; the `ON CONFLICT` only keeps the loser from raising.
 

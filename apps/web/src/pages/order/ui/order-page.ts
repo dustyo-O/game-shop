@@ -256,12 +256,31 @@ export function createOrderPage(orderId: string): HTMLElement {
    * TypeScript refuses the circular inference. Neither closure runs before both
    * bindings exist: one waits for a click, the other for a request to land.
    *
-   * **What pressing pay does to the poll.** Nothing, structurally: the loop is
-   * already running, because a `created` order is in flight and this page polls
-   * every order that is. `refreshNow` only spends the remainder of the current
-   * second, so the move to «Оплачен, готовим ключ» shows up as soon as the shop
-   * has made it rather than up to a second later. If the callback were removed
-   * tomorrow the page would still get there on the next tick.
+   * **What pressing pay does to the poll**, and why the callback is not an
+   * optimisation. Structurally it changes nothing: the loop is already running,
+   * because a `created` order is in flight and this page polls every order that
+   * is. What it changes is *which states the shopper ever sees*.
+   *
+   * Phase 2 moved payment processing off the webhook's response path, so `paid`
+   * and `delivering` are now real persisted states rather than steps inside one
+   * request — but they are still **short**. Measured locally against the
+   * loopback supplier stub, the whole run from the webhook's `200` to
+   * `delivered` takes 25–65ms. A one-second poll started from a cold page will
+   * essentially never land inside that.
+   *
+   * `refreshNow` is what does. It fires the moment the simulator's request
+   * resolves — which is the moment the webhook answered, ~10ms in — so its read
+   * lands *inside* the window and catches whichever of «Оплачен, готовим ключ»
+   * or «Выдаём ключ» is current. The next read is then a whole interval away,
+   * which is what holds that intermediate state on screen for a readable second
+   * rather than a frame.
+   *
+   * So this callback is load-bearing for functional spec §2.5, not a way of
+   * saving the shopper a second. Removing it does not cost a tick — it collapses
+   * the sequence straight from «Ожидает оплаты» to «Ключ выдан», which is
+   * exactly the Phase 1 behaviour that forced spec 001 §2.4 to be reworded.
+   * Verified by disabling it: three runs, no intermediate state in any of them;
+   * three runs with it restored, an intermediate state in all three.
    */
   const payment: PaymentControls = createPaymentControls({
     orderId,

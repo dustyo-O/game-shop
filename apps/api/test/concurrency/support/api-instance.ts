@@ -54,12 +54,42 @@
  * own supplier call — while every instance still shares the one thing that
  * has to be shared for the race to mean anything: `DATABASE_URL`, and through
  * it, `supplier_keys`.
+ *
+ * ---------------------------------------------------------------------------
+ * `allowClientSuppliedOrderId` — OPT-IN, AND OFF UNLESS A CALLER ASKS
+ * ---------------------------------------------------------------------------
+ * `ALLOW_CLIENT_SUPPLIED_ORDER_ID` (`apps/api/src/config/
+ * client-supplied-order-id.ts`) is the test affordance `architecture.md` §9
+ * records: `POST /api/orders` accepts an explicit `id` only when this is set,
+ * because `scripts/race/before-order.ts` has to pre-choose an order id to
+ * deliver an early webhook against before the order exists. It is **not**
+ * turned on unconditionally here. This module also spawns the instances
+ * `../key-claim-race.test.ts` and `../order-lock-race.test.ts` use, and those
+ * suites have no business with a client-chosen id — widening what they accept
+ * "for free" would be exactly the scope creep §9 warns against ("used only by
+ * seeds and this script"). So it is a plain opt-in field, defaulting to unset
+ * (→ `false` in the child, per `readBooleanFlag`), and only
+ * `scripts/race/run-checks.ts` — the one caller that is genuinely "this
+ * script" — passes it as `true`.
  */
 import { type ChildProcess, spawn } from "node:child_process";
 
 const HEALTH_POLL_INTERVAL_MS = 50;
 const HEALTH_POLL_TIMEOUT_MS = 15_000;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
+
+/**
+ * How much of a child's stderr is retained for the "did not become healthy"
+ * message when nobody is streaming it live.
+ *
+ * The cap exists because the capture listener stays attached for the whole
+ * life of the process, not just for the startup window: an instance that runs
+ * for the length of `pnpm race` and logs on every request would otherwise
+ * accumulate its entire log in the parent's heap, for a buffer that is only
+ * ever read if startup failed — which, by then, it did not. 64 KiB is far more
+ * than a Nest boot failure produces and small enough to be irrelevant.
+ */
+const STDERR_CAPTURE_LIMIT_BYTES = 64 * 1024;
 
 export interface ApiInstanceHandle {
   /** `http://127.0.0.1:{port}` — every URL this instance's own webhook and supplier calls loop back to. */
@@ -72,12 +102,57 @@ export interface RunningInstance extends ApiInstanceHandle {
   readonly child: ChildProcess;
 }
 
+/** One chunk of a spawned instance's output, as handed to {@link StartApiInstanceOptions.onOutput}. */
+export interface ApiInstanceOutput {
+  readonly stream: "stdout" | "stderr";
+  readonly text: string;
+}
+
 export interface StartApiInstanceOptions {
   /** `apps/api` — the directory containing the just-built `dist/main.js`. */
   readonly apiRoot: string;
   readonly port: number;
   readonly databaseUrl: string;
   readonly supplierTimeoutMs?: number;
+  /**
+   * Set `ALLOW_CLIENT_SUPPLIED_ORDER_ID=true` in the spawned instance's
+   * environment. Optional, and off (unset) unless a caller asks — see this
+   * file's header, "`allowClientSuppliedOrderId` — OPT-IN, AND OFF UNLESS A
+   * CALLER ASKS". Only `scripts/race/run-checks.ts` passes `true`.
+   */
+  readonly allowClientSuppliedOrderId?: boolean;
+  /**
+   * Called for every chunk this instance writes to stdout or stderr, for the
+   * whole life of the process. Optional, and off by default.
+   *
+   * Added for `scripts/race/run-checks.ts`, which is the first caller that
+   * outlives its own startup: a Vitest suite either passes or prints a
+   * stack trace, but a reviewer watching `pnpm race` for thirty seconds needs
+   * to see an instance that died at request forty rather than reading four
+   * identical `fetch failed` lines and guessing. Deliberately a callback and
+   * not a boolean: prefixing, filtering and verbosity are the runner's policy,
+   * and keeping them there leaves this module with one job.
+   *
+   * Chunks are not line-buffered — a caller that wants whole lines must
+   * assemble them.
+   */
+  readonly onOutput?: (output: ApiInstanceOutput) => void;
+  /**
+   * Called with the handle the moment the child exists, **before** the health
+   * poll — so a caller can register it for teardown while it is still booting.
+   *
+   * The window this closes is small and real. `startApiInstance` does not
+   * resolve until the instance answers `/api/health`, so a caller that only
+   * records the resolved value has nothing to kill for the first second or so
+   * of each instance's life. In Vitest that is harmless: `afterAll` cannot run
+   * until `beforeAll` has returned. In `scripts/race/run-checks.ts` it is not
+   * — a `SIGTERM` to the runner during startup would leave a booting `apps/api`
+   * behind, listening on port 4201, for the reviewer to discover later. (An
+   * interactive Ctrl-C happens to be survivable, because the signal goes to the
+   * whole process group and reaches the child directly; a signal sent to the
+   * runner's pid alone does not.)
+   */
+  readonly onSpawn?: (instance: RunningInstance) => void;
 }
 
 function delay(ms: number): Promise<void> {
@@ -127,7 +202,15 @@ async function waitUntilHealthy(baseUrl: string, child: ChildProcess): Promise<v
  * four instances never race each other on a shared `API_PORT`.
  */
 export async function startApiInstance(options: StartApiInstanceOptions): Promise<RunningInstance> {
-  const { apiRoot, port, databaseUrl, supplierTimeoutMs = 2000 } = options;
+  const {
+    apiRoot,
+    port,
+    databaseUrl,
+    supplierTimeoutMs = 2000,
+    allowClientSuppliedOrderId = false,
+    onOutput,
+    onSpawn,
+  } = options;
   const baseUrl = `http://127.0.0.1:${String(port)}`;
 
   const child = spawn(
@@ -145,19 +228,44 @@ export async function startApiInstance(options: StartApiInstanceOptions): Promis
         SUPPLIER_A_URL: `${baseUrl}/internal/suppliers/a`,
         SUPPLIER_TIMEOUT_MS: String(supplierTimeoutMs),
         WEB_API_BASE_URL: baseUrl,
+        // Explicit in both directions, never left to inherit: a `true` sitting
+        // in whoever's shell launched this process must not leak into a suite
+        // that never asked for it, and a caller that *did* ask gets a real
+        // "true" rather than hoping process.env already agreed. See this
+        // file's header, "allowClientSuppliedOrderId — OPT-IN, AND OFF UNLESS
+        // A CALLER ASKS".
+        ALLOW_CLIENT_SUPPLIED_ORDER_ID: String(allowClientSuppliedOrderId),
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
 
+  // Startup diagnostics: stderr is retained (bounded) purely so a failure to
+  // become healthy can quote what the process said before giving up. Live
+  // streaming is a separate concern and goes through `onOutput`.
   const stderrChunks: Buffer[] = [];
-  child.stderr?.on("data", (chunk: Buffer) => {
+  let stderrBytes = 0;
+
+  function capture(stream: "stdout" | "stderr", chunk: Buffer): void {
+    onOutput?.({ stream, text: chunk.toString("utf8") });
+    if (stream !== "stderr" || stderrBytes >= STDERR_CAPTURE_LIMIT_BYTES) return;
+    stderrBytes += chunk.length;
     stderrChunks.push(chunk);
+  }
+
+  child.stdout?.on("data", (chunk: Buffer) => {
+    capture("stdout", chunk);
+  });
+  child.stderr?.on("data", (chunk: Buffer) => {
+    capture("stderr", chunk);
   });
 
   child.on("error", (error: Error) => {
     throw new Error(`apps/api instance on port ${String(port)} failed to start: ${error.message}`);
   });
+
+  // Register for teardown before waiting on health — see `onSpawn`.
+  if (child.pid !== undefined) onSpawn?.({ baseUrl, port, pid: child.pid, child });
 
   try {
     await waitUntilHealthy(baseUrl, child);

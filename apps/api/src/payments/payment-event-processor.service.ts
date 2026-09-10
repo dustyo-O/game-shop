@@ -128,11 +128,17 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { and, eq, isNull, sql } from "drizzle-orm";
 
-import { PaymentEventStatus, isPaymentEventStatus, isSettledOrderStatus } from "@game-shop/contracts";
+import {
+  PaymentEventStatus,
+  isPaymentEventStatus,
+  isSettledOrderStatus,
+  type OrderStatus,
+} from "@game-shop/contracts";
 import { paymentEvents, type DatabaseClient, type Order, type PaymentEvent } from "@game-shop/db";
 
 import { DATABASE_CLIENT } from "../database/database.module.js";
 import { IssuanceOutcome, IssuanceService } from "../issuance/issuance.service.js";
+import { OrderLockService } from "../orders/order-lock.service.js";
 import { OrderTransitionOutcome, OrderTransitionService } from "../orders/order-transition.service.js";
 
 /**
@@ -270,6 +276,7 @@ export class PaymentEventProcessor {
   constructor(
     @Inject(DATABASE_CLIENT) private readonly database: DatabaseClient,
     private readonly transitions: OrderTransitionService,
+    private readonly orderLock: OrderLockService,
     private readonly issuance: IssuanceService,
   ) {}
 
@@ -286,16 +293,26 @@ export class PaymentEventProcessor {
    *
    * `failed` is a single guarded UPDATE ({@link applyFailed}). `paid` is the
    * front of §2.5's chain and runs two ({@link applyPaid}): `created → paid`,
-   * then the claim `paid → delivering`. Neither branch opens a transaction, and
-   * the `paid` branch must not — the seam that follows the claim is an HTTP
-   * call to a supplier, and with `max: 1` a transaction held across it stalls
-   * every other statement from this instance (`packages/db/src/client.ts`).
+   * standalone, and then the claim `paid → delivering` inside a **short
+   * transaction that holds the order row lock** ({@link claimForIssuance}) —
+   * I4's two halves in the order §3.1 writes them.
    *
-   * The two statements need no transaction to be correct, for the same reason
-   * the apply/settle pair does not: each is idempotent under its own guard, and
-   * the event stays pending until the order stops moving. A process that dies
-   * between them leaves the order in `paid` with its event still in the queue,
-   * and the next drain wins `beginIssuance` and carries on.
+   * That transaction commits **before** the seam it guards. The supplier call
+   * that follows the claim is an HTTP round trip, and with `max: 1` a
+   * transaction held across it would stall every other statement from this
+   * instance for up to `SUPPLIER_TIMEOUT_MS` (`packages/db/src/client.ts`). So
+   * the lock covers the claim decision and nothing else; what excludes the
+   * *call* is the `delivering` claim itself, which exactly one worker holds.
+   *
+   * The two steps still need no transaction *between* them to be correct, for
+   * the same reason the apply/settle pair does not: each is idempotent under its
+   * own guard, and the event stays pending until the order stops moving. A
+   * process that dies between them leaves the order in `paid` with its event
+   * still in the queue, and the next drain wins `beginIssuance` and carries on.
+   * `markPaid` is therefore left outside the lock deliberately — pulling it in
+   * would widen the locked span past the statement §3.1 specifies, in exchange
+   * for excluding an interleaving (`created → paid` by one worker, the claim by
+   * another) that is already correct: exactly one worker still wins the claim.
    */
   async processStoredEvent(event: PaymentEvent): Promise<ProcessPaymentEventResult> {
     if (!isPaymentEventStatus(event.status)) {
@@ -489,59 +506,119 @@ export class PaymentEventProcessor {
   }
 
   /**
-   * §2.5 step 3 — **the claim**. `paid → delivering`, and the winner of it is
-   * the one caller that may go on to issuance.
+   * §2.5 step 3 — **the claim**, and **transaction A of I4**. `paid →
+   * delivering`, under the order row lock, and the winner of it is the one
+   * caller that may go on to issuance.
    *
-   * Emitted SQL (verified under `log_statement = 'all'`):
+   * Emitted SQL (copied from the statements Postgres logged under
+   * `log_statement = 'all'`; per the project's raw-SQL rule, `architecture.md`
+   * §2, "Documentation convention"). This is `architecture.md` §3.1's I4 block,
+   * statement for statement:
+   *
+   *   begin
+   *
+   *   select "id", "client_request_id", "sku", "amount_minor", "currency",
+   *          "status", "created_at", "updated_at"
+   *   from "orders" where "orders"."id" = $1 for update;
+   *   -- THE LOCK (`../orders/order-lock.service.ts`). Every other worker that
+   *   -- reaches this statement for the same order waits here until this
+   *   -- transaction commits.
+   *   -- 0 rows => no such order, and nothing is locked. The guard below matches
+   *   --           nothing either and reports `order_not_found`.
    *
    *   update "orders" set "status" = $1, "updated_at" = now()
    *   where ("orders"."id" = $2 and "orders"."status" = ANY($3))
    *   returning "id", "client_request_id", "sku", "amount_minor", "currency",
    *             "status", "created_at", "updated_at";
-   *   -- $1 = 'delivering', $3 = '{paid}'
+   *   -- THE GUARD. $1 = 'delivering', $3 = '{paid}'
    *   -- 1 row  => THIS call claimed the order. Exactly one caller ever sees
    *   --           this per `paid → delivering`, across every process, because
    *   --           the row can only leave `paid` once.
    *   -- 0 rows => somebody else already claimed it, or the order never reached
    *   --           `paid`, or it is finished. This caller stops.
    *
-   * ### What the guard alone protects, and what the row lock will add
+   *   commit
    *
-   * The guard is the whole of the *mutual exclusion* on the status: fifty
-   * concurrent webhooks issue fifty of these UPDATEs, Postgres serialises them
-   * on the row's write lock, the first finds `status = 'paid'` and the other
-   * forty-nine find `'delivering'` and match nothing. One claim, chosen inside
-   * the database, with no application-level check anywhere near it. That is
-   * enough for I4's headline promise — *only one worker advances an order* —
-   * and it is enough for the whole of this file, whose last write is the claim
-   * itself.
+   * ### Why both, when either one looks sufficient
    *
-   * What it does **not** protect is the work *after* the claim, because the
-   * guard's exclusivity ends when its statement commits. The moment issuance
-   * spans several statements — read the order, call the supplier, write
-   * `issuance_attempts`, insert `deliveries`, finish — a second worker (a
-   * Phase 3 retry, an admin re-issue) can interleave with the first, since it
-   * is no longer trying to leave `paid` and so is no longer excluded by this
-   * guard. `SELECT … FOR UPDATE` on the order row (I4, `architecture.md` §3.1)
-   * is what covers that span: the lock serialises the *workers* for as long as
-   * the transaction lives, while the guard makes the *transition* idempotent.
-   * Different jobs, which is why Phase 2 adds the lock and keeps the guard.
+   * **The guard alone** already gives one claim per order: fifty concurrent
+   * webhooks issue fifty of these UPDATEs, Postgres serialises them on the row's
+   * write lock, the first finds `status = 'paid'` and the other forty-nine
+   * re-evaluate against `'delivering'` and match nothing. What it does not give
+   * is exclusivity that outlives its own statement — and issuance is five
+   * statements and a network call long. The moment the claim commits, the guard
+   * has no further opinion about anybody.
    *
-   * Two guarantees that are already the database's and stay untouched by the
-   * missing lock: `deliveries.order_id` UNIQUE (I3) means a second worker
-   * cannot bind a second key even if it gets that far, and the supplier's
-   * `request_id → code` ledger (I5) means a repeat of the same attempt returns
-   * the same code rather than issuing another.
+   * **The lock alone** would be worse still. It serialises the workers but says
+   * nothing about which move is legal, so two workers that took it in turn would
+   * both happily write `delivering` and both go to the supplier. The guard is
+   * what makes the second one's turn a no-op.
+   *
+   * So: the lock serialises the *workers*, the guard makes the *transition*
+   * idempotent, and I4 is the conjunction. Neither is redundant.
+   *
+   * ### What the lock does not cover, on purpose
+   *
+   * It is released at `COMMIT`, one line before the supplier call. That is
+   * forced: `max: 1` per instance means a transaction held across an HTTP round
+   * trip stalls every other statement this process wants to run for up to
+   * `SUPPLIER_TIMEOUT_MS` — the catalogue, order creation, webhook intake, every
+   * status poll (`packages/db/src/client.ts`). **The exclusion for the call
+   * itself is the `delivering` claim**, which is a fact in the database rather
+   * than a lock: a worker that got zero rows from the guard does not call the
+   * supplier, and it cannot get one row later, because nothing returns an order
+   * to `paid`. `../issuance/issuance.service.ts` takes the lock again on the
+   * far side — transaction B — to write the outcome.
+   *
+   * ### The loser's path, which must be a clean no-op
+   *
+   * A worker that waits on the lock, acquires it, and finds the order already
+   * `delivering` or `delivered` gets `not_in_source_state` and falls to
+   * {@link settleOrDeferPaidEvent}. Nothing throws, nothing is written, and the
+   * `observed` row it carries was read *under the lock* — so it is the order's
+   * true state at that instant rather than a racing read. It is still treated as
+   * advisory, because the settle decision is taken after this transaction has
+   * committed and the lock is gone by then; the load-bearing fact remains the
+   * one that is true forever, that this call did not claim the order.
+   *
+   * Two guarantees that were already the database's and are unchanged by the
+   * lock: `deliveries.order_id` UNIQUE (I3) means a second worker cannot bind a
+   * second key even if it gets that far, and the supplier's `request_id → code`
+   * ledger (I5) means a repeat of the same attempt returns the same code rather
+   * than issuing another. The lock is what stops a second worker *reaching the
+   * supplier at all*, which is the thing neither of those can do — by the time
+   * the unique index speaks, a second key has already left the pool.
    */
   private async claimForIssuance(event: PaymentEvent): Promise<ProcessPaymentEventResult> {
-    const claim = await this.transitions.transition(event.orderId, "beginIssuance");
+    // TRANSACTION A. Two statements, no network I/O, no branch between them —
+    // so the queue behind the lock waits microseconds, not a supplier timeout.
+    const { lockedStatus, claim } = await this.database.transaction(async (tx) => {
+      // The lock first, always: it is the serialisation point, so every write
+      // this transaction makes has to happen after it. Nothing branches on the
+      // row that comes back — under the lock a check-then-act would even be
+      // safe, and this codebase still does not write one. The decision is the
+      // guarded UPDATE below, evaluated by Postgres against the row.
+      const locked = await this.orderLock.lockOrder(tx, event.orderId);
+
+      // `transitionWithin`, never `transition`: the latter asks the pool for a
+      // connection of its own, and with `max: 1` the one it would wait for is
+      // the one this transaction is holding
+      // ({@link OrderTransitionService.transition}).
+      const result = await this.transitions.transitionWithin(tx, event.orderId, "beginIssuance");
+
+      return { lockedStatus: locked?.status, claim: result };
+    });
 
     switch (claim.outcome) {
       case OrderTransitionOutcome.Transitioned:
         this.logger.log({
-          msg: "payment event: claimed the order for issuance",
+          msg: "payment event: claimed the order for issuance under the order row lock",
           event_id: event.eventId,
           order_id: event.orderId,
+          // What this worker saw the instant it got the lock, before its own
+          // UPDATE. `paid` on the winner's line; `delivering` or `delivered` on
+          // a loser's, which is the whole story of the race in one field.
+          locked_status: lockedStatus,
           status: claim.order.status,
         });
 
@@ -645,7 +722,12 @@ export class PaymentEventProcessor {
         // Whether the *event* is finished with is a different question from
         // whether this *call* did anything, and it is asked of the order's
         // state — see {@link settleOrDeferPaidEvent}.
-        return this.settleOrDeferPaidEvent(event, claim.observed);
+        //
+        // `claim.observed` was read inside transaction A, under the lock, so it
+        // is what the order truly was while this worker held it. It is still
+        // passed as advisory: the settle decision below runs after the commit
+        // that released the lock.
+        return this.settleOrDeferPaidEvent(event, claim.observed, lockedStatus);
 
       case OrderTransitionOutcome.OrderNotFound:
         // The order existed for step 2 and does not exist now. Nothing in this
@@ -677,11 +759,20 @@ export class PaymentEventProcessor {
    *     that every future drain re-examines and never clears.
    *   - `created`, `paid`, `delivering` → leave pending. The order is unfinished
    *     and this row is a record that says so. Whether some other worker is
-   *     mid-chain right now cannot be established from here — `observed` is
-   *     advisory, read after the UPDATE and possibly already stale — and the
-   *     asymmetry of the mistake settles the argument: a needless pending row
-   *     costs a repeated no-op, while a needless settle costs the payment
-   *     result permanently.
+   *     mid-chain right now cannot be established from here — and the asymmetry
+   *     of the mistake settles the argument: a needless pending row costs a
+   *     repeated no-op, while a needless settle costs the payment result
+   *     permanently.
+   *
+   *     `observed` and `lockedStatus` were both read inside transaction A while
+   *     this worker held the order row lock, so they are not a racing read —
+   *     they are what the order genuinely was at that instant. They are still
+   *     **advisory here**, and the distinction is worth being exact about: the
+   *     lock was released by the `COMMIT` that ended transaction A, and this
+   *     method runs after it. An order that read `delivering` under the lock may
+   *     be `delivered` by the time the settle decision is taken. What does not
+   *     expire is the outcome itself — *this call did not claim the order* — and
+   *     that is the only fact anything branches on.
    *
    * `isSettledOrderStatus` comes from `@game-shop/contracts` rather than a
    * local list of three strings, so Phase 3's `delivery_failed` is classified
@@ -695,12 +786,16 @@ export class PaymentEventProcessor {
   private async settleOrDeferPaidEvent(
     event: PaymentEvent,
     observed: Order,
+    lockedStatus: OrderStatus | undefined,
   ): Promise<ProcessPaymentEventResult> {
     if (isSettledOrderStatus(observed.status)) {
       this.logger.log({
         msg: "payment event: no-op, the order has already stopped moving",
         event_id: event.eventId,
         order_id: event.orderId,
+        // The state this worker found when it won the lock — the answer to
+        // "what happened to the loser of the race", in one field.
+        locked_status: lockedStatus,
         observed_status: observed.status,
       });
 
@@ -713,6 +808,7 @@ export class PaymentEventProcessor {
       msg: "payment event: no-op, this call did not claim the order; left pending until the order settles",
       event_id: event.eventId,
       order_id: event.orderId,
+      locked_status: lockedStatus,
       observed_status: observed.status,
     });
 

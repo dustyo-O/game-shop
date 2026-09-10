@@ -29,6 +29,30 @@
  * documentation.
  *
  * ---------------------------------------------------------------------------
+ * THE TWO PROVIDERS HERE WHOSE ABSENCE IS NOT FATAL — FOR TWO DIFFERENT REASONS
+ * ---------------------------------------------------------------------------
+ * `ADMIN_TOKEN` joins `SUPPLIER_A_URL` and `SUPPLIER_TIMEOUT_MS` in being read
+ * and checked while the container is built, and differs from both in what
+ * happens when it is missing: the boot continues, loudly, and the endpoints
+ * behind it fail closed with a `503`. The argument for that asymmetry is in
+ * `./env.ts` ({@link readOptionalSecret}) and `./admin-token.ts`, and it comes
+ * down to one line of `architecture.md` §4 — the four processing triggers are
+ * layered *"so no single one is load-bearing"*, so an unconfigured admin token
+ * costs a backstop rather than an order, and refusing to boot over it would
+ * take the catalogue and the webhook down with it.
+ *
+ * `ALLOW_CLIENT_SUPPLIED_ORDER_ID` (`./client-supplied-order-id.ts`) is
+ * unset-tolerant for a different, simpler reason: unset is not a degraded
+ * state to report, it is the *only* state a real deployment should ever be
+ * in. Nothing fails closed on its absence because there is nothing to fail —
+ * `POST /api/orders` behaves exactly as it did before this file existed.
+ *
+ * What is *not* asymmetric, for either of them, is when the check runs. A
+ * token that is present but too short to be a secret, or a flag set to
+ * anything but `"true"`/`"false"`, still stops the boot from this module, at
+ * the same moment a malformed `SUPPLIER_A_URL` would.
+ *
+ * ---------------------------------------------------------------------------
  * WHAT IS DELIBERATELY NOT HERE
  * ---------------------------------------------------------------------------
  * `PAYMENT_WEBHOOK_URL` is still read in {@link PaymentSimulatorService}'s
@@ -49,10 +73,15 @@
  */
 import { Module } from "@nestjs/common";
 
+import { ADMIN_TOKEN_CONFIG, adminTokenConfigProvider } from "./admin-token.js";
+import {
+  CLIENT_SUPPLIED_ORDER_ID_CONFIG,
+  clientSuppliedOrderIdConfigProvider,
+} from "./client-supplied-order-id.js";
 import { SUPPLIER_A_CONFIG, supplierAConfigProvider } from "./supplier-config.js";
 
 @Module({
-  providers: [supplierAConfigProvider],
-  exports: [SUPPLIER_A_CONFIG],
+  providers: [supplierAConfigProvider, adminTokenConfigProvider, clientSuppliedOrderIdConfigProvider],
+  exports: [SUPPLIER_A_CONFIG, ADMIN_TOKEN_CONFIG, CLIENT_SUPPLIED_ORDER_ID_CONFIG],
 })
 export class ConfigModule {}
