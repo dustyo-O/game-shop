@@ -33,15 +33,15 @@ _Concepts to walk away able to explain: the order lifecycle as a state machine, 
 
 _The key stage. The pipeline from Phase 1 works when the world is polite; this phase makes it hold when the world repeats, races and reorders itself. Acceptance criteria 1–3 are settled here._
 
-- [ ] **Single Issuance Under Races** _(~3h)_
-  - [ ] **Duplicate-Proof Ordering:** An impatient double-click on Купить produces one order and one charge, guaranteed by the server rather than by a disabled button.
-  - [ ] **Replay-Proof Payment Events:** A webhook redelivered with the same `event_id` changes nothing at all — the payment provider is free to retry as often as it likes.
-  - [ ] **Concurrent Webhook Safety:** Fifty simultaneous "paid" notifications for a single order produce exactly one issuance and consume exactly one key.
-  - [ ] **Out-of-Order Tolerance:** A payment notification that arrives before its order exists — or otherwise out of sequence — is retained and applied correctly, never lost and never doubled.
-  - [ ] **Fast Acknowledgement:** Notifications are accepted and acknowledged promptly, with failures signalled deliberately so the provider retries only when we actually want it to.
+- [x] **Single Issuance Under Races** _(~3h)_
+  - [x] **Duplicate-Proof Ordering:** An impatient double-click on Купить produces one order and one charge, guaranteed by the server rather than by a disabled button.
+  - [x] **Replay-Proof Payment Events:** A webhook redelivered with the same `event_id` changes nothing at all — the payment provider is free to retry as often as it likes.
+  - [x] **Concurrent Webhook Safety:** Fifty simultaneous "paid" notifications for a single order produce exactly one issuance and consume exactly one key.
+  - [x] **Out-of-Order Tolerance:** A payment notification that arrives before its order exists — or otherwise out of sequence — is retained and applied correctly, never lost and never doubled.
+  - [x] **Fast Acknowledgement:** Notifications are accepted and acknowledged promptly, with failures signalled deliberately so the provider retries only when we actually want it to.
 
-- [ ] **Proof the Reviewer Can Run** _(~1h)_
-  - [ ] **Reproducible Race Scripts:** One runnable script per acceptance scenario, each asserting the invariant it defends — turning the reviewer's checklist into something they execute rather than read. Required by the assignment.
+- [x] **Proof the Reviewer Can Run** _(~1h)_
+  - [x] **Reproducible Race Scripts:** One runnable script per acceptance scenario, each asserting the invariant it defends — turning the reviewer's checklist into something they execute rather than read. Required by the assignment.
 
 _Concepts to walk away able to explain: at-least-once delivery, idempotency keys, the durable inbox pattern, and why uniqueness enforced by the database beats a check-then-act in application code._
 

@@ -1,7 +1,7 @@
 # Functional Specification: Single Issuance Under Races
 
 - **Roadmap Item:** Phase 2 — Single Issuance Under Races; Proof the Reviewer Can Run
-- **Status:** Draft
+- **Status:** Completed
 - **Author:** Alexander Shleyko
 
 ---

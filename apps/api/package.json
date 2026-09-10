@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "test:concurrency": "vitest run test/concurrency/",
-    "test:acceptance": "vitest run test/acceptance/purchase-and-key-delivery.test.ts",
+    "test:acceptance": "vitest run test/acceptance/",
     "test": "vitest run"
   },
   "dependencies": {

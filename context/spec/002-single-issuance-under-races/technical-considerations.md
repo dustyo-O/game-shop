@@ -1,7 +1,7 @@
 # Technical Specification: Single Issuance Under Races
 
 - **Functional Specification:** `context/spec/002-single-issuance-under-races/functional-spec.md`
-- **Status:** Draft
+- **Status:** Completed
 - **Author(s):** Alexander Shleyko
 
 ---

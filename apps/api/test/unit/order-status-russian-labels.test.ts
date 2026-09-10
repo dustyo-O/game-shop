@@ -1,0 +1,120 @@
+// @layer: unit
+// @spec: 002-single-issuance-under-races
+// @regression
+/**
+ * Functional spec §2.8's one testable fact for this phase: *"When the shopper
+ * reads any text this phase adds or changes, then that text is in Russian, as
+ * established in spec 001 §2.8."*
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS WORTH A TEST NOW, WHEN SPEC 001'S SUITE ONLY "VERIFIED BY
+ * SOURCE REVIEW"
+ * ---------------------------------------------------------------------------
+ * `../acceptance/purchase-and-key-delivery.test.ts`'s header explains why
+ * Phase 1 left §2.8 to a one-line note: only `created` was reachable through
+ * the UI, so the other five labels were unread prose with nothing to exercise.
+ * Phase 2 changes that premise — `paid`, `delivering`, `payment_failed` and
+ * `out_of_stock` are now genuinely reached by a shopper watching their order
+ * settle (§2.5), and this suite's own out-of-order and duplicate-report tests
+ * below drive every one of them. A label that was silently left in English, or
+ * merged with another status by copy-paste, would now be shown to a real
+ * shopper — so it is cheap and real to check, exactly as this task's brief
+ * says.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS READS THE FILE'S TEXT RATHER THAN IMPORTING AND CALLING IT
+ * ---------------------------------------------------------------------------
+ * `apps/web/src/entities/order/lib/order-status-label.ts` belongs to
+ * `apps/web` — a separate Vite application with its own build, not a
+ * workspace package `apps/api` depends on. Importing it here would either
+ * require wiring a second, unrelated app into this package's module
+ * resolution for the sake of one string table, or silently rely on a
+ * relative path resolving through two different bundlers' rules. Reading the
+ * file as **text** and checking its literal content needs neither: it is the
+ * same "independent transcription, not a shared import" stance
+ * `../concurrency/support/db.ts` documents for `deriveTestRequestId` — a test
+ * that imported the very code it is meant to catch a mistake in cannot catch
+ * that mistake.
+ *
+ * This is therefore a `@layer: unit` check in the strict sense: no database,
+ * no HTTP, no running process — a deterministic scan of one source file's
+ * text, entirely independent of every other test in this spec's suite.
+ */
+import { dirname, resolve } from "node:path";
+import { readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+
+import { orderStatuses } from "@game-shop/contracts";
+import { describe, expect, it } from "vitest";
+
+const TEST_DIR = dirname(fileURLToPath(import.meta.url));
+
+/**
+ * `apps/web/src/entities/order/lib/order-status-label.ts` — three levels up
+ * from `apps/api/test/unit` reaches `apps/`, then down into `web`.
+ */
+const ORDER_STATUS_LABEL_FILE = resolve(
+  TEST_DIR,
+  "..",
+  "..",
+  "..",
+  "web",
+  "src",
+  "entities",
+  "order",
+  "lib",
+  "order-status-label.ts",
+);
+
+/**
+ * Every `[OrderStatus.X]: "…"` entry in the object literal, in file order.
+ * Deliberately does not care about the key names — see the file header on
+ * why this is independent of `@game-shop/contracts`'s own naming — only that
+ * each bracketed-key line carries a quoted string value.
+ */
+const LABEL_ENTRY_PATTERN = /\[OrderStatus\.\w+\]:\s*"([^"]*)"/g;
+
+/** The Cyrillic Unicode block — U+0400–U+04FF covers every letter Russian uses, а–я and Ё/ё included. */
+const CYRILLIC_PATTERN = /[Ѐ-ӿ]/;
+
+function extractLabels(source: string): readonly string[] {
+  return [...source.matchAll(LABEL_ENTRY_PATTERN)].map((match) => match[1] ?? "");
+}
+
+describe("functional spec §2.8 — every order status label is in Russian", () => {
+  const source = readFileSync(ORDER_STATUS_LABEL_FILE, "utf8");
+  const labels = extractLabels(source);
+
+  // @regression
+  it("the label table defines exactly one entry per lifecycle status — none missing, none duplicated", () => {
+    // `orderStatuses` (@game-shop/contracts) is the same list
+    // `Record<OrderStatus, string>` is typed against — a total record cannot
+    // compile with a status missing, so this is really checking that this
+    // independent regex-based read agrees with what the compiler already
+    // enforces, per the file header's "do not import what you are checking"
+    // stance.
+    expect(labels.length, `found ${String(labels.length)} labelled entries in ${ORDER_STATUS_LABEL_FILE}`).toBe(
+      orderStatuses.length,
+    );
+  });
+
+  // @regression
+  it("every status label is non-empty and contains a Cyrillic character — not English, not a blank placeholder", () => {
+    for (const [index, label] of labels.entries()) {
+      expect(label.length, `label #${String(index)} ("${label}") is empty`).toBeGreaterThan(0);
+      expect(CYRILLIC_PATTERN.test(label), `label #${String(index)} ("${label}") has no Cyrillic character`).toBe(
+        true,
+      );
+    }
+  });
+
+  // @regression
+  it("every status has its own distinct wording — no two lifecycle states share one label", () => {
+    // A shopper who watches `paid` and `delivering` render identical text
+    // cannot tell the shop is still working from the shop being stuck — the
+    // exact "unexplained wait" functional spec §2.5's second criterion warns
+    // against.
+    const distinct = new Set(labels);
+    expect(distinct.size, `labels: ${JSON.stringify(labels)}`).toBe(labels.length);
+  });
+});

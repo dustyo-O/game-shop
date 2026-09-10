@@ -68,9 +68,9 @@
  *                         build nothing. Unset → local mode (the default).
  *   RACE_INSTANCES        Local instances to start. Default 4 — the number
  *                         architecture.md §7's measurement used.
- *   RACE_BASE_PORT        First port. Default 4201, so a run never collides
- *                         with `pnpm dev` (3000, 5173) or with the Vitest
- *                         concurrency suite (4101-4104).
+ *   RACE_BASE_PORT        First port. Default 4601, clear of `pnpm dev`
+ *                         (3000, 5173) and of every port the Vitest suites
+ *                         bind (4101, 4201, 4301, 4401, 4501-4504).
  *   RACE_SKIP_BUILD       Non-empty → skip the rebuild. Faster to iterate, and
  *                         WRONG for RED validation: the spawned processes run
  *                         `dist/`, so a weakened source file that was not
@@ -103,7 +103,26 @@ const RUNNER_FILENAME = "run-checks.ts";
 const FIRST_CHECK = "harness";
 
 const DEFAULT_INSTANCE_COUNT = 4;
-const DEFAULT_BASE_PORT = 4201;
+/**
+ * First port `pnpm race` binds, for `RACE_INSTANCES` consecutive ports.
+ *
+ * 4601 and not 4201. The original default was 4201 and it **collided** with
+ * `test/acceptance/purchase-and-key-delivery.test.ts`, which binds that exact
+ * port — the comment below this one used to claim there was no collision, and
+ * two later test files documented the overlap in their own headers rather than
+ * resolving it.
+ *
+ * Nobody hit it because both are documented as run one at a time, which is
+ * exactly what makes it worth moving: the failure would only appear when
+ * somebody ran `pnpm test` and `pnpm race` together — in CI, or on the machine
+ * of a reviewer with two terminals open — and it would present as an instance
+ * that would not start, or worse, as one suite's requests being answered by the
+ * other suite's process.
+ *
+ * The Vitest suites bind 4101, 4201, 4301, 4401 and 4501-4504. This range is
+ * clear of all of them and of `pnpm dev` (3000, 5173).
+ */
+const DEFAULT_BASE_PORT = 4601;
 const DEFAULT_CHECK_TIMEOUT_MS = 180_000;
 
 const EXIT_OK = 0;
