@@ -18,7 +18,7 @@
  * {@link SupplierKeyClaimService} all return discriminated unions instead of
  * throwing, because in each of them "nothing happened" is an ordinary result of
  * a statement that ran correctly. Here it is the opposite: the *only* ordinary
- * result of {@link SupplierAClient.issue} is a code. Everything else is the
+ * result of {@link SupplierClient.issue} is a code. Everything else is the
  * boundary failing — an answer that was a refusal, or no answer at all — and
  * modelling those as return values would let a caller reach for `result.code`
  * on a union it had not narrowed, or ignore the result entirely.

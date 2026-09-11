@@ -8,6 +8,34 @@
       "when": 1788523933523,
       "tag": "0000_init",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1789051170809,
+      "tag": "0001_delivery_failed_status",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1789054721423,
+      "tag": "0002_issuance_attempt_ledger",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1789073426734,
+      "tag": "0003_supplier_behaviour",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1789117984626,
+      "tag": "0004_supplier_hang_placement",
+      "breakpoints": true
     }
   ]
 }

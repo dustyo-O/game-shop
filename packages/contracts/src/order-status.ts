@@ -1,7 +1,7 @@
 /**
  * The order lifecycle: `created → paid → delivering → delivered`, with branches
- * to `payment_failed` and `out_of_stock` (architecture §3, technical
- * considerations §2.2).
+ * to `payment_failed`, `out_of_stock` and `delivery_failed` (architecture §3,
+ * technical considerations §2.2; spec 003 technical-considerations §2).
  *
  * This is the wire-level definition — the one `apps/web` reads out of
  * `GET /api/orders/:id`, and the one the race scripts assert against. The
@@ -12,9 +12,11 @@
  * drift fail loudly: a status this file invents and the database has never heard
  * of is rejected on write, not discovered by a shopper.
  *
- * `delivery_failed` is **Phase 3** and is deliberately absent. It is not in the
- * CHECK constraint either, and a status the shop cannot reach should not be a
- * value either layer will accept.
+ * `delivery_failed` arrived with Phase 3 and is here now. Migration
+ * `0001_delivery_failed_status` widened the CHECK constraint in the same commit
+ * as the code that can reach it, so neither layer accepts a status the other has
+ * never heard of. It is classified as **recoverable, not terminal** — see
+ * {@link recoverableOrderStatuses} for why that is the load-bearing choice.
  *
  * An `as const` object rather than a TypeScript `enum` — see the "what this
  * package is not" note in `./index.ts` for the full reasoning. The short version:
@@ -36,6 +38,11 @@ export const OrderStatus = {
   PaymentFailed: "payment_failed",
   /** The supplier's key pool was empty. Recoverable — see below. */
   OutOfStock: "out_of_stock",
+  /**
+   * The shop could not obtain a key: every supplier definitely refused, or the
+   * outcome was never established. Recoverable — see below.
+   */
+  DeliveryFailed: "delivery_failed",
 } as const;
 
 export type OrderStatus = (typeof OrderStatus)[keyof typeof OrderStatus];
@@ -53,6 +60,7 @@ export const orderStatuses = [
   OrderStatus.Delivered,
   OrderStatus.PaymentFailed,
   OrderStatus.OutOfStock,
+  OrderStatus.DeliveryFailed,
 ] as const;
 
 /**
@@ -72,6 +80,9 @@ export type InFlightOrderStatus = (typeof inFlightOrderStatuses)[number];
 /**
  * **Terminal.** `delivered` and `payment_failed` accept no further transitions —
  * ever, by any path, automatic or manual.
+ *
+ * `delivery_failed` is deliberately **not** in this set, however final it may
+ * sound — see {@link recoverableOrderStatuses}.
  *
  * This is invariant I9 (architecture §3). The transition helper enforces it by
  * naming permitted source states on every update:
@@ -95,26 +106,38 @@ export const terminalOrderStatuses = [
 export type TerminalOrderStatus = (typeof terminalOrderStatuses)[number];
 
 /**
- * **Recoverable in a later phase.** `out_of_stock` is where a paid order lands
- * when the supplier's pool was empty.
+ * **Settled, but nothing moves it on its own — a person does.** `out_of_stock`
+ * is where a paid order lands when the supplier's pool was empty;
+ * `delivery_failed` is where it lands when the shop could not obtain a key at
+ * all (spec 003 technical-considerations §2.4).
  *
  * The distinction from {@link terminalOrderStatuses} is the whole reason this
  * set is separate rather than folded in with the other two:
  *
- *   - **Phase 1:** nothing moves it. It behaves exactly like a terminal state,
- *     and the status page renders it as an ordinary outcome
- *     (technical-considerations §2.5 step 6).
- *   - **Phase 3:** the admin panel lists these orders and retries them through
- *     the same idempotent issuance path the automatic flow uses, re-entering
- *     `delivering` (architecture §4, "Recovery").
+ *   - **Nothing here moves by itself.** It behaves exactly like a terminal state
+ *     to a passive observer, and the status page renders it as an ordinary
+ *     outcome (technical-considerations §2.5 step 6).
+ *   - **An operator moves it.** The recovery surface lists these orders and
+ *     retries them through the same idempotent issuance path the automatic flow
+ *     uses, re-entering `delivering` (architecture §4, "Recovery"; spec 003
+ *     §2.5, and the `retryIssuance` rule in its technical-considerations §2.2).
  *
  * So it is *settled* but not *terminal*, and code must not treat the two as
  * interchangeable. Anything that means "no further transitions are legal"
  * (I9, the transition helper's guard lists) uses {@link terminalOrderStatuses};
  * anything that means "nothing more will happen on its own" (the poll's stop
  * condition, the admin panel's inbox) uses {@link settledOrderStatuses}.
+ *
+ * **Why `delivery_failed` is here and not above.** Terminal is the set the
+ * guarded `UPDATE ... WHERE status = ANY($3)` draws its permitted source states
+ * from, and nothing may leave it. Classifying `delivery_failed` as terminal
+ * would make the operator retry illegal by construction — it would match zero
+ * rows for ever, and spec 003 §2.4/§2.5 could not be built at all.
  */
-export const recoverableOrderStatuses = [OrderStatus.OutOfStock] as const;
+export const recoverableOrderStatuses = [
+  OrderStatus.OutOfStock,
+  OrderStatus.DeliveryFailed,
+] as const;
 
 export type RecoverableOrderStatus = (typeof recoverableOrderStatuses)[number];
 
@@ -123,10 +146,12 @@ export type RecoverableOrderStatus = (typeof recoverableOrderStatuses)[number];
  *
  * **This is the frontend's polling stop condition.** The order page polls
  * `GET /api/orders/:id` once a second while the order is in-flight and stops on
- * `delivered`, `payment_failed` or `out_of_stock` (technical-considerations
- * §2.6). Deriving that set here rather than restating three strings in the page
- * is what stops Phase 3's `delivery_failed` from producing a page that polls a
- * dead order forever.
+ * `delivered`, `payment_failed`, `out_of_stock` or `delivery_failed`
+ * (technical-considerations §2.6). Deriving that set here rather than restating
+ * the strings in the page is what stopped `delivery_failed` from producing a
+ * page that polls a dead order forever: adding it to
+ * {@link recoverableOrderStatuses} above was the whole edit — this list, and the
+ * poll that reads it, needed no change at all.
  */
 export const settledOrderStatuses = [
   ...terminalOrderStatuses,
@@ -139,11 +164,13 @@ export type SettledOrderStatus = (typeof settledOrderStatuses)[number];
  * Compile-time proof that every member of {@link OrderStatus} is classified as
  * either in-flight or settled — no status is in both, none is in neither.
  *
- * Type-level only: it emits nothing and costs nothing at run time. When Phase 3
- * adds `delivery_failed` to {@link OrderStatus}, this alias stops compiling until
- * the new status is put in one of the lists above, which is the point. Without
- * it, an unclassified status silently reads as "in-flight" to
- * {@link isSettledOrderStatus} and the status page polls it forever.
+ * Type-level only: it emits nothing and costs nothing at run time, and it has
+ * already been paid for once. Adding `delivery_failed` to {@link OrderStatus}
+ * stopped this alias compiling — *Type `"delivery_failed"` does not satisfy the
+ * constraint `never`* — until the new status was classified into one of the
+ * lists above, which is the point. Without it, an unclassified status silently
+ * reads as "in-flight" to {@link isSettledOrderStatus} and the status page polls
+ * it forever.
  */
 type AssertNoUnclassifiedStatus<TUnclassified extends never> = TUnclassified;
 type _EveryOrderStatusIsClassified = AssertNoUnclassifiedStatus<
@@ -165,14 +192,14 @@ export function isTerminalOrderStatus(status: OrderStatus): status is TerminalOr
   return (terminalOrderStatuses as readonly OrderStatus[]).includes(status);
 }
 
-/** `out_of_stock` — settled now, retryable from the admin panel in Phase 3. */
+/** `out_of_stock` or `delivery_failed` — settled, and retryable by an operator. */
 export function isRecoverableOrderStatus(status: OrderStatus): status is RecoverableOrderStatus {
   return (recoverableOrderStatuses as readonly OrderStatus[]).includes(status);
 }
 
 /**
- * `delivered`, `payment_failed` or `out_of_stock` — the order will not move on
- * its own. **The status page's stop-polling condition.**
+ * `delivered`, `payment_failed`, `out_of_stock` or `delivery_failed` — the order
+ * will not move on its own. **The status page's stop-polling condition.**
  */
 export function isSettledOrderStatus(status: OrderStatus): status is SettledOrderStatus {
   return (settledOrderStatuses as readonly OrderStatus[]).includes(status);

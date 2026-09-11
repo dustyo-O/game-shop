@@ -40,6 +40,24 @@ const orderStatusLabels: Readonly<Record<OrderStatus, string>> = {
    * refund this phase cannot make.
    */
   [OrderStatus.OutOfStock]: "Ключей сейчас нет в наличии",
+  /**
+   * The other recoverable state (spec 003 §2.3): the shop could not obtain a
+   * key at all — the supplier errored, timed out, or answered something the shop
+   * could not read.
+   *
+   * It is worded as *what happened*, not *whose fault it was*, and deliberately
+   * does not say «ошибка» — a shopper reading this has paid, and the one thing
+   * the label must not imply is that the money went nowhere. The sentence that
+   * says the payment is safe is not here: a status label is a few words in a
+   * `<dd>`, and §2.3's second half needs a sentence. That lives in
+   * `order-recovery-explanation.ts`, beside this file and total over the same
+   * recoverable set.
+   *
+   * Distinct from «Ключей сейчас нет в наличии» on purpose: §2.3's second
+   * criterion is that the two failures read differently, and the shopper's first
+   * glance lands here rather than on the paragraph below.
+   */
+  [OrderStatus.DeliveryFailed]: "Не удалось выдать ключ",
 };
 
 /** The Russian label for a status — total, so every status has one. */

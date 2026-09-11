@@ -32,7 +32,12 @@ export interface SupplierIssueRequest {
    * than depending on a caller to have remembered it. The supplier keys its own
    * ledger on it (invariant I5):
    *
-   *   SELECT code FROM supplier_requests WHERE request_id = $1;
+   *   SELECT code FROM supplier_requests WHERE request_id = $1 AND provider = $2;
+ *   -- Both predicates. The provider was added in Phase 3 once a second supplier
+ *   -- existed: a probe mis-addressed to the wrong supplier must return zero rows
+ *   -- ("this supplier has never answered this id") rather than the other
+ *   -- supplier's code recorded as though this one had issued it. Measured before
+ *   -- the narrowing: the request_id-only predicate returned the other supplier's key.
    *   -- found => return that code unchanged, however many times we are asked
    *
    * That is what makes retry-after-timeout safe. Architecture §4 spells out the
@@ -74,8 +79,14 @@ export type SupplierIssueStatus = (typeof SupplierIssueStatus)[keyof typeof Supp
  * move on to the fallback. A *timeout* produces no body at all and is a
  * different thing entirely; see {@link SupplierIssueRequest.request_id}.
  *
- * `out_of_stock` is the only reason Phase 1 defines. Phase 3's failure injection
- * adds members here — one line, in one place, which is what this package is for.
+ * Phase 1 defined one reason. Phase 3's failure injection added the second, and
+ * it cost exactly what this package exists to make it cost: one line, in one
+ * place. Every consumer that had to change was found by a compiler rather than
+ * by a reader — the shop's `settleRefusedTransition`
+ * (`apps/api/src/issuance/issuance-ladder.ts`) and the stubs' refusal builder
+ * (`apps/api/src/suppliers/supplier-issue-refusal.ts`) each switch over this
+ * object with an `assertNever`, so a third member breaks both builds instead of
+ * falling silently into either one's existing branch.
  */
 export const SupplierIssueErrorReason = {
   /**
@@ -97,6 +108,37 @@ export const SupplierIssueErrorReason = {
    * renders as an ordinary outcome rather than an error.
    */
   OutOfStock: "out_of_stock",
+
+  /**
+   * **The supplier refused on its own account** — it was asked, it could have
+   * issued, and it declined. The pool is untouched and may well be full.
+   *
+   * Phase 3's injected failure (`supplier_behaviour.failure_rate` /
+   * `fail_next`, 003 technical-considerations §7). It is deliberately **not**
+   * `out_of_stock`, and the second of the two reasons is the one that bites:
+   *
+   *   1. It would be a lie whenever the pool is full, which is the ordinary
+   *      case — fifty keys sit unclaimed while the supplier says no.
+   *   2. 003 §2.4's decision table routes `out_of_stock` to the **`out_of_stock`
+   *      order status** and every *other* definite reason to
+   *      **`delivery_failed`**. Reusing it would therefore tell the shopper
+   *      «ключей сейчас нет» — *wait, stock is coming* — about a supplier fault
+   *      that no restock will ever fix. Functional spec 003 §2.3's second
+   *      criterion is precisely the requirement that those two read differently.
+   *
+   * **Definite, and answered `4xx` — never `5xx`.** It belongs in this set at
+   * all because the supplier *answered*: no key was issued, the attempt is
+   * recorded `failed`, and the shop may fall through to the backup with a
+   * **new** `request_id`. A `5xx` is the shape of an *unknown* outcome — what an
+   * intermediary emits when it could not reach a service, and what a killed
+   * serverless function produces — so dressing a refusal in one would route
+   * "definitely no key" through the branch built for "possibly a key". The
+   * status code is only ever a hint, though; what makes a failure definite is
+   * this body being parseable, which is why the digits are chosen in one place
+   * (`apps/api/src/suppliers/supplier-issue-refusal.ts`) rather than at each
+   * stub.
+   */
+  SupplierRejected: "supplier_rejected",
 } as const;
 
 export type SupplierIssueErrorReason =

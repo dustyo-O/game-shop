@@ -4,18 +4,22 @@
  * ---------------------------------------------------------------------------
  * WHAT THIS MODULE IS FOR
  * ---------------------------------------------------------------------------
- * Registering it in {@link AppModule} is what turns two documented strings in
+ * Registering it in {@link AppModule} is what turns documented strings in
  * `.env.example` into a boot-time guarantee. Nest instantiates every provider
  * declared here while it builds the container — eagerly, and without waiting
- * for anything to inject them — so a missing `SUPPLIER_A_URL` or a
- * `SUPPLIER_TIMEOUT_MS` of `"soon"` stops the process before `app.listen()`
- * rather than surfacing as a `500` on the first order somebody pays for.
+ * for anything to inject them — so a missing `SUPPLIER_A_URL`, a
+ * `SUPPLIER_B_URL` with no scheme, or a `SUPPLIER_TIMEOUT_MS` of `"soon"` stops
+ * the process before `app.listen()` rather than surfacing as a `500` on the
+ * first order somebody pays for.
  *
- * That distinction is the module's entire reason to exist today, because
- * **nothing injects `SUPPLIER_A_CONFIG` yet** — the issuance client is Slice 5.
- * A configuration provider with no consumers still runs, still validates, and
- * still refuses the boot, which is precisely the behaviour wanted: the shop
- * cannot come up unable to reach its supplier and look healthy while doing it.
+ * **`SUPPLIER_B_CONFIG` currently has no consumer, and is validated anyway.**
+ * That is not an accident to tidy up later — it is the same property that made
+ * this module worth having in Phase 1, when nothing injected `SUPPLIER_A_CONFIG`
+ * either. A configuration provider with no consumers still runs, still
+ * validates, and still refuses the boot, so the shop cannot come up unable to
+ * reach its backup supplier and look healthy while doing it. B's misconfiguration
+ * is the one that would otherwise stay hidden longest: nothing calls the backup
+ * until a fall-through, which happens on a paid order.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS IS NOT `@Global()`
@@ -78,10 +82,25 @@ import {
   CLIENT_SUPPLIED_ORDER_ID_CONFIG,
   clientSuppliedOrderIdConfigProvider,
 } from "./client-supplied-order-id.js";
-import { SUPPLIER_A_CONFIG, supplierAConfigProvider } from "./supplier-config.js";
+import {
+  SUPPLIER_A_CONFIG,
+  SUPPLIER_B_CONFIG,
+  supplierAConfigProvider,
+  supplierBConfigProvider,
+} from "./supplier-config.js";
 
 @Module({
-  providers: [supplierAConfigProvider, adminTokenConfigProvider, clientSuppliedOrderIdConfigProvider],
-  exports: [SUPPLIER_A_CONFIG, ADMIN_TOKEN_CONFIG, CLIENT_SUPPLIED_ORDER_ID_CONFIG],
+  providers: [
+    supplierAConfigProvider,
+    supplierBConfigProvider,
+    adminTokenConfigProvider,
+    clientSuppliedOrderIdConfigProvider,
+  ],
+  exports: [
+    SUPPLIER_A_CONFIG,
+    SUPPLIER_B_CONFIG,
+    ADMIN_TOKEN_CONFIG,
+    CLIENT_SUPPLIED_ORDER_ID_CONFIG,
+  ],
 })
 export class ConfigModule {}

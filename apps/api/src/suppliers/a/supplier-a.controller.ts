@@ -95,121 +95,71 @@
  * WHERE PHASE 3'S FAILURE AND TIMEOUT INJECTION GOES
  * ---------------------------------------------------------------------------
  * Here, at the top of {@link SupplierAController.issue}, before the service is
- * called — as an injected provider of `SupplierAModule` reading its rates from
- * the environment (architecture.md §5, *"supplier behaviour must be tunable at
- * runtime"*). Nothing about this file needs restructuring for it: an injected
- * failure returns the same error shape with a new `reason` member, which is one
- * line in `packages/contracts`; an injected timeout sleeps past
- * `SUPPLIER_TIMEOUT_MS` and never reaches the claim at all.
+ * called. Nothing about this file needed restructuring for it, and the failure
+ * half of that prediction has now been cashed twice over: the `reason` member is
+ * `supplier_rejected`, it cost one line in `packages/contracts`, and it is built
+ * by the shared `../supplier-issue-refusal.ts` exactly as `out_of_stock` is — an
+ * injected refusal is a *reason*, not a second way of answering.
  *
- * Above the service and never inside it, because the service's guarantees are
- * about what is *stored*, and injected chaos must not be able to weaken them. A
- * hang injected *after* a successful claim is precisely the Phase 3 trap — a key
- * genuinely issued, a client that timed out and cannot know it, and a retry on
- * the same `request_id` that gets the same code back.
+ * Around the service and never inside it, because the service's guarantees are
+ * about what is *stored*, and injected chaos must not be able to weaken them.
  *
- * None of those knobs exist yet. Technical-considerations §1 builds *"only
- * supplier A, always succeeding"* in this phase, so the only way this endpoint
- * does not return a code is an empty pool.
+ * ### Both halves are now read, and they sit in different places
+ *
+ * `supplier_behaviour` holds a row per provider, tunable through
+ * `PUT /internal/suppliers/:provider/behaviour`, and this endpoint reads all of
+ * it:
+ *
+ *   - **The refusal.** {@link SupplierBehaviourService.shouldRefuse} spends
+ *     `fail_next` and then rolls `failure_rate`, **before the key claim**, so a
+ *     refused call provably claims nothing. An armed refusal that claimed first
+ *     would quietly drain the fifty-key pool and break the one assertion this
+ *     phase rests on — `claimed keys = deliveries`.
+ *   - **The hang.** {@link SupplierBehaviourService.shouldHang} spends
+ *     `hang_next` and then rolls `hang_rate`, also before the claim — but the
+ *     *wait* it decides on happens on the side of the claim that
+ *     `hang_before_claim` names, and the default is **after**.
+ *
+ * ### And the hang's placement is the whole of the trap
+ *
+ * A hang after the claim commits is precisely the Phase 3 trap: a key genuinely
+ * issued, a ledger row holding its code, a client that timed out and cannot
+ * know it, and a re-probe on the same `request_id` that gets the same code
+ * back. Placed *before* the claim instead, the same knob stages a different and
+ * equally real scenario — *a slow supplier is not a failed one* — and the two
+ * are different checks rather than two settings of one
+ * (`../supplier-hang.ts`; technical-considerations §7.1).
+ *
+ * Neither wait is inside a transaction. `keys.issue(...)` has returned by the
+ * time the `after` hold runs, so the claim has committed and the instance's one
+ * pooled connection is free; a wait held *inside* that transaction would stall
+ * every other request in this process (`packages/db/src/client.ts`, `max: 1`).
+ *
+ * There is now a second stub beside this one (`../b/supplier-b.controller.ts`),
+ * the backup a definite refusal falls through to. It draws from the same pool
+ * and the same ledger, and states its own identity at its own endpoint exactly
+ * as this one does.
  */
-import {
-  BadRequestException,
-  Body,
-  ConflictException,
-  Controller,
-  HttpCode,
-  HttpStatus,
-  Logger,
-  Post,
-} from "@nestjs/common";
+import { Body, Controller, HttpCode, HttpStatus, Logger, Post } from "@nestjs/common";
 
 import {
   SupplierIssueErrorReason,
   SupplierIssueStatus,
-  type SupplierIssueErrorResponse,
   type SupplierIssueOkResponse,
 } from "@game-shop/contracts";
 
 import {
+  SupplierBehaviourService,
+  supplierRefusalLogFields,
+} from "../supplier-behaviour.service.js";
+import { SupplierHangPlacement, supplierHangHold } from "../supplier-hang.js";
+import { supplierRefusal } from "../supplier-issue-refusal.js";
+import { parseSupplierIssueRequest } from "../supplier-issue-request.js";
+import {
   SupplierKeyClaimOutcome,
   SupplierKeyClaimService,
-  type SupplierKeyClaimRequest,
+  SupplierProvider,
 } from "../supplier-key-claim.service.js";
-
-/** `null`-safe object test — `typeof null` is `"object"`, and a body may be `null`. */
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** A required wire field. Empty is as absent as missing. */
-function readNonEmptyString(body: Record<string, unknown>, field: string): string {
-  const value = body[field];
-
-  if (typeof value !== "string" || value === "") {
-    throw new BadRequestException(`"${field}" must be a non-empty string`);
-  }
-
-  return value;
-}
-
-/**
- * Parse the wire body and map it onto the domain request.
- *
- * ---------------------------------------------------------------------------
- * THIS IS THE ONE PLACE snake_case BECOMES camelCase
- * ---------------------------------------------------------------------------
- * `SupplierIssueRequest` (`@game-shop/contracts`) is the supplier's fixed wire
- * shape, transcribed from the assignment and unrenameable.
- * {@link SupplierKeyClaimRequest} is the domain call. The three-line object
- * below is the entire crossing between them, so nothing downstream of here ever
- * sees a `request_id` and nothing upstream ever sees a `requestId`.
- *
- * ### All three fields are required, even though only one decides anything
- *
- * The service reads `requestId` and logs the other two — the pool is
- * undifferentiated, so no query touches `sku`. They are still required, because
- * the contract fixes all three and a supplier that quietly accepted a call with
- * no SKU would be lenient about something a real one would reject, which is the
- * kind of leniency that hides a client bug until Phase 3 is trying to explain a
- * missing key.
- *
- * This is deliberately **stricter than `parsePaymentWebhookPayload`**, and the
- * asymmetry is the point. That endpoint stores a status it does not recognise
- * because the sender is a real payment provider reporting something that
- * happened to real money, and destroying that evidence is worse than not
- * understanding it. Nothing of the kind applies here: the sender is our own
- * issuance client, no money has moved, and there is nothing to preserve — the
- * same reasoning `parseSimulatePaymentRequest` gives for narrowing `outcome`.
- *
- * Rejecting is also safe in a way that matters to the retry policy: a `400`
- * happens before any key is touched, so nothing is claimed and nothing is
- * written to the ledger. A corrected retry carrying the same `request_id` issues
- * normally.
- *
- * `request_id` is read first, so a body missing everything complains about the
- * field that actually matters.
- *
- * Hand-written rather than `class-validator` + a `ValidationPipe`, as every
- * other controller here is: `packages/contracts` stays free of validation
- * frameworks because `apps/web` bundles it into a browser.
- *
- * A body that is not JSON at all never reaches this function — Express's JSON
- * parser rejects it first and Nest turns that into a `400`, which is the same
- * answer for the same reason.
- */
-function parseSupplierIssueRequest(body: unknown): SupplierKeyClaimRequest {
-  if (!isJsonObject(body)) {
-    throw new BadRequestException(
-      'expected a JSON body of the form { "request_id": string, "sku": string, "order_id": string }',
-    );
-  }
-
-  return {
-    requestId: readNonEmptyString(body, "request_id"),
-    sku: readNonEmptyString(body, "sku"),
-    orderId: readNonEmptyString(body, "order_id"),
-  };
-}
 
 /** Exhaustiveness guard: the compiler routes here only if an outcome went unhandled. */
 function assertNever(value: never): never {
@@ -220,7 +170,10 @@ function assertNever(value: never): never {
 export class SupplierAController {
   private readonly logger = new Logger(SupplierAController.name);
 
-  constructor(private readonly keys: SupplierKeyClaimService) {}
+  constructor(
+    private readonly keys: SupplierKeyClaimService,
+    private readonly behaviour: SupplierBehaviourService,
+  ) {}
 
   /**
    * Issue a key for this `request_id` — or the one it was already issued.
@@ -257,7 +210,90 @@ export class SupplierAController {
   async issue(@Body() body: unknown): Promise<SupplierIssueOkResponse> {
     const request = parseSupplierIssueRequest(body);
 
-    const result = await this.keys.issue(request);
+    // ##################################################################
+    // # THE INJECTED REFUSAL, AND IT IS BEFORE THE CLAIM ON PURPOSE.
+    // ##################################################################
+    //
+    // `fail_next` is spent first, then `failure_rate` is rolled —
+    // `SupplierBehaviourService.shouldRefuse` owns that order and argues for it.
+    // What this line owns is the *placement*: nothing below has run, so a
+    // refused call has provably claimed no key and written no ledger row. Move
+    // this past `this.keys.issue(...)` and an armed refusal starts draining the
+    // fifty-key pool while telling the shop it issued nothing, which breaks
+    // `claimed keys = deliveries` — the one assertion this phase turns on.
+    const refusal = await this.behaviour.shouldRefuse(SupplierProvider.A);
+
+    if (refusal.refuse) {
+      // The same shared builder `out_of_stock` uses below, with a different
+      // reason: an injected refusal is a *reason*, not a second way of
+      // answering. `422`, chosen in `../supplier-issue-refusal.ts` — a `4xx`,
+      // because this is *answered, and the answer is no*, and the shop's ladder
+      // is allowed to fall through to B on it. A `5xx` would read as an
+      // **unknown** outcome and forbid exactly that.
+      const rejected = supplierRefusal(SupplierIssueErrorReason.SupplierRejected);
+
+      this.logger.warn({
+        msg: "supplier A: injected refusal; answering 422 supplier_rejected, no key claimed",
+        request_id: request.requestId,
+        order_id: request.orderId,
+        sku: request.sku,
+        status_code: rejected.getStatus(),
+        reason: SupplierIssueErrorReason.SupplierRejected,
+        ...supplierRefusalLogFields(refusal),
+      });
+
+      throw rejected;
+    }
+
+    // ##################################################################
+    // # THE HANG IS DECIDED HERE AND HELD LATER. THE TWO ARE NOT THE SAME
+    // # EVENT.
+    // ##################################################################
+    //
+    // Decided before the claim because `hang_next` must be spent exactly once
+    // per call and because the `before_claim` placement would have nothing to
+    // act on otherwise. Where the *wait* happens is carried on the decision,
+    // and the hold below fires on exactly one side of the claim.
+    const hang = await this.behaviour.shouldHang(SupplierProvider.A);
+    const hold = supplierHangHold(this.logger, SupplierProvider.A, request, hang);
+
+    // SCENARIO 1 — "a slow supplier is not a failed one" (`hang_before_claim:
+    // true`). Nothing has been claimed while this waits, so with
+    // `hang_ms < SUPPLIER_TIMEOUT_MS` the call simply completes late, and with a
+    // longer one the shop times out on a request that genuinely has no answer.
+    await hold(SupplierHangPlacement.BeforeClaim);
+
+    // `SupplierProvider.A` is stated HERE, by the controller mounted at
+    // `/internal/suppliers/a`, and not read out of the body: the provider is
+    // the endpoint. It is what the shared ledger records in
+    // `supplier_requests.provider` (migration 0002), so that once supplier B
+    // exists a probe addressed to the wrong one misses rather than being
+    // answered with the other's code.
+    const result = await this.keys.issue(request, SupplierProvider.A);
+
+    // ##################################################################
+    // # SCENARIO 2 — THE TIMEOUT TRAP, AND THE DEFAULT. AFTER THE CLAIM
+    // # TRANSACTION HAS COMMITTED, NOT INSIDE IT.
+    // ##################################################################
+    //
+    // `this.keys.issue(...)` has returned, so `BEGIN … COMMIT` is over: on the
+    // `issued` branch a key is claimed and `supplier_requests` holds its code
+    // for this `request_id`, durably, before a millisecond of this wait
+    // elapses. With `SUPPLIER_TIMEOUT_MS < hang_ms` the shop's
+    // `AbortSignal.timeout` severs its own socket while that code sits on file
+    // — the abort does not reach this handler — and the shop is left with an
+    // `unknown` outcome over an answer that already exists. That is the trap,
+    // and a re-probe on the same `request_id` is what springs it.
+    //
+    // Unconditional across outcomes, deliberately: a supplier that is slow to
+    // answer is slow whatever the answer is, so an empty pool hangs before its
+    // `409` in exactly the same way. That is the honest simulation, and it is
+    // also the one scenario where a timeout genuinely has no key behind it.
+    //
+    // Moving this line above `keys.issue(...)` deletes the trap while leaving
+    // every knob, every log line and every type exactly as they are — which is
+    // precisely why the placement is stated in a comment this size.
+    await hold(SupplierHangPlacement.AfterClaim);
 
     switch (result.outcome) {
       case SupplierKeyClaimOutcome.Issued:
@@ -280,25 +316,33 @@ export class SupplierAController {
           code: result.code,
         };
 
-      case SupplierKeyClaimOutcome.OutOfStock:
+      case SupplierKeyClaimOutcome.OutOfStock: {
+        // Built by `../supplier-issue-refusal.ts`, which both stubs share: the
+        // body is the contract's two fields and nothing else, and the status is
+        // a `4xx` — *answered, and the answer is no* — chosen there, once, with
+        // the argument for why the `5xx` family is inadmissible. `409` for an
+        // empty pool; this file's header explains that choice at length.
+        //
+        // The *genuine* refusal, as opposed to the injected one above, and the
+        // two must stay distinguishable: `out_of_stock` sends the order to a
+        // status a restock fixes, `supplier_rejected` to one a retry fixes. The
+        // same call builds both, because a refusal is a reason rather than a
+        // second way of answering.
+        const outOfStock = supplierRefusal(SupplierIssueErrorReason.OutOfStock);
+
         this.logger.warn({
           msg: "supplier A: pool empty; answering 409 out_of_stock",
           request_id: request.requestId,
           order_id: request.orderId,
           sku: request.sku,
-          status_code: HttpStatus.CONFLICT,
+          // Read back off the exception being thrown rather than restated, so
+          // the line cannot claim a status the response did not carry.
+          status_code: outOfStock.getStatus(),
+          reason: SupplierIssueErrorReason.OutOfStock,
         });
 
-        // Thrown rather than returned so the body is the contract's two fields
-        // and nothing else. Nest serialises an object passed to an
-        // `HttpException` verbatim — it only wraps a *string* in its own
-        // `{ message, error, statusCode }` envelope — and the client parses this
-        // body to decide `failed` vs. `unknown`, so an extra field or a wrapper
-        // would be a change to the interface, not to the prose.
-        throw new ConflictException({
-          status: SupplierIssueStatus.Error,
-          reason: SupplierIssueErrorReason.OutOfStock,
-        } satisfies SupplierIssueErrorResponse);
+        throw outOfStock;
+      }
 
       default:
         return assertNever(result);

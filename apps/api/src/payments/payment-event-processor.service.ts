@@ -137,7 +137,12 @@ import {
 import { paymentEvents, type DatabaseClient, type Order, type PaymentEvent } from "@game-shop/db";
 
 import { DATABASE_CLIENT } from "../database/database.module.js";
-import { IssuanceOutcome, IssuanceService } from "../issuance/issuance.service.js";
+import {
+  IssuanceEntry,
+  IssuanceOutcome,
+  IssuanceRunOutcome,
+  IssuanceRunnerService,
+} from "../issuance/issuance-runner.service.js";
 import { OrderLockService } from "../orders/order-lock.service.js";
 import { OrderTransitionOutcome, OrderTransitionService } from "../orders/order-transition.service.js";
 
@@ -199,6 +204,25 @@ export const ProcessPaymentEventOutcome = {
   OutOfStock: "out_of_stock",
 
   /**
+   * This caller won the claim, **every** supplier in the ladder definitely
+   * refused, and at least one of them refused for a reason that is not an empty
+   * pool. The order is `delivery_failed`. No key was issued and none is bound.
+   *
+   * Event **settled**, for the same reason `out_of_stock` is: the order has
+   * stopped moving, and re-applying this event could never do anything but the
+   * same thing again. Settled and *terminal* are different questions —
+   * `delivery_failed` is recoverable by an operator retry, which re-enters
+   * `delivering` under its own claim rather than by re-applying this event.
+   *
+   * This member is what closes the gap slice 2 inherited: `transitionForReason`
+   * had two arms while the reporting had one, so a `supplier_rejected` refusal
+   * moved the order to `delivery_failed` correctly and was then reported as
+   * {@link ProcessPaymentEventOutcome.IssuanceClaimed} — leaving a permanent
+   * occupant in the queue for an order that had finished moving.
+   */
+  DeliveryFailed: "delivery_failed",
+
+  /**
    * **This caller won `paid → delivering` and issuance did not reach a
    * finishing status.** In practice: the supplier gave no usable answer, so the
    * attempt row says `unknown`, the order rests in `delivering`, and a key may
@@ -254,6 +278,7 @@ const outcomeSettlesTheEvent = {
   [ProcessPaymentEventOutcome.UnknownStatus]: true,
   [ProcessPaymentEventOutcome.Delivered]: true,
   [ProcessPaymentEventOutcome.OutOfStock]: true,
+  [ProcessPaymentEventOutcome.DeliveryFailed]: true,
   [ProcessPaymentEventOutcome.DeferredOrderMissing]: false,
   [ProcessPaymentEventOutcome.IssuanceClaimed]: false,
   [ProcessPaymentEventOutcome.DeferredOrderInFlight]: false,
@@ -277,7 +302,7 @@ export class PaymentEventProcessor {
     @Inject(DATABASE_CLIENT) private readonly database: DatabaseClient,
     private readonly transitions: OrderTransitionService,
     private readonly orderLock: OrderLockService,
-    private readonly issuance: IssuanceService,
+    private readonly issuance: IssuanceRunnerService,
   ) {}
 
   /**
@@ -506,210 +531,106 @@ export class PaymentEventProcessor {
   }
 
   /**
-   * §2.5 step 3 — **the claim**, and **transaction A of I4**. `paid →
-   * delivering`, under the order row lock, and the winner of it is the one
-   * caller that may go on to issuance.
+   * §2.5 steps 3-6 — **hand the order to the one entry point into issuance and
+   * report what came back.**
    *
-   * Emitted SQL (copied from the statements Postgres logged under
-   * `log_statement = 'all'`; per the project's raw-SQL rule, `architecture.md`
-   * §2, "Documentation convention"). This is `architecture.md` §3.1's I4 block,
-   * statement for statement:
+   * ---------------------------------------------------------------------------
+   * WHAT MOVED, AND WHY IT HAD TO
+   * ---------------------------------------------------------------------------
+   * Phase 2 opened transaction A here: lock the order, run the guarded
+   * `paid → delivering` UPDATE, commit, and hand the claimed row to issuance.
+   * That transaction now lives in {@link IssuanceRunnerService}, and it did not
+   * move for tidiness.
    *
-   *   begin
+   * Spec 003 §6 widens transaction A from two statements to three, and the new
+   * one is a read of `issuance_attempts` — the retry ladder's input. It has to
+   * sit between the lock and the claim, because it is a **read-then-act with
+   * nothing else protecting it**: two workers reading different snapshots
+   * compute different rungs, ask two suppliers two different questions, and two
+   * keys leave the pool. Splitting the claim from the ladder read across two
+   * files would put a commit between them, and a commit between them is all the
+   * race needs. So the whole of transaction A belongs to whoever walks the
+   * ladder, and this method's job shrinks to what it always really was: deciding
+   * the **event's** fate from the **order's**.
    *
-   *   select "id", "client_request_id", "sku", "amount_minor", "currency",
-   *          "status", "created_at", "updated_at"
-   *   from "orders" where "orders"."id" = $1 for update;
-   *   -- THE LOCK (`../orders/order-lock.service.ts`). Every other worker that
-   *   -- reaches this statement for the same order waits here until this
-   *   -- transaction commits.
-   *   -- 0 rows => no such order, and nothing is locked. The guard below matches
-   *   --           nothing either and reports `order_not_found`.
+   * ### The claim is still I4, and it is still both halves
    *
-   *   update "orders" set "status" = $1, "updated_at" = now()
-   *   where ("orders"."id" = $2 and "orders"."status" = ANY($3))
-   *   returning "id", "client_request_id", "sku", "amount_minor", "currency",
-   *             "status", "created_at", "updated_at";
-   *   -- THE GUARD. $1 = 'delivering', $3 = '{paid}'
-   *   -- 1 row  => THIS call claimed the order. Exactly one caller ever sees
-   *   --           this per `paid → delivering`, across every process, because
-   *   --           the row can only leave `paid` once.
-   *   -- 0 rows => somebody else already claimed it, or the order never reached
-   *   --           `paid`, or it is finished. This caller stops.
-   *
-   *   commit
-   *
-   * ### Why both, when either one looks sufficient
+   * {@link OrderLockService.lockOrder} and
+   * {@link OrderTransitionService.transitionWithin} emit the same two statements
+   * they always did, in the same order, inside the runner's transaction A —
+   * `architecture.md` §3.1's I4 block, statement for statement, with the ladder
+   * read between them and the attempt reservation after them.
    *
    * **The guard alone** already gives one claim per order: fifty concurrent
-   * webhooks issue fifty of these UPDATEs, Postgres serialises them on the row's
-   * write lock, the first finds `status = 'paid'` and the other forty-nine
+   * webhooks issue fifty UPDATEs, Postgres serialises them on the row's write
+   * lock, the first finds `status = 'paid'` and the other forty-nine
    * re-evaluate against `'delivering'` and match nothing. What it does not give
-   * is exclusivity that outlives its own statement — and issuance is five
-   * statements and a network call long. The moment the claim commits, the guard
-   * has no further opinion about anybody.
+   * is exclusivity that outlives its own statement — and issuance is now a
+   * ladder walk, several statements and up to two network calls long.
    *
    * **The lock alone** would be worse still. It serialises the workers but says
    * nothing about which move is legal, so two workers that took it in turn would
-   * both happily write `delivering` and both go to the supplier. The guard is
-   * what makes the second one's turn a no-op.
+   * both write `delivering` and both go to the supplier. The guard is what makes
+   * the second one's turn a no-op.
    *
    * So: the lock serialises the *workers*, the guard makes the *transition*
-   * idempotent, and I4 is the conjunction. Neither is redundant.
-   *
-   * ### What the lock does not cover, on purpose
-   *
-   * It is released at `COMMIT`, one line before the supplier call. That is
-   * forced: `max: 1` per instance means a transaction held across an HTTP round
-   * trip stalls every other statement this process wants to run for up to
-   * `SUPPLIER_TIMEOUT_MS` — the catalogue, order creation, webhook intake, every
-   * status poll (`packages/db/src/client.ts`). **The exclusion for the call
-   * itself is the `delivering` claim**, which is a fact in the database rather
-   * than a lock: a worker that got zero rows from the guard does not call the
-   * supplier, and it cannot get one row later, because nothing returns an order
-   * to `paid`. `../issuance/issuance.service.ts` takes the lock again on the
-   * far side — transaction B — to write the outcome.
+   * idempotent, and I4 is the conjunction. Neither is redundant — and spec 003
+   * adds a third member to that sentence, because the ladder's `unknown` guard
+   * is what decides *what a worker does once it has won*.
    *
    * ### The loser's path, which must be a clean no-op
    *
    * A worker that waits on the lock, acquires it, and finds the order already
-   * `delivering` or `delivered` gets `not_in_source_state` and falls to
-   * {@link settleOrDeferPaidEvent}. Nothing throws, nothing is written, and the
-   * `observed` row it carries was read *under the lock* — so it is the order's
-   * true state at that instant rather than a racing read. It is still treated as
-   * advisory, because the settle decision is taken after this transaction has
-   * committed and the lock is gone by then; the load-bearing fact remains the
-   * one that is true forever, that this call did not claim the order.
+   * `delivering` or `delivered` gets {@link IssuanceRunOutcome.NotClaimable} and
+   * falls to {@link settleOrDeferPaidEvent}. Nothing throws, nothing is written,
+   * and the `observed` row it carries was read *under the lock* — so it is the
+   * order's true state at that instant rather than a racing read. It is still
+   * treated as advisory, because the settle decision is taken after that
+   * transaction committed and the lock is gone by then; the load-bearing fact
+   * remains the one that is true forever, that this call did not claim the order.
    *
-   * Two guarantees that were already the database's and are unchanged by the
-   * lock: `deliveries.order_id` UNIQUE (I3) means a second worker cannot bind a
-   * second key even if it gets that far, and the supplier's `request_id → code`
-   * ledger (I5) means a repeat of the same attempt returns the same code rather
-   * than issuing another. The lock is what stops a second worker *reaching the
-   * supplier at all*, which is the thing neither of those can do — by the time
-   * the unique index speaks, a second key has already left the pool.
+   * ### The event is settled here, and never inside issuance
+   *
+   * `markProcessed` is called on the *outcome*, below, for the same reason it
+   * always was: the event must not leave the queue before the order has stopped
+   * moving. Three of the four issuance outcomes have stopped it; the fourth has
+   * not, and its row stays pending as the queue's record that this order still
+   * owes somebody something.
    */
   private async claimForIssuance(event: PaymentEvent): Promise<ProcessPaymentEventResult> {
-    // TRANSACTION A. Two statements, no network I/O, no branch between them —
-    // so the queue behind the lock waits microseconds, not a supplier timeout.
-    const { lockedStatus, claim } = await this.database.transaction(async (tx) => {
-      // The lock first, always: it is the serialisation point, so every write
-      // this transaction makes has to happen after it. Nothing branches on the
-      // row that comes back — under the lock a check-then-act would even be
-      // safe, and this codebase still does not write one. The decision is the
-      // guarded UPDATE below, evaluated by Postgres against the row.
-      const locked = await this.orderLock.lockOrder(tx, event.orderId);
+    // ##################################################################
+    // # THE ISSUANCE SEAM — §2.5 STEPS 3-6 RUN HERE, BEHIND ONE CALL.
+    // ##################################################################
+    //
+    // The runner claims the order under the lock, reads the ledger inside that
+    // lock, walks the ladder — `askFirst`, then `fallThrough` to the backup only
+    // after a **definite** refusal — and settles. No transaction spans a
+    // supplier call (`max: 1` per instance), and nothing here may reach a
+    // supplier client directly: `IssuanceModule` exports the runner and nothing
+    // else, so a call that skipped the claim, the lock or the ladder cannot be
+    // written from this file.
+    //
+    // It does not throw for anything a supplier does. A definite refusal from
+    // every supplier becomes `out_of_stock` or `delivery_failed`; silence
+    // becomes nothing at all.
+    const run = await this.issuance.runForOrder(event.orderId, IssuanceEntry.Automatic);
 
-      // `transitionWithin`, never `transition`: the latter asks the pool for a
-      // connection of its own, and with `max: 1` the one it would wait for is
-      // the one this transaction is holding
-      // ({@link OrderTransitionService.transition}).
-      const result = await this.transitions.transitionWithin(tx, event.orderId, "beginIssuance");
-
-      return { lockedStatus: locked?.status, claim: result };
-    });
-
-    switch (claim.outcome) {
-      case OrderTransitionOutcome.Transitioned:
+    switch (run.outcome) {
+      case IssuanceRunOutcome.OrderNotFound:
+        // The order existed for step 2 and does not exist now. Nothing in this
+        // system deletes orders, so this is all but unreachable — and it is
+        // still handled rather than folded into the case below, because the
+        // union makes the distinction and collapsing it would mean settling an
+        // event whose order might yet appear.
         this.logger.log({
-          msg: "payment event: claimed the order for issuance under the order row lock",
+          msg: "payment event: order not found when claiming for issuance; left pending for a later drain",
           event_id: event.eventId,
           order_id: event.orderId,
-          // What this worker saw the instant it got the lock, before its own
-          // UPDATE. `paid` on the winner's line; `delivering` or `delivered` on
-          // a loser's, which is the whole story of the race in one field.
-          locked_status: lockedStatus,
-          status: claim.order.status,
         });
 
-        // ##################################################################
-        // # THE ISSUANCE SEAM — §2.5 steps 4-6 RUN HERE.
-        // ##################################################################
-        //
-        // This caller, and only this caller, holds the claim on `order_id`, so
-        // this is the one place issuance may be entered from. The work itself
-        // belongs to `IssuanceModule` (`../issuance/issuance.service.ts`) and is
-        // one call: derive the deterministic `request_id`, record the attempt as
-        // `unknown` **before** the supplier is called, call
-        // `POST {SUPPLIER_A_URL}/issue` over real HTTP with no transaction open,
-        // then in one short transaction resolve the attempt, bind the key with
-        // `INSERT INTO deliveries ... ON CONFLICT (order_id) DO NOTHING` (I3) and
-        // move the order to its finishing status.
-        //
-        // Both constraints this seam was written with are honoured there and
-        // documented at the statements that honour them: no transaction spans
-        // the HTTP call (`max: 1` per instance), and the event is not settled
-        // before the finishing status — which is why `markProcessed` is called
-        // *below*, on the outcome, and never inside the issuance service.
-        //
-        // It does not throw for anything the supplier does. An empty pool is a
-        // definite refusal and becomes `out_of_stock`; silence is an unknown
-        // outcome and becomes nothing at all.
-        const issued = await this.issuance.issueForClaimedOrder(claim.order);
+        return eventResult(ProcessPaymentEventOutcome.DeferredOrderMissing);
 
-        switch (issued.outcome) {
-          case IssuanceOutcome.Delivered:
-            this.logger.log({
-              msg: "payment event: issuance delivered a key; the order is finished",
-              event_id: event.eventId,
-              order_id: event.orderId,
-              request_id: issued.requestId,
-            });
-
-            // Settled here and not one statement earlier. Between the claim and
-            // this line the order was paid and undelivered, and this row was the
-            // queue's only record of it.
-            await this.markProcessed(event);
-
-            return eventResult(ProcessPaymentEventOutcome.Delivered);
-
-          case IssuanceOutcome.OutOfStock:
-            this.logger.warn({
-              msg: "payment event: the supplier had nothing to issue; the order is out_of_stock",
-              event_id: event.eventId,
-              order_id: event.orderId,
-              request_id: issued.requestId,
-              reason: issued.reason,
-            });
-
-            // Also a finishing status, so also settled. `out_of_stock` is
-            // terminal for Phase 1; Phase 3 makes it recoverable through the
-            // admin retry, which re-enters `delivering` under its own claim
-            // rather than by re-applying this event.
-            await this.markProcessed(event);
-
-            return eventResult(ProcessPaymentEventOutcome.OutOfStock);
-
-          case IssuanceOutcome.Unresolved:
-            // #############################################################
-            // # NOT SETTLED. THE ORDER IS PAID, UNDELIVERED, AND STILL OURS.
-            // #############################################################
-            //
-            // No finishing status was reached — the supplier gave no usable
-            // answer, so the attempt row says `unknown` and a key may or may not
-            // exist for that `request_id`. The event stays in the queue because
-            // it is the record that this order still owes somebody something,
-            // and Phase 3's retry is what will act on it.
-            //
-            // Not an exception: a `500` here would ask the payment provider to
-            // redeliver an event whose duplicate is deliberately not processed
-            // (`./payment-webhook.controller.ts`), which buys a retry storm and
-            // no issuance.
-            this.logger.error({
-              msg: "payment event: issuance reached no finishing status; order rests in delivering and the event stays pending",
-              event_id: event.eventId,
-              order_id: event.orderId,
-              request_id: issued.requestId,
-              detail: issued.detail,
-            });
-
-            return eventResult(ProcessPaymentEventOutcome.IssuanceClaimed);
-
-          default:
-            return assertNever(issued);
-        }
-
-      case OrderTransitionOutcome.NotInSourceState:
+      case IssuanceRunOutcome.NotClaimable:
         // #################################################################
         // # ZERO ROWS IS A NO-OP, NOT AN ERROR — AND HERE IT IS THE COMMON
         // # CASE, NOT THE EXCEPTION.
@@ -722,29 +643,93 @@ export class PaymentEventProcessor {
         // Whether the *event* is finished with is a different question from
         // whether this *call* did anything, and it is asked of the order's
         // state — see {@link settleOrDeferPaidEvent}.
-        //
-        // `claim.observed` was read inside transaction A, under the lock, so it
-        // is what the order truly was while this worker held it. It is still
-        // passed as advisory: the settle decision below runs after the commit
-        // that released the lock.
-        return this.settleOrDeferPaidEvent(event, claim.observed, lockedStatus);
+        return this.settleOrDeferPaidEvent(event, run.observed, run.lockedStatus);
 
-      case OrderTransitionOutcome.OrderNotFound:
-        // The order existed for step 2 and does not exist now. Nothing in this
-        // system deletes orders, so this is all but unreachable — and it is
-        // still handled rather than folded into the case above, because the
-        // union makes the distinction and collapsing it would mean settling an
-        // event whose order might yet appear.
-        this.logger.log({
-          msg: "payment event: order not found when claiming for issuance; left pending for a later drain",
-          event_id: event.eventId,
-          order_id: event.orderId,
-        });
-
-        return eventResult(ProcessPaymentEventOutcome.DeferredOrderMissing);
+      case IssuanceRunOutcome.Ran:
+        break;
 
       default:
-        return assertNever(claim);
+        return assertNever(run);
+    }
+
+    const issued = run.result;
+
+    switch (issued.outcome) {
+      case IssuanceOutcome.Delivered:
+        this.logger.log({
+          msg: "payment event: issuance delivered a key; the order is finished",
+          event_id: event.eventId,
+          order_id: event.orderId,
+          request_id: issued.requestId,
+        });
+
+        // Settled here and not one statement earlier. Between the claim and
+        // this line the order was paid and undelivered, and this row was the
+        // queue's only record of it.
+        await this.markProcessed(event);
+
+        return eventResult(ProcessPaymentEventOutcome.Delivered);
+
+      case IssuanceOutcome.OutOfStock:
+        this.logger.warn({
+          msg: "payment event: every supplier had nothing to issue; the order is out_of_stock",
+          event_id: event.eventId,
+          order_id: event.orderId,
+          request_id: issued.requestId,
+          refusals: issued.refusals,
+        });
+
+        // A finishing status, so settled. `out_of_stock` is recoverable through
+        // the operator retry, which re-enters `delivering` under its own claim
+        // rather than by re-applying this event.
+        await this.markProcessed(event);
+
+        return eventResult(ProcessPaymentEventOutcome.OutOfStock);
+
+      case IssuanceOutcome.DeliveryFailed:
+        this.logger.warn({
+          msg: "payment event: every supplier definitely refused and at least one was not an empty pool; the order is delivery_failed",
+          event_id: event.eventId,
+          order_id: event.orderId,
+          request_id: issued.requestId,
+          refusals: issued.refusals,
+        });
+
+        // Settled for exactly the reason `out_of_stock` is: the order has
+        // stopped moving. **Settled is not terminal** — an operator can still
+        // push this order through — and keeping those two questions apart is
+        // what `settledOrderStatuses` and `terminalOrderStatuses` are for.
+        await this.markProcessed(event);
+
+        return eventResult(ProcessPaymentEventOutcome.DeliveryFailed);
+
+      case IssuanceOutcome.Unresolved:
+        // #############################################################
+        // # NOT SETTLED. THE ORDER IS PAID, UNDELIVERED, AND STILL OURS.
+        // #############################################################
+        //
+        // No finishing status was reached — a supplier gave no usable answer,
+        // so its attempt row says `unknown` and a key may or may not exist for
+        // that `request_id`. The event stays in the queue because it is the
+        // record that this order still owes somebody something, and the retry
+        // is what will act on it.
+        //
+        // Not an exception: a `500` here would ask the payment provider to
+        // redeliver an event whose duplicate is deliberately not processed
+        // (`./payment-webhook.controller.ts`), which buys a retry storm and
+        // no issuance.
+        this.logger.error({
+          msg: "payment event: issuance reached no finishing status; order rests in delivering and the event stays pending",
+          event_id: event.eventId,
+          order_id: event.orderId,
+          request_id: issued.requestId,
+          detail: issued.detail,
+        });
+
+        return eventResult(ProcessPaymentEventOutcome.IssuanceClaimed);
+
+      default:
+        return assertNever(issued);
     }
   }
 

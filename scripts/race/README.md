@@ -310,6 +310,78 @@ check's cleanup another check's flake.
 
 `harness.ts` is the worked example — read it top to bottom for the shape.
 
+### Making a supplier misbehave — `PUT /internal/suppliers/:provider/behaviour`
+
+A check that needs a refusal or a silence causes it through the supplier's own
+control endpoint, behind the same `ADMIN_TOKEN` the sweep is behind:
+
+```
+PUT /internal/suppliers/a/behaviour
+Authorization: Bearer $ADMIN_TOKEN
+{ "fail_next": 1 }                            -- refuse exactly the next call
+{ "hang_next": 1, "hang_ms": 5000 }           -- THE TIMEOUT TRAP (see below)
+{ "hang_next": 1, "hang_ms": 500,
+  "hang_before_claim": true }                 -- slow, but successful
+{}                                            -- restore the seeded baseline
+```
+
+**Every knob is live.** `fail_next` / `failure_rate` are read by both stubs
+before the key claim, so an armed refusal answers `422 supplier_rejected` and
+provably claims nothing (`apps/api/src/suppliers/supplier-behaviour.service.ts`,
+`shouldRefuse`). `hang_next` / `hang_rate` are read the same way, but the *wait*
+they decide on is held on the side of the key claim that `hang_before_claim`
+names (`apps/api/src/suppliers/supplier-hang.ts`).
+
+##########################################################################
+# WHERE THE HANG SITS DECIDES WHICH SCENARIO YOU STAGED. THEY ARE TWO
+# DIFFERENT CHECKS, NOT TWO SETTINGS OF ONE.
+##########################################################################
+
+| Want | Body | Why |
+|---|---|---|
+| **The timeout trap** — a key genuinely issued and a client that cannot know it | `{ "hang_next": 1, "hang_ms": 5000 }` | The supplier claims the key, commits it to its ledger, *then* waits. With `hang_ms` past `SUPPLIER_TIMEOUT_MS` (2000 by default) the shop's `AbortSignal.timeout` severs **its own socket** — it does not stop the stub — so the attempt is recorded `unknown`, never `failed`, while a code sits on file for that `request_id`. A re-probe with the same id gets that same code back. |
+| **Slow but successful** — a slow supplier is not a failed one | `{ "hang_next": 1, "hang_ms": 500, "hang_before_claim": true }` | The wait happens before anything is claimed, and being shorter than the shop's deadline it produces no timeout at all: the call simply completes late. |
+
+`hang_before_claim` defaults to `false`, i.e. **after the claim**, because that
+is the scenario this phase exists to demonstrate and the one an armed
+`hang_next` almost certainly means. The other placement must be asked for by
+name. Pair each placement with the matching duration or you have staged
+neither: a long hang *before* the claim is a request that genuinely has no
+answer, and a short hang *after* it never times out.
+
+It is a boolean rather than a `hang_at` enum because there are exactly two
+places a hang may go — the claim and its ledger write are one transaction — and
+the only third value anyone would reach for is *inside* it, which would hold the
+instance's single pooled connection for `hang_ms` and stall every other request
+in that process.
+
+It is a **replacement, not a patch**: an omitted field is reset to zero, so the
+body you send fully determines the supplier's behaviour and `{}` is the reset.
+The state lives in the `supplier_behaviour` table rather than in a process, so
+one `PUT` reaches all four spawned instances — an in-process rate would reach
+one, and the other three would keep succeeding while your check passed having
+exercised nothing.
+
+##########################################################################
+# USE `fail_next` / `hang_next` AND RATES OF EXACTLY 0 OR 1. NEVER A
+# FRACTIONAL RATE.
+##########################################################################
+
+`failure_rate` and `hang_rate` are there for a person exploring by hand. In a
+check they make §2.6's *"twice in a row, no tidying in between"* untrue **by
+construction** — not flaky because of a bug, but unreproducible because a coin
+is being tossed. The intermittent red that follows reads to a reviewer as a
+correctness defect in the shop, which is the most expensive kind of wrong
+answer this directory can produce (spec 003 technical-considerations §11, R8).
+
+The one-shot counters are what make that criterion achievable: *"refuse exactly
+the next call"* is a statement about one specific call, and two runs of it are
+identical. They are consumed by an atomic conditional `UPDATE … WHERE
+fail_next > 0`, so the four instances cannot both spend the one you armed.
+
+Restore the baseline in your cleanup, beside `cleanupTestOrders` — a check that
+leaves a knob turned up is a check that breaks the next one.
+
 ---
 
 ## Knobs

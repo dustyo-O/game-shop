@@ -14,10 +14,13 @@
  * HTTP response, which the shop then has to believe or not on its own.
  *
  * It is not under `suppliers/a/` on purpose. There is one pool and one ledger:
- * `supplier_keys` has no provider column and `supplier_requests` is keyed on
- * `request_id` alone, so Phase 3's supplier B draws from exactly this inventory
- * through exactly this code. What differs between A and B is the *endpoint* and
- * its injected failure behaviour — that is what `suppliers/a` (§2.4) is for.
+ * `supplier_keys` has no provider column at all, so Phase 3's supplier B draws
+ * from exactly this inventory through exactly this code. The *ledger* does
+ * record who answered — `supplier_requests.provider`, migration 0002 — and
+ * {@link SupplierKeyClaimService.readLedger} reads it, so the shared table
+ * still answers each supplier only about its own requests. What differs between
+ * A and B is the *endpoint* and its injected failure behaviour — that is what
+ * `suppliers/a` (§2.4) is for.
  *
  * ---------------------------------------------------------------------------
  * THE PROPERTY THE WHOLE PHASE 3 TRAP RESTS ON
@@ -87,7 +90,7 @@
  * they are.
  */
 import { Inject, Injectable, Logger } from "@nestjs/common";
-import { eq, isNull, sql } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 
 import {
   supplierKeys,
@@ -98,6 +101,34 @@ import {
 } from "@game-shop/db";
 
 import { DATABASE_CLIENT } from "../database/database.module.js";
+
+/**
+ * Which simulated supplier is answering — the value written to
+ * `supplier_requests.provider`.
+ *
+ * **Not part of the request.** It is not on the wire and the shop never sends
+ * it: the provider is the *endpoint*, `/internal/suppliers/a/issue` or
+ * `/internal/suppliers/b/issue`, so each controller states its own identity and
+ * this service records it. A supplier that had to be *told* which supplier it
+ * was would be a strange thing to trust.
+ *
+ * Declared here rather than imported from `../issuance/issuance-request-id.ts`,
+ * which is shop-side code: the whole point of `packages/db/src/schema/supplier.ts`'s
+ * header is that the two sides share a database only as a convenience of
+ * running one container. They must not share types either — the `{provider}`
+ * segment agreeing across the boundary is a fact about the wire, not a fact the
+ * compiler should be asked to enforce from one side of it.
+ *
+ * An `as const` object rather than a TypeScript `enum`, per the project rule: no
+ * runtime class, and it compares equal to the plain strings Postgres hands back
+ * from a `text` column.
+ */
+export const SupplierProvider = {
+  A: "a",
+  B: "b",
+} as const;
+
+export type SupplierProvider = (typeof SupplierProvider)[keyof typeof SupplierProvider];
 
 /**
  * What the supplier was asked for.
@@ -290,12 +321,21 @@ export class SupplierKeyClaimService {
    *
    * If the re-read somehow finds nothing, the original error is rethrown rather
    * than guessed at. That is an invariant violation, not traffic, and it should
-   * surface as one.
+   * surface as one. Since {@link SupplierKeyClaimService.readLedger} is now
+   * narrowed by `provider`, one such violation has a name: `supplier_requests`
+   * is keyed on `request_id` alone, so a row written by the *other* supplier
+   * under this id raises `23505` here and then does **not** satisfy the re-read.
+   * The 23505 surfaces instead of this call returning a code the other supplier
+   * cut. Nothing can construct that today — ids are derived and carry the
+   * provider segment — and if something ever does, a raise is the right answer.
    */
-  async issue(request: SupplierKeyClaimRequest): Promise<SupplierKeyClaimResult> {
+  async issue(
+    request: SupplierKeyClaimRequest,
+    provider: SupplierProvider,
+  ): Promise<SupplierKeyClaimResult> {
     const { requestId, sku, orderId } = request;
 
-    const alreadyIssued = await this.readLedger(this.database.db, requestId);
+    const alreadyIssued = await this.readLedger(this.database.db, requestId, provider);
     if (alreadyIssued !== undefined) {
       this.logger.log({
         msg: "supplier: repeat of a request_id already answered; returning the stored code",
@@ -310,11 +350,11 @@ export class SupplierKeyClaimService {
     let result: SupplierKeyClaimResult;
 
     try {
-      result = await this.claimAndRecord(requestId);
+      result = await this.claimAndRecord(requestId, provider);
     } catch (error: unknown) {
       if (!isUniqueViolation(error)) throw error;
 
-      const settledByTheWinner = await this.readLedger(this.database.db, requestId);
+      const settledByTheWinner = await this.readLedger(this.database.db, requestId, provider);
       if (settledByTheWinner === undefined) throw error;
 
       this.logger.log({
@@ -347,9 +387,13 @@ export class SupplierKeyClaimService {
   }
 
   /**
-   * I5 — one supplier request → one code. `architecture.md` §3.1:
+   * I5 — one supplier request → one code, **asked of one supplier**.
+   * `architecture.md` §3.1, narrowed by the `provider` column migration 0002
+   * added (whose §(7) spells this read out) and `packages/db/src/schema/supplier.ts`
+   * quotes on the column itself:
    *
-   *   SELECT code FROM supplier_requests WHERE request_id = $1;
+   *   SELECT code FROM supplier_requests
+   *   WHERE request_id = $1 AND provider = $2;
    *   -- found => return that code unchanged, however many times we are asked
    *
    * Emitted SQL (copied from the statement Postgres logged under
@@ -357,20 +401,34 @@ export class SupplierKeyClaimService {
    * §2, "Documentation convention"):
    *
    *   execute <unnamed>: select "code" from "supplier_requests"
-   *                      where "supplier_requests"."request_id" = $1
-   *   DETAIL: parameters: $1 = 'req_ord_00123_a_1'
-   *   -- 1 row  => this request_id HAS BEEN ANSWERED. Return that code and stop.
-   *   --           No key is claimed, nothing is written, and the answer is the
-   *   --           same on the thousandth call as on the second. This single row
-   *   --           is what makes «таймаут ≠ отказ» true.
-   *   -- 0 rows => not answered *as of this snapshot*. First sight, so go and
-   *   --           claim. Note what this does NOT prove: a concurrent
-   *   --           transaction may hold this request_id uncommitted, and under
-   *   --           READ COMMITTED we cannot see it. The unique constraints
-   *   --           settle that case, not this read — see `issue()`.
+   *                      where ("supplier_requests"."request_id" = $1
+   *                        and "supplier_requests"."provider" = $2)
+   *   DETAIL: parameters: $1 = 'req_ord_00123_a_1', $2 = 'a'
+   *   -- 1 row  => THIS SUPPLIER HAS ANSWERED THIS request_id. Return that code
+   *   --           and stop. No key is claimed, nothing is written, and the
+   *   --           answer is the same on the thousandth call as on the second.
+   *   --           This single row is what makes «таймаут ≠ отказ» true.
+   *   -- 0 rows => *this* supplier has not answered it, as of this snapshot.
+   *   --           Two different situations land here and both are answered by
+   *   --           going on to claim:
+   *   --             * first sight — nobody has answered this id at all; or
+   *   --             * MIS-ADDRESSED — the id was answered by the OTHER
+   *   --               supplier. `$2` is the whole reason this is a miss rather
+   *   --               than a hit: without it the row comes back and B hands the
+   *   --               shop a code A cut, recorded as though B had issued it,
+   *   --               for a question B was never asked.
+   *   --           Note what zero rows does NOT prove: a concurrent transaction
+   *   --           may hold this request_id uncommitted, and under READ
+   *   --           COMMITTED we cannot see it. The unique constraints settle
+   *   --           that case, not this read — see `issue()`.
    *
-   * `request_id` is the PRIMARY KEY, so this is an index lookup of at most one
-   * row; `[found]` destructures it and is `undefined` on the zero-row path.
+   * `request_id` is the PRIMARY KEY, so this is still an index lookup of at most
+   * one row and `provider` is a filter applied to that row rather than a second
+   * index it needs — which is why no `(request_id, provider)` index was added:
+   * the primary key has already reduced the scan to one row, and an extra index
+   * would cost the claim's write path more than the one `=` it saves.
+   * `[found]` destructures that at-most-one row and is `undefined` on the
+   * zero-row path.
    *
    * **`execute <unnamed>`** is worth reading, and it is the same on every
    * statement below. It is the *unnamed* statement of the extended query
@@ -382,12 +440,36 @@ export class SupplierKeyClaimService {
    *
    * Runs on whichever handle it is given so that it can be called both outside a
    * transaction (the fast path) and, if a caller ever needs it, inside one.
+   *
+   * ### Why `provider` is read here now, when it was written two tasks ago
+   *
+   * `supplier_requests.provider` has been *written* since supplier B shipped —
+   * `claimAndRecord` passes it and each controller states its own identity,
+   * because the provider is the endpoint. Until this read it was recorded and
+   * never consulted, and narrowing changed nothing observable: request ids are
+   * **derived** rather than remembered — `req_{order}_{provider}_{attempt}`, see
+   * the shop's `issuance/issuance-request-id.ts` — so `req_x_a_1` can only ever
+   * be sent to A, and no path could address a lookup to the wrong supplier.
+   *
+   * **The re-probe is what makes this read load-bearing.** A timed-out attempt
+   * is re-asked *of the same supplier, under the same id*, and this one row is
+   * what stops a second key being cut for it. Against that, *"nothing can
+   * currently construct a mismatch"* is a far thinner guarantee than *"a
+   * mismatch returns zero rows"*: the first is a property of every present and
+   * future caller, the second is a property of this statement. The column was
+   * defence in depth; this predicate is what arms it.
    */
-  private async readLedger(handle: SupplierReader, requestId: string): Promise<string | undefined> {
+  private async readLedger(
+    handle: SupplierReader,
+    requestId: string,
+    provider: SupplierProvider,
+  ): Promise<string | undefined> {
     const [found] = await handle
       .select({ code: supplierRequests.code })
       .from(supplierRequests)
-      .where(eq(supplierRequests.requestId, requestId));
+      .where(
+        and(eq(supplierRequests.requestId, requestId), eq(supplierRequests.provider, provider)),
+      );
 
     return found?.code;
   }
@@ -423,9 +505,16 @@ export class SupplierKeyClaimService {
    *   --           ordinary order state.
    *
    *   execute <unnamed>: insert into "supplier_requests"
-   *                      ("request_id", "code", "created_at")
-   *                      values ($1, $2, default)
-   *   DETAIL: parameters: $1 = 'req_ord_00123_a_1', $2 = 'LFXC-TNCS-BPCD'
+   *                      ("request_id", "provider", "code", "created_at")
+   *                      values ($1, $2, $3, default)
+   *   DETAIL: parameters: $1 = 'req_ord_00123_a_1', $2 = 'a',
+   *                       $3 = 'LFXC-TNCS-BPCD'
+   *   -- $2 is PASSED, never defaulted: migration 0002 added the column with
+   *   --    DEFAULT 'a' to backfill and dropped the default in the next
+   *   --    statement, so a supplier that forgets to say which one it is takes
+   *   --    a 23502 rather than being recorded as A. Recorded as A, ITS OWN
+   *   --    later lookups would miss and it would claim a second key for a
+   *   --    request that was already answered.
    *   -- Always exactly one row, or it raises. There is deliberately no
    *   -- ON CONFLICT DO NOTHING here: a conflict means another transaction has
    *   -- already answered this request_id, and the correct response is to undo
@@ -492,7 +581,10 @@ export class SupplierKeyClaimService {
    * The row lock the subquery takes lives until COMMIT, and COMMIT is one
    * statement away.
    */
-  private async claimAndRecord(requestId: string): Promise<SupplierKeyClaimResult> {
+  private async claimAndRecord(
+    requestId: string,
+    provider: SupplierProvider,
+  ): Promise<SupplierKeyClaimResult> {
     return this.database.transaction(async (tx) => {
       // Built, not executed: this is the locking subquery embedded in the
       // UPDATE's WHERE clause above. Awaiting it here would be a separate
@@ -515,7 +607,7 @@ export class SupplierKeyClaimService {
         return { outcome: SupplierKeyClaimOutcome.OutOfStock, requestId };
       }
 
-      await tx.insert(supplierRequests).values({ requestId, code: claimed.code });
+      await tx.insert(supplierRequests).values({ requestId, provider, code: claimed.code });
 
       return { outcome: SupplierKeyClaimOutcome.Issued, code: claimed.code };
     });

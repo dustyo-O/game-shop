@@ -48,11 +48,15 @@
 /**
  * Which supplier a call is addressed to — the `{provider}` segment.
  *
- * `a` is the only one Phase 1 builds (technical-considerations §1). Supplier B
- * is Phase 3 and is one member added here, which is also what makes the ids of
- * the two suppliers un-confusable: `req_ord_x_a_1` and `req_ord_x_b_1` are
- * different rows in `issuance_attempts` and different keys in two different
- * ledgers.
+ * Phase 1 built only `a` (technical-considerations §1); Phase 3 adds `b`, and
+ * it really is *one member added here*, which is what makes the ids of the two
+ * suppliers un-confusable: `req_ord_x_a_1` and `req_ord_x_b_2` are different
+ * rows in `issuance_attempts` and different keys in the shared ledger.
+ *
+ * **The order matters and is the fall-through order.** `a` is asked first and
+ * `b` is the backup (spec 003 §2.1). The retry ladder — `issuance-ladder.ts`,
+ * still to be built — takes its sequence from this object rather than keeping a
+ * second list of the same two strings somewhere else to disagree with it.
  *
  * An `as const` object rather than a TypeScript `enum`, per the project rule:
  * it emits no runtime class and compares equal to the plain strings Postgres
@@ -60,6 +64,7 @@
  */
 export const IssuanceProvider = {
   A: "a",
+  B: "b",
 } as const;
 
 export type IssuanceProvider = (typeof IssuanceProvider)[keyof typeof IssuanceProvider];

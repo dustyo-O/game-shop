@@ -12,16 +12,18 @@
  * ---------------------------------------------------------------------------
  * WHY A TABLE RATHER THAN A METHOD PER TRANSITION
  * ---------------------------------------------------------------------------
- * Five `markPaid()` / `beginIssuance()` methods would each carry their own
- * `WHERE status = ...`, and the set of legal moves would then only exist as the
- * union of five function bodies — unreadable as a whole and unenforceable as a
- * set. As data it can be read in ten lines, and the compiler can make
+ * A `markPaid()` / `beginIssuance()` method per transition would each carry its
+ * own `WHERE status = ...`, and the set of legal moves would then only exist as
+ * the union of those function bodies — unreadable as a whole and unenforceable
+ * as a set. As data it can be read in ten lines, and the compiler can make
  * assertions about it: see `_NoTransitionLeavesATerminalState` below, which
  * fails the build if anyone ever gives a terminal state an exit.
  *
- * Phase 3 (`delivery_failed`, plus retrying `out_of_stock` and `delivery_failed`
- * back into `delivering`) is therefore new entries here and nothing else — no
- * new SQL, no new service method. That is the point of the shape.
+ * Phase 3 is that prediction being cashed. `markDeliveryFailed` below is the
+ * whole of its first arc: one row added to this table, no new SQL and no new
+ * service method — `./order-transition.service.ts` did not change, and neither
+ * did the statement it emits. Still ahead, and landing the same way: retrying
+ * `out_of_stock` and `delivery_failed` back into `delivering`.
  */
 import { OrderStatus, type TerminalOrderStatus } from "@game-shop/contracts";
 
@@ -43,30 +45,35 @@ export interface OrderTransitionRule {
 }
 
 /**
- * The five transitions of the Phase 1 lifecycle, keyed by what the caller is
- * doing rather than by the state it lands in — `beginIssuance` says why the
- * call is being made, `delivering` only says where it ends up.
+ * Every legal transition, keyed by what the caller is doing rather than by the
+ * state it lands in — `beginIssuance` says why the call is being made,
+ * `delivering` only says where it ends up.
  *
- * Each maps onto a numbered step of the delivery path
+ * The first five map onto a numbered step of Phase 1's delivery path
  * (`context/spec/001-purchase-and-key-delivery/technical-considerations.md`
- * §2.5), which is the checklist this table has to satisfy in full:
+ * §2.5), which is the checklist this table has to satisfy in full; the sixth is
+ * Phase 3's (`context/spec/003-failure-and-recovery/technical-considerations.md`
+ * §2.2):
  *
- * | Transition          | Move                        | Called from                    |
- * | ------------------- | --------------------------- | ------------------------------ |
- * | `markPaid`          | `created → paid`            | webhook, `status: "paid"` (§2.5.2)   |
- * | `markPaymentFailed` | `created → payment_failed`  | webhook, `status: "failed"` (§2.5.2) |
- * | `beginIssuance`     | `paid → delivering`         | claiming the order (§2.5.3)    |
- * | `completeDelivery`  | `delivering → delivered`    | after the delivery row (§2.5.6)|
- * | `markOutOfStock`    | `delivering → out_of_stock` | empty supplier pool (§2.5.6)   |
+ * | Transition           | Move                           | Called from                    |
+ * | -------------------- | ------------------------------ | ------------------------------ |
+ * | `markPaid`           | `created → paid`               | webhook, `status: "paid"` (§2.5.2)   |
+ * | `markPaymentFailed`  | `created → payment_failed`     | webhook, `status: "failed"` (§2.5.2) |
+ * | `beginIssuance`      | `paid → delivering`            | claiming the order (§2.5.3)    |
+ * | `completeDelivery`   | `delivering → delivered`       | after the delivery row (§2.5.6)|
+ * | `markOutOfStock`     | `delivering → out_of_stock`    | empty supplier pool (§2.5.6)   |
+ * | `markDeliveryFailed` | `delivering → delivery_failed` | no key obtained (003 §1.3)     |
  *
  * Two things to notice about what is *not* here:
  *
  *   - **No `paid → delivered`.** Delivery is only ever finished by the worker
  *     that claimed the order into `delivering`, so the claim cannot be skipped.
- *   - **Nothing leaves `delivered`, `payment_failed` or `out_of_stock`.** The
- *     first two are terminal forever (I9). `out_of_stock` is terminal *for
- *     Phase 1* and becomes recoverable in Phase 3 — which is one line added
- *     below, and is why `recoverableOrderStatuses` is kept separate from
+ *   - **Nothing leaves `delivered`, `payment_failed`, `out_of_stock` or
+ *     `delivery_failed`.** The first two are terminal forever (I9). The other
+ *     two are *settled but not terminal*: they have no exit in this table yet,
+ *     which is a fact about the table and not about the statuses. Phase 3's
+ *     operator retry gives them one, as one more row below — and that it *can*
+ *     is why `recoverableOrderStatuses` is kept separate from
  *     `terminalOrderStatuses` in `@game-shop/contracts`.
  *
  * `as const satisfies` rather than a type annotation: `satisfies` checks the
@@ -96,6 +103,31 @@ export const orderTransitions = {
 
   /** §2.5 step 6 — the supplier's pool was empty. Settled, and recoverable in Phase 3. */
   markOutOfStock: { to: OrderStatus.OutOfStock, from: [OrderStatus.Delivering] },
+
+  /**
+   * Spec 003 §2.4 — **no key was obtained.** Either a supplier definitely
+   * refused for a reason that is not an empty pool, or the outcome was never
+   * established at all (003 technical-considerations §1.3, §2.4).
+   *
+   * `from: [delivering]` and nothing else, for the reason `completeDelivery`
+   * reads the same way: only the worker that claimed the order may settle it.
+   * A `paid` order nobody has claimed cannot be written off, and a `delivered`
+   * one cannot be un-delivered by a late failure report — the latter is I9,
+   * enforced here by `delivered` being absent from every `from` list rather
+   * than by anyone remembering to check.
+   *
+   * The row records the **shop's** side of it — "we did not hand over a key".
+   * It says nothing about the supplier: an attempt that timed out stays
+   * `unknown` in `issuance_attempts`, with `last_error` NULL, because that is
+   * still the only truthful thing to say about it. Two different facts, two
+   * tables, and writing `failed` into the second is the exact bug Phase 3
+   * exists to prevent (003 technical-considerations §1.3).
+   *
+   * Settled, not terminal: `delivery_failed` is deliberately absent from
+   * `terminalOrderStatuses`, so a later row may give it an exit. This row is
+   * not that one — it is the arrival.
+   */
+  markDeliveryFailed: { to: OrderStatus.DeliveryFailed, from: [OrderStatus.Delivering] },
 } as const satisfies Readonly<Record<string, OrderTransitionRule>>;
 
 /**

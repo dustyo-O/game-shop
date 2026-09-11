@@ -36,12 +36,24 @@ import {
 } from "drizzle-orm/pg-core";
 
 /**
- * The order lifecycle as of Phase 1 — `created → paid → delivering → delivered`,
- * with branches to `payment_failed` and `out_of_stock`
- * (technical-considerations §2.2).
+ * The order lifecycle — `created → paid → delivering → delivered`, with
+ * branches to `payment_failed`, `out_of_stock` and, from Phase 3,
+ * `delivery_failed` (technical-considerations §2.2; spec 003 §2.3).
  *
- * `delivery_failed` is Phase 3 and is deliberately absent: a status the shop
- * cannot yet reach should not be a value the database will accept.
+ * `delivery_failed` was deliberately absent through Phases 1 and 2 — a status
+ * the shop could not reach should not be a value the database will accept — and
+ * arrives here with migration `0001_delivery_failed_status`, in the same commit
+ * as the code that can reach it (spec 003 technical-considerations §11, R6).
+ *
+ * It is a statement **about the shop**: "we did not hand over a key". The
+ * matching statement about the supplier — "the outcome was never established" —
+ * is `issuance_attempts.status = 'unknown'`. Two different facts, two tables, on
+ * purpose (spec 003 technical-considerations §1.3).
+ *
+ * It is **recoverable, not terminal**: an operator retry moves it back to
+ * `delivering`. Terminality is I9's set (`delivered`, `payment_failed`) and
+ * lives in `packages/contracts`, not here — this array only bounds which values
+ * may exist at all.
  *
  * The wire-level enum shipped to the frontend belongs to `packages/contracts`
  * (technical-considerations §2.4). This array exists because the CHECK
@@ -55,6 +67,7 @@ export const orderStatuses = [
   "delivered",
   "payment_failed",
   "out_of_stock",
+  "delivery_failed",
 ] as const;
 
 export type OrderStatus = (typeof orderStatuses)[number];
@@ -148,12 +161,17 @@ export const orders = pgTable(
     /**
      * I9 — final states are terminal.
      *
-     * The column is `text` plus a CHECK rather than a Postgres enum: Phase 3
-     * adds `delivery_failed`, and widening a CHECK is an ordinary DDL statement
-     * inside the migration transaction, whereas `ALTER TYPE ... ADD VALUE` is
-     * a special case with its own rules. Terminality itself is enforced by the
-     * status-guarded UPDATEs (see the table comment below), not by this list —
-     * the list only bounds which states can exist at all.
+     * The column is `text` plus a CHECK rather than a Postgres enum, and Phase 3
+     * is the migration that decision was made for. Widening a CHECK is ordinary
+     * DDL inside the migration transaction — drop and re-add in one transaction,
+     * one full scan, **no table rewrite** (measured: 3.6 ms on 20 000 rows,
+     * `ACCESS EXCLUSIVE`). `ALTER TYPE ... ADD VALUE` cannot use the new label
+     * in the same transaction that added it, which would forbid widening and
+     * backfilling in one file.
+     *
+     * Terminality itself is enforced by the status-guarded UPDATEs (see the
+     * table comment below), not by this list — the list only bounds which states
+     * can exist at all.
      */
     status: text("status", { enum: orderStatuses }).notNull(),
 
@@ -178,10 +196,15 @@ export const orders = pgTable(
     unique("orders_client_request_id_key").on(t.clientRequestId),
 
     // ---------------------------------------------------------------------
-    // I9 — the set of states an order may be in, in Phase 1.
+    // I9 — the set of states an order may be in.
     //
     //   CHECK (status IN ('created', 'paid', 'delivering', 'delivered',
-    //                     'payment_failed', 'out_of_stock'))
+    //                     'payment_failed', 'out_of_stock', 'delivery_failed'))
+    //
+    // `delivery_failed` was added by 0001_delivery_failed_status. This CHECK is
+    // a tripwire, not decoration: without the migration, the first order the
+    // shop tries to record as failed takes a `23514 check_violation` inside the
+    // transaction that was recording it — a 500 on an already-broken order.
     //
     // Every transition is a status-guarded UPDATE naming its permitted source
     // states, which is what makes `delivered` and `payment_failed` terminal:
@@ -356,6 +379,31 @@ export const issuanceAttempts = pgTable(
     provider: text("provider").notNull(),
 
     /**
+     * Which attempt this is **for this order** — counting from 1 across every
+     * provider, not per provider.
+     *
+     * That distinction is the whole reason the column is here rather than being
+     * read back out of `request_id`. `req_x_a_3` and `req_x_b_3` are two ids
+     * both claiming to be attempt 3 of order `x`; only one of them can be, and
+     * `issuance_attempts_order_id_attempt_key` below is what refuses the second.
+     *
+     * The alternative to storing it is `split_part(request_id, '_', -1)::int` —
+     * string surgery on a value whose other segments contain the same
+     * delimiter, unindexable, and silently wrong the day the id shape changes
+     * (spec 003 technical-considerations §3).
+     *
+     * **No DEFAULT, deliberately.** Migration 0002 adds the column
+     * `NOT NULL DEFAULT 1` so the `ADD COLUMN` stays metadata-only, then drops
+     * the default in the very next statement. Leaving it would be a
+     * silent-reuse bug: a caller that forgot to compute the next attempt number
+     * would write `1`, derive a `request_id` that already exists, hit
+     * `ON CONFLICT DO NOTHING` and re-probe a settled attempt instead of making
+     * a new one. Without the default that mistake is a
+     * `23502 not_null_violation` at the first insert (§10, §11 R7).
+     */
+    attempt: integer("attempt").notNull(),
+
+    /**
      * `unknown` | `ok` | `failed`, in that order of appearance: a row is written
      * as `unknown` *before* the call, so a process that dies mid-request leaves
      * evidence that an issuance may have happened. No CHECK constraint here —
@@ -363,6 +411,28 @@ export const issuanceAttempts = pgTable(
      * and should not have to alter a Phase 1 constraint to extend it.
      */
     status: text("status").notNull(),
+
+    /**
+     * How many times this one `request_id` has been **sent**, the first ask
+     * included.
+     *
+     * A re-probe after a timeout deliberately does not create a second row — it
+     * is the same question, to the same supplier, under the same id — so the
+     * count lives in a column and the retry ladder bounds it with
+     * `SUPPLIER_MAX_PROBES_PER_REQUEST` (spec 003 technical-considerations §1.2).
+     *
+     * It counts **asks, not answers**: it is incremented before the call and
+     * outside any transaction, so a process killed mid-request leaves a truthful
+     * count with no `catch` having had to run. Accepted cost — a worker that
+     * dies before sending burns a probe; incrementing afterwards would lose the
+     * count on exactly the failure the column exists to count.
+     *
+     * **No DEFAULT**, for the reason `attempt` has none: 0002 adds it
+     * `NOT NULL DEFAULT 1` to stay rewrite-free and drops the default
+     * immediately, so the number of asks is always a number somebody wrote on
+     * purpose.
+     */
+    probeCount: integer("probe_count").notNull(),
 
     /** The issued code, present only once `status = 'ok'`. */
     code: text("code"),
@@ -384,19 +454,88 @@ export const issuanceAttempts = pgTable(
     // this index guarantees that recording that retry updates one row rather
     // than accumulating a second history for the same supplier call:
     //
-    //   INSERT INTO issuance_attempts (request_id, order_id, provider, status)
-    //   VALUES ($1, $2, $3, 'unknown')
-    //   ON CONFLICT (request_id) DO UPDATE SET status = 'unknown'
+    //   INSERT INTO issuance_attempts
+    //     (request_id, order_id, provider, attempt, status, probe_count)
+    //   VALUES ($1, $2, $3, $4, 'unknown', $5)
+    //   ON CONFLICT (request_id) DO NOTHING
     //   RETURNING *;
+    //   -- 0 rows => this request_id is already on file. The row is NOT
+    //   --           rewritten: on the re-probe path it may already say `ok`,
+    //   --           and resetting it to `unknown` would erase the one fact
+    //   --           worth having. The caller reads the existing row back.
+    //   -- $4 is the attempt number the ladder computed. It is passed, never
+    //   --           defaulted — see the column comment above.
     // ---------------------------------------------------------------------
     unique("issuance_attempts_request_id_key").on(t.requestId),
 
-    // Index on `order_id` (technical-considerations §2.2): the retry policy asks
-    // "does this order have an attempt still `unknown`?" before it is allowed to
-    // fall through to the backup supplier. Also the index Postgres needs for the
-    // foreign key above, which it does not create on its own.
-    //   CREATE INDEX issuance_attempts_order_id_idx ON issuance_attempts (order_id);
-    index("issuance_attempts_order_id_idx").on(t.orderId),
+    // ---------------------------------------------------------------------
+    // `attempt` IS NUMBERED PER ORDER — one attempt number, one row.
+    //
+    //   ALTER TABLE issuance_attempts
+    //     ADD CONSTRAINT issuance_attempts_order_id_attempt_key
+    //     UNIQUE (order_id, attempt);
+    //
+    // TWO COLUMNS, NOT THREE. `(order_id, provider, attempt)` would permit
+    // `(x, a, 3)` and `(x, b, 3)` — two rows both claiming to be attempt 3 of
+    // order x — and the ladder's `max(attempt) + 1` would then hand the same
+    // number out twice.
+    //
+    // `issuance_attempts_request_id_key` above does NOT cover this. It catches
+    // two rows carrying the same request id *string*; this one catches a stored
+    // `attempt` that has drifted from the string it appears in. That is the
+    // shape of R7: a retry that numbers attempts per provider recomputes
+    // `req_x_a_1` — an id that was settled long ago — and `ON CONFLICT DO
+    // NOTHING` swallows it in silence, leaving an order that can never be
+    // re-issued. With this constraint the drift is instead
+    //
+    //     23505 unique_violation  "issuance_attempts_order_id_attempt_key"
+    //
+    // raised by the INSERT that reserves the attempt, before any supplier is
+    // called.
+    //
+    // It is also the ladder's access path, and it replaces
+    // `issuance_attempts_order_id_idx` — `order_id` leads, so the FK-shaped
+    // lookup keeps an index. Migration 0002 drops the old one, after adding
+    // this one:
+    //
+    //   SELECT id, request_id, order_id, provider, attempt, status,
+    //          probe_count, code, last_error, created_at
+    //   FROM issuance_attempts WHERE order_id = $1 ORDER BY attempt DESC;
+    //   -- Index Scan Backward using issuance_attempts_order_id_attempt_key,
+    //   -- no Sort node.
+    //   -- 0 rows => this order was never offered to a supplier. NOT a failure:
+    //   --           the recovery list renders it as "not yet attempted".
+    //   -- Read INSIDE the order row lock (I4): outside it these rows are a
+    //   -- snapshot another worker is free to extend between this SELECT and
+    //   -- the rung computed from it.
+    //
+    // `ORDER BY attempt`, not `created_at`: `created_at` defaults to `now()`,
+    // which is transaction-start time and therefore ties for two rows written
+    // in one transaction. This UNIQUE is what makes `attempt` a total order
+    // with no ties.
+    // (spec 003 technical-considerations §3, §5 and §11 R7.)
+    // ---------------------------------------------------------------------
+    unique("issuance_attempts_order_id_attempt_key").on(t.orderId, t.attempt),
+
+    // ---------------------------------------------------------------------
+    // `deriveIssuanceRequestId` already refuses a zero, a float or a NaN before
+    // it will build an id. These two mirror that guard at the layer that still
+    // holds when TypeScript is bypassed — a seed, a psql session, a future
+    // service in another language.
+    //
+    //   CHECK (attempt >= 1)
+    //   CHECK (probe_count >= 1)
+    //
+    // Attempt 0 reads as "no attempt" to anyone looking at a log line; a
+    // probe_count of 0 would claim a row exists for a request nobody sent, when
+    // the row is written precisely because one is about to be.
+    //
+    // No CHECK on `provider` or on `status`, on purpose: those value sets
+    // belong to the retry policy, which should not have to alter a constraint
+    // in order to extend itself (technical-considerations §3, "Rejected").
+    // ---------------------------------------------------------------------
+    check("issuance_attempts_attempt_positive", sql`"attempt" >= 1`),
+    check("issuance_attempts_probe_count_positive", sql`"probe_count" >= 1`),
   ],
 );
 

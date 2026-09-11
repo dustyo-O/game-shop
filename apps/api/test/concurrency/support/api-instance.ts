@@ -45,7 +45,7 @@
  * old, correct claim regardless of what the source on disk says.
  *
  * ---------------------------------------------------------------------------
- * WHY EACH INSTANCE POINTS `PAYMENT_WEBHOOK_URL` AND `SUPPLIER_A_URL` AT ITSELF
+ * WHY EACH INSTANCE POINTS `PAYMENT_WEBHOOK_URL` AND THE SUPPLIER URLS AT ITSELF
  * ---------------------------------------------------------------------------
  * Matches the shape `docs/walkthrough/slice-5-issuance.md` §1 and §3 measured
  * by hand: each spawned instance's webhook and supplier calls loop back to its
@@ -75,7 +75,32 @@
 import { type ChildProcess, spawn } from "node:child_process";
 
 const HEALTH_POLL_INTERVAL_MS = 50;
-const HEALTH_POLL_TIMEOUT_MS = 15_000;
+/**
+ * How long to wait for a spawned instance to answer `GET /api/health`.
+ *
+ * 60s, raised from 15s during Phase 3 slice 2 after a measured failure — and
+ * the distinction matters, because raising a timeout to make a red run green is
+ * normally the wrong move.
+ *
+ * What was measured: on a loaded machine a nested `spawn` of `dist/main.js`
+ * took **13,434 ms before Nest printed its first line** — that is process
+ * startup, not application work. Against a 15s budget the suite did not fail an
+ * assertion; it failed with "did not become healthy", and then did something
+ * worse. A suite that dies in `beforeAll` leaves orders and pending events on
+ * the database, and the *next* suite's admin sweep issues keys for those
+ * leftovers inside its own measurement window — so the visible symptom was two
+ * pool-accounting assertions failing in a suite that had nothing wrong with it
+ * (`the unclaimed pool moved by exactly one key: expected 3 to be 1`).
+ *
+ * So this bound is not hiding a slow test. It is a readiness budget that was
+ * tighter than the machine, and its tightness manifested as a *correctness*
+ * failure somewhere else. Every suite passed individually against a freshly
+ * seeded database throughout.
+ *
+ * If an instance genuinely cannot serve within a minute, something is wrong
+ * that a longer wait will not fix, and the error message says which port.
+ */
+const HEALTH_POLL_TIMEOUT_MS = 60_000;
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 
 /**
@@ -226,6 +251,11 @@ export async function startApiInstance(options: StartApiInstanceOptions): Promis
         // instance's own webhook and supplier calls stay inside this instance.
         PAYMENT_WEBHOOK_URL: `${baseUrl}/api/webhooks/payment`,
         SUPPLIER_A_URL: `${baseUrl}/internal/suppliers/a`,
+        // Set for the same reason A's is, and required for the same reason:
+        // `SUPPLIER_B_CONFIG` is validated while the container is built, so an
+        // instance spawned without it does not fail on a fall-through — it
+        // fails to boot, and the suite reports "never became healthy".
+        SUPPLIER_B_URL: `${baseUrl}/internal/suppliers/b`,
         SUPPLIER_TIMEOUT_MS: String(supplierTimeoutMs),
         WEB_API_BASE_URL: baseUrl,
         // Explicit in both directions, never left to inherit: a `true` sitting

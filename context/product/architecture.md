@@ -231,7 +231,23 @@ RETURNING *;
 - **Why serverless strengthens the claim:** concurrent requests land in separate processes, so passing the fifty-webhook scenario against the deployed URL is direct evidence that correctness lives in Postgres and not in one process's memory. This is the README's strongest sentence.
 - **Local development:** Docker Compose (Postgres + API + web) with one-command startup, seeds included. The assignment accepts a fully local setup, so this is the guaranteed path; the deployment is the bonus.
 - **Configuration:** environment variables for the database URL, supplier failure and timeout rates, retry counts and the admin token. Supplier behaviour must be tunable at runtime so every failure scenario can be reproduced on demand.
-- **Serverless timeouts:** the supplier stub's deliberate hang is configuration, not a constant, and is kept below the function execution ceiling. Our client-side timeout sits below that again, so a timeout is always observed as a timeout rather than as a killed function.
+- **Serverless timeouts — two hang scenarios, and they need opposite orderings.** The supplier stub's deliberate hang is configuration, not a constant, and which side of `SUPPLIER_TIMEOUT_MS` it lands on decides which scenario is being staged. Both are worth having as named checks; neither substitutes for the other.
+
+  | Scenario | Where the hang sits | Required ordering | What it demonstrates |
+  | --- | --- | --- | --- |
+  | Slow but successful | before the key claim, short (`hang_before_claim: true`) | `hang_ms < SUPPLIER_TIMEOUT_MS` | a slow supplier is not a failed one — the call completes normally and no timeout occurs |
+  | **The timeout trap** | **after the key claim commits, long (the default)** | **`SUPPLIER_TIMEOUT_MS < hang_ms < function execution ceiling`** | a key genuinely issued, a client that timed out and cannot know it, and a re-probe on the same `request_id` that gets the same code back |
+
+  **The placement is stored, not compiled in.** `supplier_behaviour.hang_before_claim` (migration 0004) selects between the two rows above and is armed per check beside `hang_ms`, through `PUT /internal/suppliers/:provider/behaviour`. It is a boolean rather than an enum because the key claim and its ledger write are one transaction, so there are exactly two honest placements — and the only third value anybody would reach for is *inside* that transaction, which would hold the instance's one pooled connection for `hang_ms` and stall every other request in the process. It defaults to `false`, i.e. **after the claim**, because that is the scenario this phase exists to demonstrate; the other must be asked for by name.
+
+  **The trap's ordering is the one the retry policy above turns on, and it was written backwards here until Phase 3.** The old text gave `hang < SUPPLIER_TIMEOUT_MS < ceiling` as the rule for every case, which produces no timeout at all: the client waits, the supplier answers, and a timeout check staged that way passes having exercised nothing. It was not simply inverted — it describes the first row, and was being cited as the basis for the second.
+
+  The reasoning offered for the old direction conflated two different events, and keeping them apart is the point of this bullet:
+
+  - **The client giving up.** `AbortSignal.timeout` aborts the *shop's own socket* (`apps/api/src/issuance/supplier.client.ts`). It does not stop the supplier's handler, which keeps running, may claim a key, and may finish its work and write a response nobody is listening for. That is exactly what makes a timeout **`unknown`** rather than **`failed`**, and it is the whole subject of §4's retry policy. Measured, not assumed: a client aborting at 200 ms against a handler that claims at 400 ms throws `TimeoutError` while the claim still commits and the ledger still holds the code.
+  - **The platform killing the function.** That is the execution ceiling's doing, not the timeout's — no exception, no `catch`, no log line, no attempt row updated, and an order left in `delivering` holding a key that may or may not exist.
+
+  `SUPPLIER_TIMEOUT_MS < ceiling` is what stops the second from pre-empting the first, and it holds in both rows: **a timeout must always be observed as a timeout, never as a killed function.** `hang_ms < ceiling` is the trap row's right-hand term, and it is what leaves the supplier time to finish and have a code on file for the re-probe to find.
 
 ---
 

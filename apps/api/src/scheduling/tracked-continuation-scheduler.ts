@@ -65,7 +65,9 @@ import {
  *     slowest is a payment continuation that runs a full issuance: a handful of
  *     guarded UPDATEs either side of one supplier call, and that call is itself
  *     bounded by `SUPPLIER_TIMEOUT_MS` (2000 ms locally — `.env.example`, and
- *     the middle term of the ordered chain in `../config/supplier-config.ts`).
+ *     the shop's own term in the ordered chain in
+ *     `../config/supplier-config.ts`, which sits below the function ceiling and
+ *     may sit either side of the supplier's injected hang).
  *     Two seconds of supplier plus statements against a local pool leaves well
  *     over half the budget spare, so a *healthy* continuation is never
  *     abandoned. If `SUPPLIER_TIMEOUT_MS` is ever raised past ~4 s, this

@@ -173,7 +173,26 @@ export function assertBaseline(counts: BaselineCounts, when: "before" | "after")
  */
 export async function cleanupTestOrders(client: DatabaseClient, orderIds: readonly string[]): Promise<void> {
   if (orderIds.length === 0) return;
-  const requestIds = orderIds.map(deriveTestRequestId);
+
+  // Prefix patterns, NOT `orderIds.map(deriveTestRequestId)`.
+  //
+  // That helper derives exactly one id — `req_{order}_a_1` — because through
+  // Phases 1 and 2 that was the only id an order could ever produce. Phase 3's
+  // ladder broke that assumption: an order whose first supplier refuses falls
+  // through to `req_{order}_b_2`, and a retry can reach `_a_3`.
+  //
+  // Cleaning only `_a_1` therefore leaves a *claimed key* behind for every
+  // order that fell through — and the damage does not surface here. It surfaces
+  // later, in an unrelated suite, as `unclaimed = 49, expected 50`, pointing at
+  // code that has nothing to do with it. The same misdirection cost real time
+  // this phase when a tight readiness budget stranded rows the next suite's
+  // sweep then consumed.
+  //
+  // `req_{order}_%` matches every rung the ladder can mint, now and after a
+  // provider is added. `deriveTestRequestId` is kept for the callers that want
+  // to *assert* on the first attempt's id specifically — a different job from
+  // deciding what to clean up.
+  const requestIdPatterns = orderIds.map((orderId) => `req_${orderId}_%`);
 
   await client.pool.query(`delete from deliveries where order_id = ANY($1::text[])`, [orderIds]);
   await client.pool.query(`delete from issuance_attempts where order_id = ANY($1::text[])`, [orderIds]);
@@ -185,10 +204,11 @@ export async function cleanupTestOrders(client: DatabaseClient, orderIds: readon
   // supplier.ts, "There is no 'unclaim'"), and that rule is about production
   // code, not about a test restoring the fixture it borrowed.
   await client.pool.query(
-    `update supplier_keys set claimed_by_request_id = null, claimed_at = null where claimed_by_request_id = ANY($1::text[])`,
-    [requestIds],
+    `update supplier_keys set claimed_by_request_id = null, claimed_at = null
+       where claimed_by_request_id like any($1::text[])`,
+    [requestIdPatterns],
   );
-  await client.pool.query(`delete from supplier_requests where request_id = ANY($1::text[])`, [requestIds]);
+  await client.pool.query(`delete from supplier_requests where request_id like any($1::text[])`, [requestIdPatterns]);
 }
 
 export interface ConcurrencyWitness {

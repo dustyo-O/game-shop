@@ -38,12 +38,19 @@
 import { Module } from "@nestjs/common";
 
 import { DatabaseModule } from "../../database/database.module.js";
+import { SupplierBehaviourService } from "../supplier-behaviour.service.js";
 import { SupplierKeyClaimService } from "../supplier-key-claim.service.js";
 import { SupplierAController } from "./supplier-a.controller.js";
 
 @Module({
   imports: [DatabaseModule],
   controllers: [SupplierAController],
-  providers: [SupplierKeyClaimService],
+  // `SupplierBehaviourService` is listed here rather than exported by
+  // `SupplierBehaviourModule`, for the reason that module's header gives: it
+  // exports nothing, so the shop cannot inject it and must discover a refusing
+  // supplier by being refused over HTTP. A second instance of a stateless class
+  // over one `DATABASE_CLIENT` is not a cost worth an export — the state is in
+  // `supplier_behaviour`, not in the object.
+  providers: [SupplierKeyClaimService, SupplierBehaviourService],
 })
 export class SupplierAModule {}

@@ -84,13 +84,20 @@
  * AND WHY IT NOW IMPORTS `IssuanceModule`
  * ---------------------------------------------------------------------------
  * The same reasoning, one step further along §2.5. `OrdersModule` gives this
- * module the transitions of steps 2 and 3; `IssuanceModule` gives it steps 4-6
- * as a single call ({@link IssuanceService.issueForClaimedOrder}) made at the
- * point where {@link PaymentEventProcessor} has just won `paid → delivering`.
+ * module the transitions of step 2; `IssuanceModule` gives it steps 3-6 as a
+ * single call ({@link IssuanceRunnerService.runForOrder}) made at the point
+ * where {@link PaymentEventProcessor} has decided the event is a `paid` one.
  *
- * It exports {@link IssuanceService} and nothing else — in particular not
- * {@link SupplierAClient}, so there is no wiring by which this module could
- * reach a supplier without an attempt row being written first
+ * **Step 3 — the claim — moved across that line in spec 003.** Phase 2 claimed
+ * the order here and handed the claimed row over; the ladder's inputs now have
+ * to be read in the same transaction as the lock and the claim (spec 003 §6),
+ * and a transaction cannot be split across two modules. So the runner owns the
+ * whole of transaction A and this module owns the *event's* fate.
+ *
+ * It exports {@link IssuanceRunnerService} and nothing else — in particular
+ * neither {@link IssuanceService} nor {@link SupplierClient}, so there is no
+ * wiring by which this module could reach a supplier without the claim, the
+ * lock and the ladder that precede it
  * (`../issuance/issuance.module.ts`).
  *
  * ---------------------------------------------------------------------------

@@ -1,35 +1,31 @@
 /**
- * `issuance` — "Drive a paid order to `delivered`: call the supplier, record the
- * attempt, bind the delivery" (technical-considerations §2.4), i.e. §2.5 **steps
- * 4, 5 and 6**.
+ * **One ask, of one supplier, for one already-reserved attempt.**
  *
- * Entered by exactly one caller per order: the one that won `paid → delivering`
- * in {@link PaymentEventProcessor.claimForIssuance}. It never decides *whether*
- * to issue — that decision was made by a guarded UPDATE inside Postgres — and it
- * never settles the payment event, which stays the processor's job precisely so
- * the event cannot leave the queue before the order has stopped moving.
+ * This file used to be the whole of issuance: derive the id, record the
+ * attempt, call supplier A, and settle the order whatever came back. Phase 3
+ * splits that in two, because "what did this supplier say?" and "what should
+ * the shop do about it?" are different questions and only the second one needs
+ * to see the ledger:
+ *
+ *   - **{@link IssuanceRunnerService}** owns the policy — the claim under the
+ *     lock, the ladder walk, the attempt reservation and every order
+ *     transition. It is the single entry point for both the automatic path and
+ *     the operator's retry.
+ *   - **This service owns the boundary** — the HTTP call, the classification of
+ *     what came back, and, on success only, the one short transaction that
+ *     binds the key and finishes the order.
+ *
+ * The split is what makes the retry policy testable without a supplier: the
+ * ladder is a pure function of rows (`./issuance-ladder.ts`) precisely because
+ * nothing in it has to reach this file.
  *
  * ---------------------------------------------------------------------------
  * THE ORDERING IS THE DESIGN. THERE ARE THREE STEPS AND THEY MAY NOT BE SWAPPED.
  * ---------------------------------------------------------------------------
  *
- *     1. WRITE   record the attempt as `unknown`      (one statement, no tx)
- *     2. CALL    POST {SUPPLIER_A_URL}/issue          (no transaction, no lock)
- *     3. WRITE   resolve the attempt + bind + finish  (TX B: lock, then write)
- *
- * Step 3 is **transaction B of invariant I4** (`architecture.md` §3, §3.1). Its
- * first statement is `SELECT … FROM orders WHERE id = $1 FOR UPDATE`; transaction
- * A is the claim that let this service be entered at all
- * ({@link PaymentEventProcessor.claimForIssuance}). The two bracket the supplier
- * call and neither one spans it — see "Why no transaction spans the call" below,
- * and `../orders/order-lock.service.ts` for why the shape has to be two short
- * transactions rather than one long one.
- *
- * **Step 1 deliberately takes no lock.** It is a single statement in its own
- * implicit transaction, so a lock taken there would be released before the next
- * line of TypeScript ran — protection in name only. The row it writes is not a
- * decision anybody races over; it is a note that we are about to ask, and
- * `ON CONFLICT (request_id) DO NOTHING` already makes writing it twice a no-op.
+ *     1. WRITE   reserve the attempt as `unknown`   ← THE RUNNER, in TX A / A′
+ *     2. CALL    POST {SUPPLIER_x_URL}/issue        ← here, no transaction
+ *     3. WRITE   resolve + bind + finish            ← here, TX B: lock, then write
  *
  * **Why the attempt row is written before the call.** A timeout must have
  * somewhere to be written down, and the place has to exist *before* the thing it
@@ -47,42 +43,55 @@
  * error handler at all — all leave the record saying precisely what is true.
  * The only writes that *change* it are the ones that follow a definite answer.
  *
- * **Why no transaction spans the call.** `packages/db/src/client.ts` sets
- * `max: 1` per instance, and Drizzle checks the single connection out for the
- * whole of `transaction()`. A transaction held across an HTTP round trip
- * therefore stalls every other statement this instance wants to run, for as long
- * as the supplier takes — up to `SUPPLIER_TIMEOUT_MS`. The constraint is stated
- * four times in the codebase (the client, {@link OrderTransitionService},
- * {@link OrderLockService}, and the seam in {@link PaymentEventProcessor})
- * because it is the one that is easiest to violate by accident and hardest to
- * diagnose afterwards: the symptom is unrelated requests timing out.
+ * **Step 1 moved into the runner's transaction, and that is a strengthening.**
+ * Phase 1 wrote the row here, outside any transaction, and argued — correctly —
+ * that opening a transaction *just* for it would take a lock that was released
+ * before the next line of TypeScript ran. Phase 3 does not open a transaction
+ * for it: it writes the row inside a transaction that is **already** holding the
+ * order row lock for the ladder's sake, and guards the write on the order still
+ * being `delivering` (spec 003 §6, transaction A′). The row is still written
+ * before the call, which is the property that mattered.
+ *
+ * ---------------------------------------------------------------------------
+ * THIS SERVICE NEVER MOVES AN ORDER EXCEPT TO `delivered`
+ * ---------------------------------------------------------------------------
+ * A definite refusal used to be settled here, straight to `out_of_stock`. It
+ * cannot be any more, and the reason is the whole of slice 2: after supplier A
+ * refuses, the order must stay `delivering` so that supplier B can be asked
+ * under the same claim. Settling it and re-claiming would need a transition
+ * that does not exist yet, and would show the shopper an `out_of_stock` flicker
+ * for an order that is about to be delivered.
+ *
+ * So a refusal returns {@link SupplierAskOutcome.Refused} and **writes
+ * nothing**. The runner's transaction A′ records `failed` against the attempt
+ * and then — under the lock, from the ledger it just wrote — decides whether
+ * there is another supplier to ask or the order is settled.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY NO TRANSACTION SPANS THE CALL
+ * ---------------------------------------------------------------------------
+ * `packages/db/src/client.ts` sets `max: 1` per instance, and Drizzle checks the
+ * single connection out for the whole of `transaction()`. A transaction held
+ * across an HTTP round trip therefore stalls every other statement this instance
+ * wants to run, for as long as the supplier takes — up to
+ * `SUPPLIER_TIMEOUT_MS`. The constraint is stated four times in the codebase
+ * (the client, {@link OrderTransitionService}, {@link OrderLockService}, and
+ * {@link IssuanceRunnerService}) because it is the one that is easiest to
+ * violate by accident and hardest to diagnose afterwards: the symptom is
+ * unrelated requests timing out.
  *
  * It is also the reason the lock is taken **twice**, in two transactions, rather
  * than once across the call. Two acquisitions of a short lock cost two round
  * trips; one acquisition held across the supplier call would cost the instance.
- *
- * ---------------------------------------------------------------------------
- * WHAT THIS SLICE DOES NOT DO
- * ---------------------------------------------------------------------------
- * There is **no retry policy here**, deliberately. Phase 1 builds only supplier
- * A, always succeeding unless the pool is empty (technical-considerations §1),
- * so an unknown outcome ends the run: the attempt stays `unknown`, the order
- * rests in `delivering`, and the payment event stays pending. Nothing falls
- * through to anything, because there is nothing to fall through to and — more
- * importantly — falling through while an attempt is `unknown` is the exact move
- * `architecture.md` §4 forbids.
- *
- * What Phase 3 adds sits entirely on top of this file's shape: re-probe the
- * outstanding `request_id` against the same supplier, bounded retries, and only
- * after a *definite* failure a call to supplier B with `attempt + 1` in a new
- * id. The classification those decisions read is already being recorded here, on
- * every attempt row, which is why getting it right now matters more than the
- * absent policy does.
  */
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import { eq } from "drizzle-orm";
 
-import { OrderStatus, SupplierIssueErrorReason, type SupplierIssueRequest } from "@game-shop/contracts";
+import {
+  OrderStatus,
+  type SupplierIssueErrorReason,
+  type SupplierIssueRequest,
+} from "@game-shop/contracts";
 import {
   deliveries,
   issuanceAttempts,
@@ -97,78 +106,86 @@ import { OrderLockService } from "../orders/order-lock.service.js";
 import { OrderTransitionOutcome, OrderTransitionService } from "../orders/order-transition.service.js";
 import type { OrderTransitionName } from "../orders/order-transitions.js";
 import { IssuanceAttemptStatus } from "./issuance-attempt-status.js";
-import {
-  FIRST_ISSUANCE_ATTEMPT,
-  IssuanceProvider,
-  deriveIssuanceRequestId,
-} from "./issuance-request-id.js";
-import { SupplierAClient } from "./supplier-a.client.js";
+import type { IssuanceAsk } from "./issuance-ladder.js";
+import { IssuanceProvider } from "./issuance-request-id.js";
+import { SUPPLIER_A_CLIENT, SUPPLIER_B_CLIENT, SupplierClient } from "./supplier.client.js";
 import { SupplierDefiniteFailure, SupplierUnknownOutcome } from "./supplier-issue.errors.js";
 
 /**
- * How the issuance ended — the three ways an order can leave this service.
+ * How one supplier call ended — **three answers, and the split between the last
+ * two is the assignment's central trap.**
  *
- * Named values in the shape every other service here uses
- * ({@link OrderTransitionOutcome}, {@link SupplierKeyClaimOutcome}), so the
- * caller's `switch` reads as news and the compiler has something to be
- * exhaustive about. **None of them is an error**, and none of them throws: an
- * empty pool is an ordinary business outcome and a silent supplier is an
- * ordinary network one.
- *
- * The split that matters to the caller is not "did it work?" — it is **"has the
- * order stopped moving?"**, because that is what decides whether the payment
- * event settles. The first two have; the third has not.
+ * Named values in the shape every other outcome type here uses, so the caller's
+ * `switch` reads as news and the compiler has something to be exhaustive about.
+ * None of them is an error and none of them throws: an empty pool is an ordinary
+ * business outcome and a silent supplier is an ordinary network one.
  */
-export const IssuanceOutcome = {
-  /** A code is bound in `deliveries` and the order is `delivered`. Terminal. */
-  Delivered: "delivered",
+export const SupplierAskOutcome = {
+  /**
+   * **The supplier returned a code, and transaction B committed.** The key is
+   * bound in `deliveries` and the order was moved with `completeDelivery`.
+   */
+  Issued: "issued",
 
   /**
-   * The supplier answered with a definite refusal and the order is
-   * `out_of_stock`. No delivery row exists and none ever will for this attempt.
-   * Terminal for Phase 1; recoverable in Phase 3.
+   * **The supplier answered, and the answer was no.** We know no key was
+   * issued: the answer arrived from a claim transaction that committed having
+   * written nothing. Nothing has been written on our side either — the runner's
+   * transaction A′ records `failed` and decides what happens next, because that
+   * decision needs the ledger and the lock, and this service has neither.
    */
-  OutOfStock: "out_of_stock",
+  Refused: "refused",
 
   /**
-   * **No finishing status was reached.** In practice: the supplier gave no
-   * usable answer, so the attempt stays `unknown`, the order rests in
-   * `delivering`, and the caller must leave the payment event pending. A key may
-   * or may not exist for this `request_id`, and the only thing that can find out
-   * is another call with the same id.
+   * **There is no answer, and there may or may not be a key.** A timeout, a
+   * dead socket, a body that did not parse. Nothing is written, because the
+   * attempt row already says `unknown` and that is still the truth. The only
+   * safe next move is to ask **this** supplier **this same** `request_id`
+   * again; falling through to another supplier from here is how one order gets
+   * charged for two keys (`architecture.md` §4, "The hard rule").
    */
-  Unresolved: "unresolved",
+  NoAnswer: "no_answer",
 } as const;
 
-export type IssuanceOutcome = (typeof IssuanceOutcome)[keyof typeof IssuanceOutcome];
+export type SupplierAskOutcome = (typeof SupplierAskOutcome)[keyof typeof SupplierAskOutcome];
 
 /**
- * The result of driving one claimed order through issuance.
+ * The result of one supplier call.
  *
  * A discriminated union, so `result.code` does not type-check until the caller
- * has narrowed to {@link IssuanceOutcome.Delivered} — the two non-delivering
- * outcomes cannot be skipped by accident, only refused on purpose.
- *
- * `requestId` is on every branch because it is the correlation id for this whole
- * path and the caller logs it whatever happened.
+ * has narrowed to {@link SupplierAskOutcome.Issued}, and `result.reason` does
+ * not type-check on the branch where no supplier said anything. `requestId` and
+ * `provider` are on every branch because they are the correlation ids for this
+ * whole path and the caller logs them whatever happened.
  */
-export type IssuanceResult =
+export type SupplierAskResult =
   | {
-      readonly outcome: typeof IssuanceOutcome.Delivered;
+      readonly outcome: typeof SupplierAskOutcome.Issued;
       readonly requestId: string;
+      readonly provider: IssuanceProvider;
       /** The key now bound to this order in `deliveries`. */
       readonly code: string;
+      /** Whether *this* call bound it, or found one already bound (I3). */
+      readonly bound: boolean;
+      /**
+       * The status the order ended transaction B in. `delivered` on every
+       * ordinary run; anything else means the finishing transition matched zero
+       * rows, and the caller must report that rather than claiming a delivery.
+       */
+      readonly finished: OrderStatus | undefined;
     }
   | {
-      readonly outcome: typeof IssuanceOutcome.OutOfStock;
+      readonly outcome: typeof SupplierAskOutcome.Refused;
       readonly requestId: string;
-      /** The supplier's own word, as recorded in `issuance_attempts.last_error`. */
+      readonly provider: IssuanceProvider;
+      /** The supplier's own word, to be written to `issuance_attempts.last_error`. */
       readonly reason: SupplierIssueErrorReason;
     }
   | {
-      readonly outcome: typeof IssuanceOutcome.Unresolved;
+      readonly outcome: typeof SupplierAskOutcome.NoAnswer;
       readonly requestId: string;
-      /** Why nothing was concluded. For the log line; never branched on. */
+      readonly provider: IssuanceProvider;
+      /** Which flavour of silence. For the log line; never branched on. */
       readonly detail: string;
     };
 
@@ -181,43 +198,52 @@ function assertNever(value: never): never {
 export class IssuanceService {
   private readonly logger = new Logger(IssuanceService.name);
 
-  /** Phase 1 calls exactly one supplier. Phase 3 chooses between two. */
-  private readonly provider = IssuanceProvider.A;
+  /**
+   * One client per supplier, keyed by the provider tag the ladder chose.
+   *
+   * `satisfies Record<IssuanceProvider, SupplierClient>` is a tripwire, not
+   * decoration: adding a third member to {@link IssuanceProvider} — which is
+   * also the fall-through order the ladder walks — stops the build here, at the
+   * one place that would otherwise have to fail at runtime with "cannot read
+   * property issue of undefined", on a paid order, at the first fall-through.
+   */
+  private readonly suppliers: Readonly<Record<IssuanceProvider, SupplierClient>>;
 
   constructor(
     @Inject(DATABASE_CLIENT) private readonly database: DatabaseClient,
-    private readonly supplier: SupplierAClient,
+    @Inject(SUPPLIER_A_CLIENT) supplierA: SupplierClient,
+    @Inject(SUPPLIER_B_CLIENT) supplierB: SupplierClient,
     private readonly transitions: OrderTransitionService,
     private readonly orderLock: OrderLockService,
-  ) {}
+  ) {
+    this.suppliers = {
+      [IssuanceProvider.A]: supplierA,
+      [IssuanceProvider.B]: supplierB,
+    } satisfies Record<IssuanceProvider, SupplierClient>;
+  }
 
   /**
-   * Drive one **already-claimed** order from `delivering` to a finishing status.
+   * Ask one supplier for one key, for an attempt the caller has **already
+   * reserved**.
    *
-   * The argument is the `orders` row returned by the winning
-   * `paid → delivering` UPDATE, not an id: holding the row is proof the caller
-   * won the claim, and it carries the `sku` the supplier is asked for without a
-   * second read. Passing an id would make it possible to call this for an order
-   * nobody claimed.
+   * The first argument is the `orders` row the caller claimed, not an id:
+   * holding the row is proof the caller won the claim, and it carries the `sku`
+   * the supplier is asked for without a second read. The second is the ladder's
+   * chosen rung — provider, attempt number and the id derived from them. This
+   * service never chooses any of the three, which is what keeps "which supplier
+   * next" a decision made from the recorded ledger rather than from a field on
+   * a class.
    *
    * Never throws for anything the supplier does. A definite refusal becomes
-   * {@link IssuanceOutcome.OutOfStock}, silence becomes
-   * {@link IssuanceOutcome.Unresolved}, and both are `200`s to the payment
+   * {@link SupplierAskOutcome.Refused}, silence becomes
+   * {@link SupplierAskOutcome.NoAnswer}, and both are `200`s to the payment
    * provider. Only a genuine defect on our side — the database being
    * unreachable, a bug in this file — propagates, and it propagates *after* the
    * attempt row already says `unknown`.
    */
-  async issueForClaimedOrder(order: Order): Promise<IssuanceResult> {
-    // Derived, not generated, and derived here rather than passed in: there is
-    // no caller that could have remembered it, and none that needs to.
-    // (`./issuance-request-id.ts`.)
-    const requestId = deriveIssuanceRequestId(order.id, this.provider, FIRST_ISSUANCE_ATTEMPT);
-
-    // ---------------------------------------------------------------- STEP 1
-    await this.recordAttempt(order, requestId);
-
+  async askSupplier(order: Order, ask: IssuanceAsk): Promise<SupplierAskResult> {
     const request: SupplierIssueRequest = {
-      request_id: requestId,
+      request_id: ask.requestId,
       sku: order.sku,
       order_id: order.id,
     };
@@ -226,7 +252,7 @@ export class IssuanceService {
     // Outside every transaction. See the file header.
     let code: string;
     try {
-      code = await this.supplier.issue(request);
+      code = await this.suppliers[ask.provider].issue(request);
     } catch (error: unknown) {
       // ##################################################################
       // # THE TWO CLASSES ARE HANDLED IN TWO PLACES, ON PURPOSE.
@@ -239,11 +265,11 @@ export class IssuanceService {
       // while the first one may already have issued — which is the assignment's
       // central trap, sprung.
       if (error instanceof SupplierDefiniteFailure) {
-        return this.applyDefiniteFailure(order, error);
+        return this.reportRefusal(order, ask, error);
       }
 
       if (error instanceof SupplierUnknownOutcome) {
-        return this.leaveUnresolved(order, error);
+        return this.reportNoAnswer(order, ask, error);
       }
 
       // Not a supplier failure at all — a defect in our own code, or the
@@ -256,92 +282,7 @@ export class IssuanceService {
     }
 
     // ---------------------------------------------------------------- STEP 3
-    return this.bindDelivery(order, requestId, code);
-  }
-
-  /**
-   * §2.5 step 4, first half — **write down that we are about to ask.**
-   *
-   * Emitted SQL (copied from `.toSQL()`; per the project's raw-SQL rule,
-   * `architecture.md` §2, "Documentation convention"):
-   *
-   *   insert into "issuance_attempts"
-   *     ("id", "request_id", "order_id", "provider", "status", "code", "last_error", "created_at")
-   *   values (default, $1, $2, $3, $4, default, default, default)
-   *   on conflict ("request_id") do nothing
-   *   returning "id", "request_id", "order_id", "provider", "status", "code",
-   *             "last_error", "created_at";
-   *   -- $4 = 'unknown'  — always. A row is never born in any other state.
-   *   -- 1 row  => first time this request_id has been recorded. The durable
-   *   --           record that we asked now exists, before we ask.
-   *   -- 0 rows => this request_id was ALREADY recorded — a Phase 3 retry, or a
-   *   --           re-entered issuance. Not an error, and nothing to write: the
-   *   --           record this statement exists to guarantee is already there.
-   *
-   * ### `DO NOTHING`, not `DO UPDATE SET status = 'unknown'`
-   *
-   * `packages/db/src/schema/shop.ts` sketches the upsert form, and it is the
-   * wrong shape for this call: on the Phase 3 retry path the existing row may
-   * say `ok`, and resetting it to `unknown` would erase the one fact worth
-   * having — the code the first attempt already obtained. `DO NOTHING` cannot
-   * destroy history, and the guarantee wanted here is only that a row *exists*,
-   * not that it says anything in particular.
-   *
-   * The zero-row path reads the existing row back purely to log what it says.
-   * That read is advisory and nothing branches on it: deciding whether to call
-   * the supplier from a status read a moment ago would be a check-then-act, and
-   * it is unnecessary anyway — the supplier's ledger answers a repeat with the
-   * original code (I5), so calling again is safe by construction. Phase 3 is
-   * where this row starts driving a decision, and it will do so under the order
-   * row lock.
-   *
-   *   select "id", "request_id", "order_id", "provider", "status", "code",
-   *          "last_error", "created_at"
-   *   from "issuance_attempts" where "issuance_attempts"."request_id" = $1;
-   *   -- 0 rows => impossible in practice; the insert above lost the conflict to
-   *   --           a row that must therefore exist. Logged, not thrown.
-   *
-   * No transaction: it is one statement, and its own implicit transaction is
-   * exactly the unit of work wanted. Wrapping it would hold the instance's only
-   * connection a moment longer for no gain.
-   */
-  private async recordAttempt(order: Order, requestId: string): Promise<void> {
-    const [recorded] = await this.database.db
-      .insert(issuanceAttempts)
-      .values({
-        requestId,
-        orderId: order.id,
-        provider: this.provider,
-        // The whole point of the row. See `./issuance-attempt-status.ts`.
-        status: IssuanceAttemptStatus.Unknown,
-      })
-      .onConflictDoNothing({ target: issuanceAttempts.requestId })
-      .returning();
-
-    if (recorded !== undefined) {
-      this.logger.log({
-        msg: "issuance: attempt recorded as unknown BEFORE the supplier call",
-        order_id: order.id,
-        request_id: requestId,
-        provider: this.provider,
-        attempt_status: recorded.status,
-      });
-
-      return;
-    }
-
-    const [existing] = await this.database.db
-      .select()
-      .from(issuanceAttempts)
-      .where(eq(issuanceAttempts.requestId, requestId));
-
-    this.logger.warn({
-      msg: "issuance: this request_id was already recorded; re-asking the supplier with the same id",
-      order_id: order.id,
-      request_id: requestId,
-      provider: this.provider,
-      attempt_status: existing?.status,
-    });
+    return this.bindDelivery(order, ask, code);
   }
 
   /**
@@ -363,10 +304,9 @@ export class IssuanceService {
    * what makes the outcome atomic against a second worker — the claim in
    * transaction A excluded every other worker from *reaching the supplier*, and
    * this lock excludes them from *writing the answer* while this one is
-   * mid-write. In Phase 1 no second worker can be here (only the claim winner
-   * enters this service); Phase 3's admin re-issue and the retry path are two
-   * more, and the lock is what they will arrive into rather than something added
-   * for them later.
+   * mid-write. Phase 3's operator retry and its resume path are two more workers
+   * that arrive here, which is why the lock was built in Phase 2 rather than
+   * being added for them now.
    *
    * It also means the `FOR KEY SHARE` that the `deliveries` foreign key takes on
    * this same order row a statement later is already held by this transaction,
@@ -410,6 +350,10 @@ export class IssuanceService {
    *   values (default, $1, $2, $3, $4, default)
    *   on conflict ("order_id") do nothing
    *   returning "id", "order_id", "code", "provider", "request_id", "created_at";
+   *   -- $3 is the provider THE LADDER CHOSE, not a field on this class. After a
+   *   --    fall-through the shopper's key came from `b`, and `deliveries.provider`
+   *   --    has to say so or the ledger and the delivery disagree about who
+   *   --    issued it.
    *   -- 1 row  => THIS call bound the key. Across every process, at most one
    *   --           caller ever sees this per order.
    *   -- 0 rows => this order ALREADY has a delivery. Not an error and not a
@@ -446,12 +390,14 @@ export class IssuanceService {
    *   returning ...;
    *   -- $1 = 'delivered', $3 = '{delivering}'
    *   -- 1 row  => the order is finished.
-   *   -- 0 rows => the order was not `delivering`. Unreachable in Phase 1 (only
-   *   --           the claim winner reaches this code, and only this code moves
-   *   --           an order out of `delivering`), and reported rather than
+   *   -- 0 rows => the order was not `delivering`. Reported rather than
    *   --           swallowed — see {@link finishOrder}.
    */
-  private async bindDelivery(order: Order, requestId: string, code: string): Promise<IssuanceResult> {
+  private async bindDelivery(
+    order: Order,
+    ask: IssuanceAsk,
+    code: string,
+  ): Promise<SupplierAskResult> {
     const { delivery, bound, finished, lockedStatus } = await this.database.transaction(async (tx) => {
       // (0) — THE LOCK. First statement in the transaction, always. Nothing
       // branches on the row that comes back; it is here so the log line can say
@@ -462,12 +408,12 @@ export class IssuanceService {
       await tx
         .update(issuanceAttempts)
         .set({ status: IssuanceAttemptStatus.Ok, code })
-        .where(eq(issuanceAttempts.requestId, requestId));
+        .where(eq(issuanceAttempts.requestId, ask.requestId));
 
       // (b) — I3.
       const [inserted] = await tx
         .insert(deliveries)
-        .values({ orderId: order.id, code, provider: this.provider, requestId })
+        .values({ orderId: order.id, code, provider: ask.provider, requestId: ask.requestId })
         .onConflictDoNothing({ target: deliveries.orderId })
         .returning();
 
@@ -484,7 +430,7 @@ export class IssuanceService {
         inserted ?? (await tx.select().from(deliveries).where(eq(deliveries.orderId, order.id)))[0];
 
       // (c)
-      const outcome = await this.finishOrder(tx, order, requestId, "completeDelivery");
+      const outcome = await this.finishOrder(tx, order, ask, "completeDelivery");
 
       return {
         delivery: existing,
@@ -494,7 +440,7 @@ export class IssuanceService {
       };
     });
 
-    return this.reportDelivery(order, requestId, code, delivery, bound, finished, lockedStatus);
+    return this.reportDelivery(order, ask, code, delivery, bound, finished, lockedStatus);
   }
 
   /**
@@ -505,29 +451,25 @@ export class IssuanceService {
    */
   private reportDelivery(
     order: Order,
-    requestId: string,
+    ask: IssuanceAsk,
     code: string,
     delivery: Delivery | undefined,
     bound: boolean,
     finished: OrderStatus | undefined,
     lockedStatus: OrderStatus | undefined,
-  ): IssuanceResult {
-    if (finished !== OrderStatus.Delivered) {
-      return {
-        outcome: IssuanceOutcome.Unresolved,
-        requestId,
-        detail: `a key is bound to ${order.id} but the order did not reach delivered`,
-      };
-    }
-
+  ): SupplierAskResult {
     this.logger.log({
-      msg: bound
-        ? "issuance: key bound and order delivered"
-        : "issuance: order already had a delivery; the existing key stands (I3)",
+      msg:
+        finished !== OrderStatus.Delivered
+          ? "issuance: a key is bound but the order did not reach delivered"
+          : bound
+            ? "issuance: key bound and order delivered"
+            : "issuance: order already had a delivery; the existing key stands (I3)",
       order_id: order.id,
-      request_id: requestId,
-      provider: this.provider,
-      status: OrderStatus.Delivered,
+      request_id: ask.requestId,
+      provider: ask.provider,
+      attempt: ask.attempt,
+      status: finished,
       bound_by_this_call: bound,
       // What the order read the instant transaction B's lock was granted.
       // `delivering` on every ordinary run; anything else means a second worker
@@ -536,113 +478,68 @@ export class IssuanceService {
       locked_status: lockedStatus,
     });
 
-    // The bound row's code, not the one just fetched. They are the same value on
-    // every reachable path; naming the row makes it impossible for them not to
-    // be, and the shopper's key is by definition the one in `deliveries`.
-    return { outcome: IssuanceOutcome.Delivered, requestId, code: delivery?.code ?? code };
+    return {
+      outcome: SupplierAskOutcome.Issued,
+      requestId: ask.requestId,
+      provider: ask.provider,
+      // The bound row's code, not the one just fetched. They are the same value
+      // on every reachable path; naming the row makes it impossible for them not
+      // to be, and the shopper's key is by definition the one in `deliveries`.
+      code: delivery?.code ?? code,
+      bound,
+      finished,
+    };
   }
 
   /**
-   * §2.5 step 6, definite-failure path — **`delivering → out_of_stock`, and it
-   * must not raise.**
+   * **A definite refusal, reported and not written.**
    *
-   * "Paid, and there is nothing to hand over" is a state this system
+   * "Paid, and this supplier has nothing to hand over" is a state this system
    * understands, not an exception. Throwing here would produce a `500` on a
    * webhook, which is how a payment provider is asked to redeliver an event that
    * would fail identically every time; and the shopper's order page would show
    * an error instead of an honest state (functional spec, Slice 6).
    *
-   * Three statements in one transaction — **transaction B again**, the same
-   * shape as the success path and for the same reason: the lock first, then the
-   * writes it makes atomic against another worker.
+   * **No database write happens on this path, and that is the change slice 2
+   * makes.** Phase 1 recorded `failed` and settled the order to `out_of_stock`
+   * in one transaction, because there was nothing else the shop could do. Now
+   * there is: the runner's transaction A′ records `failed` *and re-reads the
+   * ledger under the order row lock*, so the decision that follows the refusal
+   * is taken from the rows rather than from this call's local knowledge. Writing
+   * `failed` here as well would be the same fact written twice, in two
+   * transactions, with a window in between where the ledger says the attempt
+   * failed and nobody owns the next rung.
    *
-   *   select "id", "client_request_id", "sku", "amount_minor", "currency",
-   *          "status", "created_at", "updated_at"
-   *   from "orders" where "orders"."id" = $1 for update;
-   *   -- I4, `architecture.md` §3.1. Held until COMMIT, which is three
-   *   -- statements and no network I/O away.
-   *
-   *   update "issuance_attempts" set "status" = $1, "last_error" = $2
-   *   where "issuance_attempts"."request_id" = $3;
-   *   -- $1 = 'failed' — DEFINITE. Written only because a contract-shaped error
-   *   -- body was parsed; a timeout can never reach this statement.
-   *
-   *   update "orders" set "status" = $1, "updated_at" = now()
-   *   where ("orders"."id" = $2 and "orders"."status" = ANY($3))
-   *   returning ...;
-   *   -- $1 = 'out_of_stock', $3 = '{delivering}'
-   *
-   * **No `deliveries` row is written, and that is the point.** The absence is
-   * what makes `out_of_stock` recoverable in Phase 3: nothing was claimed, the
-   * supplier's ledger has no entry for this `request_id`
-   * (`../suppliers/supplier-key-claim.service.ts`), and re-driving the identical
-   * request after a restock issues normally rather than needing a new id.
-   *
-   * The `switch` on `reason` has an exhaustiveness guard, so Phase 3 adding a
-   * member to `SupplierIssueErrorReason` is a compile error here rather than a
-   * silent fall-through that quietly routes a new failure to `out_of_stock`.
+   * No `deliveries` row is written either, and that absence is what makes the
+   * refusal recoverable: nothing was claimed, the supplier's ledger has no entry
+   * for this `request_id` (`../suppliers/supplier-key-claim.service.ts`), and a
+   * later attempt against a restocked pool issues normally.
    */
-  private async applyDefiniteFailure(
+  private reportRefusal(
     order: Order,
+    ask: IssuanceAsk,
     failure: SupplierDefiniteFailure,
-  ): Promise<IssuanceResult> {
-    const transition = this.transitionForReason(failure.reason);
-
-    const { finished, lockedStatus } = await this.database.transaction(async (tx) => {
-      // THE LOCK, first — see {@link bindDelivery}. A definite refusal is still
-      // an outcome being written to the order, so it is serialised exactly like
-      // a success.
-      const locked = await this.orderLock.lockOrder(tx, order.id);
-
-      await tx
-        .update(issuanceAttempts)
-        .set({ status: IssuanceAttemptStatus.Failed, lastError: failure.reason })
-        .where(eq(issuanceAttempts.requestId, failure.requestId));
-
-      const outcome = await this.finishOrder(tx, order, failure.requestId, transition);
-
-      return { finished: outcome, lockedStatus: locked?.status };
-    });
-
-    if (finished !== OrderStatus.OutOfStock) {
-      return {
-        outcome: IssuanceOutcome.Unresolved,
-        requestId: failure.requestId,
-        detail: `supplier refused (${failure.reason}) but the order did not reach out_of_stock`,
-      };
-    }
-
+  ): SupplierAskResult {
     this.logger.warn({
-      msg: "issuance: definite failure — supplier refused; order moved to out_of_stock, no delivery bound",
+      msg: "issuance: DEFINITE failure — the supplier answered and the answer was no; nothing issued",
       order_id: order.id,
       request_id: failure.requestId,
-      provider: this.provider,
+      provider: ask.provider,
+      attempt: ask.attempt,
       reason: failure.reason,
       attempt_status: failure.attemptStatus,
-      status: OrderStatus.OutOfStock,
-      locked_status: lockedStatus,
     });
 
     return {
-      outcome: IssuanceOutcome.OutOfStock,
+      outcome: SupplierAskOutcome.Refused,
       requestId: failure.requestId,
+      provider: ask.provider,
       reason: failure.reason,
     };
   }
 
-  /** Which lifecycle move a definite refusal maps to. One reason exists in Phase 1. */
-  private transitionForReason(reason: SupplierIssueErrorReason): OrderTransitionName {
-    switch (reason) {
-      case SupplierIssueErrorReason.OutOfStock:
-        return "markOutOfStock";
-
-      default:
-        return assertNever(reason);
-    }
-  }
-
   /**
-   * §2.5 steps 4-6, unknown path — **write nothing, conclude nothing, and stop.**
+   * **Write nothing, conclude nothing, and stop.**
    *
    * There is deliberately no database write here at all. The attempt row already
    * says `unknown`, which is still the truth; the order stays `delivering`,
@@ -650,32 +547,38 @@ export class IssuanceService {
    * keeps the order findable. Writing anything would mean claiming to know
    * something we do not.
    *
-   * In particular this does **not** move the order to `out_of_stock` or to
-   * anything else terminal. A key may exist for this `request_id`, and the only
-   * way to find out is to ask supplier A again with the same id — which is what
-   * Phase 3's retry does, and why it must not fall through to supplier B first
-   * (`architecture.md` §4, "The hard rule").
+   * In particular this does **not** move the order to a settled status, and the
+   * runner does not fall through on it. A key may exist for this `request_id`,
+   * and the only way to find out is to ask this same supplier again with the
+   * same id — which is slice 3's `probe` rung, and why it must not fall through
+   * to another supplier first (`architecture.md` §4, "The hard rule").
    *
    * Logged at `error` level, unlike the client's own `warn`: from the client's
    * point of view a silent supplier is one failed call, but from here it is a
    * paid order left undelivered with a request outstanding — the exact condition
-   * the Phase 3 admin panel exists to surface, and the one worth finding in a log
+   * the recovery list exists to surface, and the one worth finding in a log
    * search.
    */
-  private leaveUnresolved(order: Order, unknown: SupplierUnknownOutcome): IssuanceResult {
+  private reportNoAnswer(
+    order: Order,
+    ask: IssuanceAsk,
+    unknown: SupplierUnknownOutcome,
+  ): SupplierAskResult {
     this.logger.error({
-      msg: "issuance: UNKNOWN outcome — order left in delivering with an outstanding request; no retry policy in this phase",
+      msg: "issuance: UNKNOWN outcome — the request is outstanding; the same id must be re-asked, never another supplier",
       order_id: order.id,
       request_id: unknown.requestId,
-      provider: this.provider,
+      provider: ask.provider,
+      attempt: ask.attempt,
       attempt_status: unknown.attemptStatus,
       detail: unknown.detail,
       status: OrderStatus.Delivering,
     });
 
     return {
-      outcome: IssuanceOutcome.Unresolved,
+      outcome: SupplierAskOutcome.NoAnswer,
       requestId: unknown.requestId,
+      provider: ask.provider,
       detail: unknown.detail,
     };
   }
@@ -690,24 +593,23 @@ export class IssuanceService {
    * `CONNECTION_TIMEOUT_MS` with an error that looks nothing like its cause
    * ({@link OrderTransitionService.transition}).
    *
-   * Zero rows is unreachable in Phase 1: the only caller here is the winner of
-   * `paid → delivering`, and the only statements that move an order out of
-   * `delivering` are the two this service issues. It is still reported rather
-   * than assumed, at `error` level, because an unreachable state that has been
-   * reached is exactly the thing that must not be silent — and because Phase 3's
-   * admin re-issue adds a second worker to this path.
+   * Zero rows means another worker moved the order out of `delivering` between
+   * this worker's claim and its answer. Reported at `error` level rather than
+   * assumed away, because an unreachable state that has been reached is exactly
+   * the thing that must not be silent — and Phase 3's operator retry and resume
+   * put two more workers on this path.
    *
-   * The transaction is **not** rolled back on that path. On the success branch
-   * the `deliveries` row records a key the supplier really did issue against
-   * this `request_id`, and discarding it would leave the supplier's ledger
-   * holding a code bound to nothing on our side. Keeping the row and reporting
-   * {@link IssuanceOutcome.Unresolved} leaves the event pending, which is the
-   * outcome that can still be recovered from.
+   * The transaction is **not** rolled back on that path. The `deliveries` row
+   * records a key the supplier really did issue against this `request_id`, and
+   * discarding it would leave the supplier's ledger holding a code bound to
+   * nothing on our side. Keeping the row and reporting the observed status
+   * leaves the payment event pending, which is the outcome that can still be
+   * recovered from.
    */
   private async finishOrder(
     tx: Transaction,
     order: Order,
-    requestId: string,
+    ask: IssuanceAsk,
     transition: OrderTransitionName,
   ): Promise<OrderStatus | undefined> {
     const result = await this.transitions.transitionWithin(tx, order.id, transition);
@@ -720,8 +622,8 @@ export class IssuanceService {
         this.logger.error({
           msg: "issuance: the finishing transition matched zero rows; the order was not delivering",
           order_id: order.id,
-          request_id: requestId,
-          provider: this.provider,
+          request_id: ask.requestId,
+          provider: ask.provider,
           transition,
           observed_status: result.observed.status,
         });
@@ -732,8 +634,8 @@ export class IssuanceService {
         this.logger.error({
           msg: "issuance: the order vanished between the claim and the finishing transition",
           order_id: order.id,
-          request_id: requestId,
-          provider: this.provider,
+          request_id: ask.requestId,
+          provider: ask.provider,
           transition,
         });
 

@@ -18,7 +18,7 @@ Domain rules that override general practice:
 
 - **Serverless is a deliberate choice, not a convenience.** Concurrent requests landing in separate processes is what proves correctness lives in Postgres rather than in one process's memory. Never introduce anything that would make the API stateful across requests.
 - Connection configuration is load-bearing: pool size 1 per function instance against Neon's pooled endpoint, prepared statements disabled. Fifty concurrent invocations must not exhaust the connection limit.
-- The supplier stub's deliberate hang, the client-side timeout, and the function execution ceiling form an ordered chain: hang < client timeout < function limit. A timeout must be observed as a timeout, never as a killed function.
+- The client-side timeout always sits below the function execution ceiling. Where the supplier stub's deliberate hang goes is **not one fixed answer**, and getting it backwards makes the phase's headline check vacuous: `hang_ms < SUPPLIER_TIMEOUT_MS` (hang before the claim) demonstrates that a slow supplier is not a failed one, while `SUPPLIER_TIMEOUT_MS < hang_ms < ceiling` (hang after the claim commits) is the timeout trap — a key genuinely issued that the timed-out client cannot know about. Measured: an `AbortSignal.timeout` severs the shop's own socket and does **not** stop the remote handler, which went on to claim a key 200ms after the client gave up. A timeout must be observed as a timeout, never as a killed function.
 - Do not depend on Vercel Cron. The Hobby plan runs it roughly daily, which is useless as a safety net. Processing is triggered by `waitUntil`, order creation, status polling and an admin sweep endpoint; cron is an optional addition on a paid plan.
 
 When working on tasks:

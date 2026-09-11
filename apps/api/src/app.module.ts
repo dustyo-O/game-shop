@@ -8,6 +8,8 @@ import { OrdersModule } from "./orders/orders.module.js";
 import { PaymentsModule } from "./payments/payments.module.js";
 import { SchedulingModule } from "./scheduling/scheduling.module.js";
 import { SupplierAModule } from "./suppliers/a/supplier-a.module.js";
+import { SupplierBModule } from "./suppliers/b/supplier-b.module.js";
+import { SupplierBehaviourModule } from "./suppliers/supplier-behaviour.module.js";
 
 @Module({
   // `ConfigModule` is listed first and holds no routes. It is here so the
@@ -51,13 +53,36 @@ import { SupplierAModule } from "./suppliers/a/supplier-a.module.js";
   // `PaymentsModule`, both already at 2) are not re-parented, so
   // `SchedulingModule` stays at 2 and the destroy order above is untouched.
   //
-  // `SupplierAModule` is the odd one out and should stay that way: it is not a
-  // part of the shop, it is the simulated supplier hosted in the same function
-  // (architecture.md §6). It answers at `POST /internal/suppliers/a/issue`,
-  // outside the `/api` namespace every other controller carries, and it exports
-  // nothing — the shop reaches it over HTTP through `SUPPLIER_A_URL`, never
-  // through this container. Listing it here buys it a route and a database
-  // connection and deliberately nothing else.
+  // `SupplierAModule` and `SupplierBModule` are the odd ones out and should stay
+  // that way: they are not part of the shop, they are the two simulated
+  // suppliers hosted in the same function (architecture.md §6). They answer at
+  // `POST /internal/suppliers/a/issue` and `POST /internal/suppliers/b/issue`,
+  // outside the `/api` namespace every other controller carries, and they export
+  // nothing — the shop reaches them over HTTP through `SUPPLIER_A_URL` and
+  // `SUPPLIER_B_URL`, never through this container. Listing them here buys each
+  // a route and a database connection and deliberately nothing else.
+  //
+  // Two modules rather than one with two controllers, and two entries here
+  // rather than B importing A: two suppliers do not depend on each other, and a
+  // reviewer reading this list should see two independent services. They do
+  // share one key pool and one ledger, which is a fact about the *fixture*
+  // (A4) — `supplier_keys` has no provider column — and it is recorded where it
+  // has a visible consequence, in `./suppliers/b/supplier-b.controller.ts`.
+  //
+  // At distance 2 `SupplierBModule`'s only import (`DatabaseModule`, at 3) is
+  // not re-parented, so `SchedulingModule` stays at 2 and the destroy order
+  // above is untouched.
+  //
+  // `SupplierBehaviourModule` is on that same far side of the boundary and
+  // exports nothing either. It carries the reviewer's console —
+  // `PUT /internal/suppliers/:provider/behaviour`, behind the same
+  // `AdminTokenGuard` the sweep sits behind — which is how spec 003 §2.7's
+  // fourth criterion is met: a supplier can be made to fail on demand *without
+  // changing the shop itself*. One route for every supplier rather than one per
+  // stub, which is why it is a module here rather than a controller inside
+  // `SupplierAModule`. At distance 2 its imports (`ConfigModule` at 2,
+  // `DatabaseModule` at 3) are not re-parented, so `SchedulingModule` stays at
+  // 2 and the destroy order above is untouched.
   imports: [
     ConfigModule,
     SchedulingModule,
@@ -66,6 +91,8 @@ import { SupplierAModule } from "./suppliers/a/supplier-a.module.js";
     PaymentsModule,
     AdminModule,
     SupplierAModule,
+    SupplierBModule,
+    SupplierBehaviourModule,
   ],
   controllers: [HealthController],
 })

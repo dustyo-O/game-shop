@@ -36,6 +36,7 @@ import {
   fetchOrder,
   OrderNotFoundError,
   renderOrderDetails,
+  renderOrderRecoveryNotice,
   type Order,
 } from "../../../entities/order/index.js";
 import { createPaymentControls, type PaymentControls } from "../../../features/simulate-payment/index.js";
@@ -156,10 +157,32 @@ export function createOrderPage(orderId: string): HTMLElement {
      */
     const paymentArea = payment.render(order);
 
+    /**
+     * What the shop is doing about an order it could not deliver (functional
+     * spec §2.3), or `null` for the orders that need no explanation. The entity
+     * decides both, exactly as it decides whether a key row exists — the page
+     * only asks.
+     *
+     * **It is composed inside this same `replaceChildren`, on purpose.** Drawn
+     * anywhere else it would land after the memo's early return, so the
+     * explanation would be re-created once a second under a shopper reading it,
+     * restarting its `role="status"` announcement each time. Built here it is
+     * painted exactly when the status it explains changes, and the poll stays
+     * invisible.
+     *
+     * Its class is `order-recovery`, not `order__notice`, and that is
+     * load-bearing rather than cosmetic: `showOrder` opens by removing
+     * `.order__notice` — the *offline* notice — from the content region on every
+     * single read. Sharing the class would have this paragraph deleted a second
+     * after it appeared and never redrawn, because the memo would by then be
+     * reporting no change.
+     */
+    const recoveryNotice = renderOrderRecoveryNotice(order);
+
     content.replaceChildren(
-      ...(paymentArea === null
-        ? [renderOrderDetails(order)]
-        : [renderOrderDetails(order), paymentArea]),
+      ...[renderOrderDetails(order), recoveryNotice, paymentArea].filter(
+        (part): part is HTMLElement => part !== null,
+      ),
     );
   }
 

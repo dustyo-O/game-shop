@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
  * Loads the assignment's fixed inputs — the twelve supplied products and the
- * fifty supplied supplier keys — then exits.
+ * fifty supplied supplier keys — plus one all-zero `supplier_behaviour` row per
+ * supplier, then exits.
  *
  * Contract (relied on by the root `pnpm db:seed`, `db:setup` and `db:reset`),
  * matching `./migrate.ts`:
@@ -19,8 +20,8 @@
  * ---------------------------------------------------------------------------
  * IDEMPOTENCE — TWO DIFFERENT ON CONFLICT CLAUSES, ON PURPOSE
  * ---------------------------------------------------------------------------
- * The two tables want opposite things, and the difference is the whole of this
- * script's correctness:
+ * The three tables want different things, and the difference is the whole of
+ * this script's correctness:
  *
  *   - `products` uses **ON CONFLICT (sku) DO UPDATE**. The catalogue is a
  *     transcription of the brief, so the fixture is authoritative: correcting a
@@ -30,6 +31,12 @@
  *     (`./schema/shop.ts`, `orders.sku`) — so re-pricing the catalogue cannot
  *     rewrite the history of what someone was charged.
  *
+ *   - `supplier_behaviour` uses **ON CONFLICT (provider) DO NOTHING**, for the
+ *     same reason as `supplier_keys` in a milder form: the row carries a knob a
+ *     reviewer may have set moments ago, and a routine `pnpm dev:stack` must not
+ *     spend their armed one-shot behind their back. The reset button is the
+ *     control endpoint, not this script.
+ *
  *   - `supplier_keys` uses **ON CONFLICT (code) DO NOTHING**. A key row carries
  *     state this script did not write: once claimed, `claimed_by_request_id` and
  *     `claimed_at` are the supplier's record that a code was handed to exactly
@@ -38,10 +45,11 @@
  *     a way for a routine `pnpm dev:stack` to resell a key that a delivered
  *     order is already holding. DO NOTHING makes an existing row untouchable.
  *
- * Both statements are single multi-row INSERTs (one round trip each, per the
- * `data-batch-inserts` rule) and both are atomic insert-or-ignore/update rather
- * than SELECT-then-INSERT (`data-upsert`): nothing here reads a row to decide
- * whether to write it, so two seeds racing each other cannot both insert.
+ * All three statements are single multi-row INSERTs (one round trip each, per
+ * the `data-batch-inserts` rule) and all three are atomic
+ * insert-or-ignore/update rather than SELECT-then-INSERT (`data-upsert`):
+ * nothing here reads a row to decide whether to write it, so two seeds racing
+ * each other cannot both insert.
  *
  * This script writes both the shop's tables and the supplier's, which no other
  * code in the repository is allowed to do. It is the loader, not a participant:
@@ -76,9 +84,18 @@ import {
   productCatalog,
   purchasableProductType,
 } from "./fixtures/catalog.js";
+import {
+  supplierBehaviourBaseline,
+  supplierBehaviourProviders,
+} from "./fixtures/supplier-behaviour.js";
 import { supplierKeyPool } from "./fixtures/supplier-key-pool.js";
 import { products, type NewProduct } from "./schema/shop.js";
-import { supplierKeys, type NewSupplierKey } from "./schema/supplier.js";
+import {
+  supplierBehaviour,
+  supplierKeys,
+  type NewSupplierBehaviourRow,
+  type NewSupplierKey,
+} from "./schema/supplier.js";
 
 const EXIT_MISCONFIGURED = 2;
 
@@ -89,6 +106,8 @@ interface SeedSummary {
   readonly keysInserted: number;
   readonly keysTotal: number;
   readonly keysClaimed: number;
+  readonly behaviourInserted: number;
+  readonly behaviourTotal: number;
 }
 
 /**
@@ -126,6 +145,21 @@ function keyPoolRows(): NewSupplierKey[] {
   // claim, and naming the columns here would invite a future edit that resets
   // them on an existing row.
   return supplierKeyPool.map((code) => ({ code }));
+}
+
+/**
+ * The behaviour rows as the database wants them: one per provider, every knob
+ * off.
+ *
+ * Written out column by column with no reliance on a column default, because
+ * `supplier_behaviour` has none (migration 0003) — every number in that table is
+ * one somebody wrote on purpose, and this is the somebody for a fresh clone.
+ */
+function behaviourRows(): NewSupplierBehaviourRow[] {
+  return supplierBehaviourProviders.map((provider) => ({
+    provider,
+    ...supplierBehaviourBaseline,
+  }));
 }
 
 /**
@@ -226,6 +260,43 @@ async function seed(tx: Transaction): Promise<SeedSummary> {
     .from(supplierKeys);
   const pool = poolRows[0] ?? { total: 0, claimed: 0 };
 
+  // ---------------------------------------------------------------------
+  //   INSERT INTO supplier_behaviour
+  //     (provider, failure_rate, hang_rate, hang_ms, fail_next, hang_next)
+  //   VALUES ($1, $2, $3, $4, $5, $6), ($7, $8, $9, $10, $11, $12)
+  //   ON CONFLICT (provider) DO NOTHING
+  //   RETURNING provider;
+  //   -- Returns ONLY the providers actually inserted; DO NOTHING skips the
+  //   --   conflicting rows entirely, so this count is exact with no
+  //   --   before/after arithmetic.
+  //   -- 0 rows => both rows are already there. The ordinary `pnpm dev:stack`
+  //   --   case, and the one this clause exists for.
+  //   -- 2 rows => a fresh database. Every knob starts off, so the shop behaves
+  //   --   exactly as it did before this table existed.
+  //
+  // DO NOTHING, NOT DO UPDATE — the opposite call from `products` above, and the
+  // same one as `supplier_keys`, for a related reason. A behaviour row that
+  // already exists carries a setting somebody deliberately made: a reviewer who
+  // armed `fail_next = 1` and then ran `pnpm dev:stack` in the next terminal
+  // would find their one-shot silently spent by a re-seed, and would then be
+  // debugging a check that "randomly" stopped reproducing.
+  //
+  // The seed is therefore the loader and not the reset button. Restoring the
+  // baseline is `PUT /internal/suppliers/:provider/behaviour` with an empty
+  // body, which replaces the row with exactly the values below — the same
+  // constant, so the two cannot drift.
+  // ---------------------------------------------------------------------
+  const insertedBehaviour = await tx
+    .insert(supplierBehaviour)
+    .values(behaviourRows())
+    .onConflictDoNothing({ target: supplierBehaviour.provider })
+    .returning({ provider: supplierBehaviour.provider });
+
+  //   SELECT count(*)::int AS n FROM supplier_behaviour;
+  const behaviourCountRows = await tx
+    .select({ n: sql<number>`count(*)::int` })
+    .from(supplierBehaviour);
+
   return {
     productsInserted,
     productsUpdated: upserted.length - productsInserted,
@@ -233,6 +304,8 @@ async function seed(tx: Transaction): Promise<SeedSummary> {
     keysInserted: insertedKeys.length,
     keysTotal: pool.total,
     keysClaimed: pool.claimed,
+    behaviourInserted: insertedBehaviour.length,
+    behaviourTotal: behaviourCountRows[0]?.n ?? 0,
   };
 }
 
@@ -246,7 +319,16 @@ function report(summary: SeedSummary): void {
       `${summary.keysTotal - summary.keysInserted} already present; ` +
       `${summary.keysTotal} in the pool, ${summary.keysClaimed} claimed`,
   );
-  if (summary.productsInserted === 0 && summary.keysInserted === 0) {
+  console.log(
+    `seed: supplier_behaviour — ${summary.behaviourInserted} inserted, ` +
+      `${summary.behaviourTotal - summary.behaviourInserted} already present; ` +
+      `${summary.behaviourTotal} providers configured`,
+  );
+  if (
+    summary.productsInserted === 0 &&
+    summary.keysInserted === 0 &&
+    summary.behaviourInserted === 0
+  ) {
     // "no new rows", not "nothing changed": the catalogue upsert rewrites all
     // twelve rows from the fixture on every run, which is how a drifted price
     // gets corrected. Only `supplier_keys` is genuinely untouched.
