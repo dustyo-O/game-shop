@@ -198,6 +198,44 @@ export function readPositiveInteger(variable: string, consequence: string): numb
 }
 
 /**
+ * A count that has a **stated default** — the same number, the same validation,
+ * and one difference: absence is answered rather than refused.
+ *
+ * ---------------------------------------------------------------------------
+ * WHY THIS IS NOT THE `??` THIS FILE'S HEADER FORBIDS
+ * ---------------------------------------------------------------------------
+ * The header's rule is about values that name something *outside* the process —
+ * an address, or a deadline measured against a platform limit — where no
+ * default is right in both development and deployment. Its one caller today,
+ * `SUPPLIER_MAX_PROBES_PER_REQUEST`, is neither. It is a **policy constant**
+ * this system chose for itself: technical-considerations §1.3's assumption A1,
+ * *"three is the smallest count that distinguishes 'the socket died once' from
+ * 'this supplier is not answering'"*. A default that is written down in an
+ * assumption, defended in prose and exercised by every test is not a guess, and
+ * refusing to boot without it would make a fresh clone unable to start over a
+ * number the repository already decided.
+ *
+ * What does **not** relax is the treatment of a value that is present. A
+ * `"2e3"`, a `"0"` or a `"three"` stops the boot exactly as
+ * {@link readPositiveInteger} stops it, because this delegates to that function
+ * rather than restating its checks — the asymmetry is only ever about *absence*,
+ * which is the same line {@link readBooleanFlag} draws for its own caller.
+ *
+ * @param fallback The value used when the variable is unset or empty. A
+ *   compile-time constant from the module that owns the policy, never another
+ *   environment read.
+ */
+export function readPositiveIntegerWithDefault(
+  variable: string,
+  fallback: number,
+  consequence: string,
+): number {
+  if (readTrimmed(variable) === undefined) return fallback;
+
+  return readPositiveInteger(variable, consequence);
+}
+
+/**
  * A shared secret that the process can legitimately run **without** — the third
  * shape, and the only one whose absence is not fatal.
  *

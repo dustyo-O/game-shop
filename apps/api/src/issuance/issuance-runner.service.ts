@@ -20,7 +20,10 @@
  *     ————   POST {SUPPLIER_a_URL}/issue        ← no transaction, no lock held
  *     TX A′  BEGIN; lock; resolve attempt n; read the ledger; reserve n+1 or
  *            settle; COMMIT;                                (definite refusal only)
- *     ————   POST {SUPPLIER_b_URL}/issue        ← no transaction, no lock held
+ *     TX A″  BEGIN; lock; read the ledger; count a probe or settle; COMMIT;
+ *                                                           (NO ANSWER only —
+ *            and it writes NOTHING about the attempt, which is the whole phase)
+ *     ————   POST {SUPPLIER_a_URL}/issue        ← the SAME id, to the SAME supplier
  *     TX B   BEGIN; lock; resolve; bind; finish; COMMIT;    (`./issuance.service.ts`)
  *
  * `packages/db/src/client.ts` sets `max: 1` per instance, which makes the
@@ -69,15 +72,20 @@
  *
  * When the ceiling wins anyway the failure is survivable by construction:
  * attempts say `unknown`, the order sits in `delivering`, the payment event is
- * still pending, and the order appears in the recovery list. Slice 3 logs the
- * computed budget at boot; this file is where the `|supplierLadder|` factor
- * comes from.
+ * still pending, and the order appears in the recovery list. The product is
+ * computed and logged by this service's constructor, which is the one place
+ * holding all three factors — the two configured numbers and the ladder's own
+ * length.
  */
 import { Inject, Injectable, Logger } from "@nestjs/common";
 
 import { OrderStatus } from "@game-shop/contracts";
 import type { DatabaseClient, Order, Transaction } from "@game-shop/db";
 
+import {
+  SUPPLIER_PROBE_BUDGET_CONFIG,
+  type SupplierProbeBudgetConfig,
+} from "../config/supplier-config.js";
 import { DATABASE_CLIENT } from "../database/database.module.js";
 import { OrderLockService } from "../orders/order-lock.service.js";
 import {
@@ -88,7 +96,7 @@ import {
 import type { OrderTransitionName } from "../orders/order-transitions.js";
 import { IssuanceHistory, ReserveAttemptOutcome, type ReserveAttemptResult } from "./issuance-history.js";
 import {
-  IssuanceRestReason,
+  IssuanceRound,
   IssuanceRung,
   isAskStep,
   nextIssuanceStep,
@@ -96,6 +104,7 @@ import {
   type IssuanceRefusal,
   type IssuanceStep,
   type RestStep,
+  type SettleNeverEstablishedStep,
   type SettleRefusedStep,
   type SettleRefusedTransition,
 } from "./issuance-ladder.js";
@@ -115,6 +124,22 @@ export const IssuanceEntry = {
    * shopper's status poll, or the admin sweep. May only claim a `paid` order.
    */
   Automatic: "automatic",
+
+  /**
+   * **The operator's retry** — one person pressing a button on
+   * `/admin/recovery` (§2.5, §8), and the only other way into issuance there
+   * is.
+   *
+   * It is an *entry*, not a path. It reaches this same service, the same claim
+   * under the same row lock, the same ladder and the same settlement; **there
+   * is no admin-only code path into issuance**, which is why §2.5's guarantees
+   * are the guarantees Phase 2 and slice 3 already proved. All this member
+   * changes is the row below it — which transitions the caller may claim with —
+   * because an operator pushes orders the automatic path has *finished* with
+   * (`out_of_stock`, `delivery_failed`) or has *abandoned* mid-flight
+   * (`delivering`, §2.3), and `beginIssuance` matches none of those.
+   */
+  Operator: "operator",
 } as const;
 
 export type IssuanceEntry = (typeof IssuanceEntry)[keyof typeof IssuanceEntry];
@@ -129,9 +154,11 @@ export type IssuanceEntry = (typeof IssuanceEntry)[keyof typeof IssuanceEntry];
  * | `delivering` | `resumeIssuance` | `{delivering}` | ladder probes the outstanding id |
  * | `delivered` / `created` / `payment_failed` | none | — | refused, `409` |
  *
- * Only the first row exists today: `retryIssuance` and `resumeIssuance` are
- * slice 5's, and they are added here as further entries in an operator's list
- * rather than as a second claim implementation.
+ * All four rows exist now. The first is {@link IssuanceEntry.Automatic}'s, the
+ * middle two are {@link IssuanceEntry.Operator}'s, and the fourth is not a row
+ * of code at all: an order in one of those three statuses matches neither
+ * operator transition, both guarded UPDATEs return zero rows, and the endpoint
+ * turns that into `409`.
  *
  * **Named here, never decided by an `if` on the row the lock returned.** §2.5's
  * last criterion is that the refusals are *"decided by zero rows from a guarded
@@ -141,17 +168,45 @@ export type IssuanceEntry = (typeof IssuanceEntry)[keyof typeof IssuanceEntry];
  * to forbid. So the entry names a transition and the transition's own `from`
  * list does the refusing.
  *
- * Slice 5 widens the value to an **ordered list** tried until one returns a row,
- * which is how the operator reaches `retryIssuance` for a settled order and
- * `resumeIssuance` for a stranded one without anybody reading a status first.
- * One entry needs one transition, so it is one transition today.
+ * The value is an **ordered list, tried until one returns a row**, which is how
+ * the operator reaches `retryIssuance` for a settled order and `resumeIssuance`
+ * for a stranded one *without anybody reading a status first*. The two lists are
+ * disjoint in their `from` sets (`../orders/order-transitions.ts`), so at most
+ * one of them can ever match and the order they are tried in changes nothing
+ * about which one wins — only how many statements are spent finding out.
  *
  * `satisfies Record<IssuanceEntry, …>` keeps the table total: adding an entry
  * without saying what it may claim with stops the build.
  */
 const entryTransitions = {
-  [IssuanceEntry.Automatic]: "beginIssuance",
-} as const satisfies Record<IssuanceEntry, OrderTransitionName>;
+  [IssuanceEntry.Automatic]: ["beginIssuance"],
+  [IssuanceEntry.Operator]: ["retryIssuance", "resumeIssuance"],
+} as const satisfies Record<IssuanceEntry, readonly OrderTransitionName[]>;
+
+/**
+ * Whether this entry's **opening** rung may start a new round of asking
+ * (`./issuance-ladder.ts`, {@link IssuanceRound}).
+ *
+ * The one fact the attempt rows cannot carry, so the entry point carries it —
+ * and it is a table beside the transitions rather than a `?:` at the call site,
+ * for the same reason: adding an entry without saying what it means stops the
+ * build.
+ *
+ * `Automatic` is `Continuing` and must stay that way. Its claim requires `paid`,
+ * so an order it can claim has no attempt rows at all and the branch this feeds
+ * is unreachable from it — but if that ever changed, a payment event that opened
+ * a fresh round on a settled order would re-ask both suppliers every time it was
+ * redelivered.
+ *
+ * **Only the opening turn gets it.** Every recomputation inside the walk
+ * ({@link IssuanceRunnerService.ladderTurnWithin}) takes the ladder's default,
+ * which is how one retry asks one more round and not an unbounded number of
+ * them.
+ */
+const entryRounds = {
+  [IssuanceEntry.Automatic]: IssuanceRound.Continuing,
+  [IssuanceEntry.Operator]: IssuanceRound.Fresh,
+} as const satisfies Record<IssuanceEntry, IssuanceRound>;
 
 /**
  * How the issuance ended — the four ways an order can leave the ladder.
@@ -188,11 +243,31 @@ export const IssuanceOutcome = {
   DeliveryFailed: "delivery_failed",
 
   /**
-   * **No finishing status was reached.** In practice: a supplier gave no usable
-   * answer, so its attempt stays `unknown`, the order rests in `delivering`, and
-   * the caller must leave the payment event pending. A key may or may not exist
-   * for that `request_id`, and the only thing that can find out is another call
-   * with the same id.
+   * **The shop asked the same question as often as its budget allows and never
+   * got an answer.** The order is `delivery_failed`: settled, recoverable, and
+   * reported as a *delivery* failure to the shopper — but the attempt row still
+   * says `unknown` with `last_error` NULL, because on the supplier's side
+   * nothing failed and nobody knows whether a key was issued.
+   *
+   * A separate member from {@link IssuanceOutcome.DeliveryFailed} for exactly
+   * that reason. Both land the order in the same status, and collapsing them
+   * would report *"we never found out"* as *"every supplier refused"* on the one
+   * screen and the one log line where a person reads that record — the
+   * one-character mistake §9.3 names (`reason ?? "failed"`), made at the layer
+   * above instead.
+   */
+  NeverEstablished: "never_established",
+
+  /**
+   * **No finishing status was reached.** In practice: the order stopped being
+   * this worker's to move part-way through the ladder — somebody else finished
+   * it, or a guarded write matched zero rows — so it rests where it is and the
+   * caller must leave the payment event pending.
+   *
+   * Silence from a supplier no longer arrives here: it is probed, and then
+   * settled as {@link IssuanceOutcome.NeverEstablished}. What remains are the
+   * genuinely unfinished cases, which is what the payment event's queue entry is
+   * for.
    */
   Unresolved: "unresolved",
 } as const;
@@ -211,6 +286,13 @@ export type IssuanceResult =
   | {
       readonly outcome: typeof IssuanceOutcome.Delivered;
       readonly requestId: string;
+      /**
+       * Which supplier issued it. Taken off the rung that asked rather than
+       * parsed back out of `requestId` — the id is *derived* from the provider
+       * and the attempt and is never read in the other direction
+       * (`./issuance-request-id.ts`).
+       */
+      readonly provider: string;
       /** The key now bound to this order in `deliveries`. */
       readonly code: string;
     }
@@ -224,6 +306,19 @@ export type IssuanceResult =
        * `out_of_stock` (§2.4).
        */
       readonly refusals: readonly IssuanceRefusal[];
+    }
+  | {
+      readonly outcome: typeof IssuanceOutcome.NeverEstablished;
+      /**
+       * The id nobody knows the answer to. **The most important field in this
+       * union**: it is the only thing that can still find out, by being asked
+       * again, and §8 surfaces it to the operator as `outstanding_request_id`.
+       */
+      readonly requestId: string;
+      /** Which supplier is holding the unanswered question. */
+      readonly provider: string;
+      /** How many times it was asked — `SUPPLIER_MAX_PROBES_PER_REQUEST` on the ordinary path. */
+      readonly probeCount: number;
     }
   | {
       readonly outcome: typeof IssuanceOutcome.Unresolved;
@@ -280,8 +375,15 @@ export type IssuanceRunResult =
 
 /** What the transaction did about the rung it computed. At most one is set. */
 interface ActedOnStep {
-  /** Set when the rung asks a supplier: did the attempt row get reserved? */
+  /** Set when the rung reserves a **new** attempt row: did the guarded insert match? */
   readonly reserved: ReserveAttemptResult | undefined;
+  /**
+   * Set when the rung is a `probe`: the attempt row's `probe_count` after the
+   * increment. Advisory — it is logged, never branched on, because the decision
+   * it would feed was already taken by the ladder from the value *before* this
+   * write.
+   */
+  readonly probed: number | undefined;
   /** Set when the rung settles the order: did the guarded UPDATE match? */
   readonly settled: OrderTransitionResult | undefined;
 }
@@ -295,6 +397,11 @@ interface LadderTurn extends ActedOnStep {
 /** Transaction A's turn, which also carries the claim it attempted. */
 interface OpeningTurn extends LadderTurn {
   readonly claim: OrderTransitionResult;
+  /**
+   * Which transition of the entry's list actually matched a row, or `undefined`
+   * when none did. For the log line only — the load-bearing fact is `claim`.
+   */
+  readonly claimedWith: OrderTransitionName | undefined;
 }
 
 /** Exhaustiveness guard: the compiler routes here only if a case went unhandled. */
@@ -330,11 +437,51 @@ export class IssuanceRunnerService {
 
   constructor(
     @Inject(DATABASE_CLIENT) private readonly database: DatabaseClient,
+    @Inject(SUPPLIER_PROBE_BUDGET_CONFIG) private readonly budget: SupplierProbeBudgetConfig,
     private readonly history: IssuanceHistory,
     private readonly issuance: IssuanceService,
     private readonly transitions: OrderTransitionService,
     private readonly orderLock: OrderLockService,
-  ) {}
+  ) {
+    // ####################################################################
+    // # THE INVOCATION BUDGET — R5, AND THE ONE LIMIT NOTHING CAN ENFORCE.
+    // ####################################################################
+    //
+    //     SUPPLIER_MAX_PROBES_PER_REQUEST × SUPPLIER_TIMEOUT_MS × |supplierLadder|
+    //         +  overhead   <   function execution ceiling
+    //
+    // With the defaults that is 3 × 2000 × 2 = 12 s, which **exceeds Vercel's
+    // Hobby ceiling**. This constructor cannot refuse to boot over it and must
+    // not try: the ceiling is the platform's, it is not in the environment, and
+    // a number hardcoded here to check against would be a guess that fails a
+    // boot over a limit that no longer applies (`../config/supplier-config.ts`
+    // makes the same argument for `SUPPLIER_TIMEOUT_MS`).
+    //
+    // So the number is *logged* instead, with every factor beside it, because
+    // the failure it predicts is the one that leaves no trace: the function is
+    // killed mid-ladder with no exception and no log line, and the only sign is
+    // an order resting in `delivering` that looks exactly like a slow supplier.
+    // Whoever sizes a deployment reads this line, lowers `SUPPLIER_TIMEOUT_MS`
+    // or the probe count, and reads it again.
+    //
+    // Survivable by construction when the ceiling wins anyway: attempts say
+    // `unknown`, the order sits in `delivering`, the payment event stays
+    // pending, and the order appears in the recovery list.
+    const worstCaseMs =
+      this.budget.maxProbesPerRequest * this.budget.timeoutMs * supplierLadder.length;
+
+    this.logger.log({
+      msg: "issuance budget: worst-case supplier time for one ladder walk, excluding overhead",
+      worst_case_ms: worstCaseMs,
+      max_probes_per_request: this.budget.maxProbesPerRequest,
+      timeout_ms: this.budget.timeoutMs,
+      providers: supplierLadder.length,
+      formula: "SUPPLIER_MAX_PROBES_PER_REQUEST × SUPPLIER_TIMEOUT_MS × |supplierLadder|",
+      caveat:
+        "must stay under the platform's function execution ceiling, which nothing in this " +
+        "process can read or enforce (spec 003 R5)",
+    });
+  }
 
   /**
    * Claim one order and walk its ladder to a resting state.
@@ -357,7 +504,7 @@ export class IssuanceRunnerService {
     // TRANSACTION A. Four statements, no network I/O and no branch that waits on
     // anything, so the queue behind the lock waits microseconds rather than a
     // supplier timeout.
-    const opening = await this.claimAndOpenLadder(orderId, claimWith);
+    const opening = await this.claimAndOpenLadder(orderId, claimWith, entryRounds[entry]);
     const claim = opening.claim;
 
     if (claim.outcome === OrderTransitionOutcome.OrderNotFound) {
@@ -378,7 +525,11 @@ export class IssuanceRunnerService {
         msg: "issuance runner: the guarded claim matched zero rows; this call does not own the order",
         order_id: orderId,
         entry,
-        transition: claimWith,
+        // The whole list, because none of them matched: on the operator path
+        // this line is the `409`'s only explanation, and "retryIssuance matched
+        // zero rows" would leave a reader wondering whether `resumeIssuance` was
+        // ever tried.
+        transitions: [...claimWith],
         locked_status: opening.lockedStatus,
         observed_status: claim.observed.status,
       });
@@ -397,7 +548,7 @@ export class IssuanceRunnerService {
       msg: "issuance runner: claimed the order under the order row lock; walking the ladder",
       order_id: order.id,
       entry,
-      transition: claimWith,
+      transition: opening.claimedWith,
       // What this worker saw the instant it got the lock, before its own UPDATE.
       // `paid` on the winner's line; `delivering` or `delivered` on a loser's,
       // which is the whole story of the race in one field.
@@ -427,23 +578,35 @@ export class IssuanceRunnerService {
    *
    * **Bounded by construction, with the bound written as the loop's own
    * condition rather than as a counter checked inside it.** Every pass either
-   * returns, or records a definite refusal against the attempt it just asked —
-   * and a definite refusal strictly reduces the number of untried suppliers, so
-   * `fallThrough` runs out after `|supplierLadder|` of them and the pass after
-   * that is `settleRefused`. Nothing here can loop against a supplier, which is
-   * the failure mode that would matter: the budget in the file header is a
-   * *product* with `|supplierLadder|` as one of its terms, and a loop that could
-   * exceed it would exceed the function's execution ceiling with no exception
-   * and no log line (R5).
+   * returns, or strictly spends something that cannot be replenished:
+   *
+   *   - a **definite refusal** reduces the number of untried suppliers, so
+   *     `fallThrough` runs out after `|supplierLadder|` of them and the pass
+   *     after that is `settleRefused`;
+   *   - a **silence** increments `probe_count` on the row it just asked, so
+   *     `probe` runs out after `SUPPLIER_MAX_PROBES_PER_REQUEST` asks of that id
+   *     and the pass after that is `settleNeverEstablished`.
+   *
+   * The two multiply, which is why {@link
+   * IssuanceRunnerService.maxSupplierCallsPerWalk} is a product and not a sum —
+   * and why it is the same product the budget logged at boot is built from. A
+   * loop that could exceed it would exceed the function's execution ceiling with
+   * no exception and no log line (R5).
+   *
+   * **Both spends are committed before the next pass reads them**, in the
+   * transaction that computed the rung. A pass that recomputed from its own
+   * in-memory idea of the ledger could probe for ever; each pass re-reads the
+   * rows under the lock instead.
    */
   private async walk(order: Order, opening: LadderTurn): Promise<IssuanceResult> {
     let turn = opening;
 
-    for (let rung = 0; rung <= supplierLadder.length; rung += 1) {
+    for (let rung = 0; rung <= this.maxSupplierCallsPerWalk(); rung += 1) {
       const step = turn.step;
 
       switch (step.rung) {
         case IssuanceRung.AskFirst:
+        case IssuanceRung.Probe:
         case IssuanceRung.FallThrough: {
           // The attempt row could not be reserved because the order is no longer
           // `delivering` — somebody else finished it while this worker was
@@ -489,6 +652,7 @@ export class IssuanceRunnerService {
               return {
                 outcome: IssuanceOutcome.Delivered,
                 requestId: ask.requestId,
+                provider: step.provider,
                 code: ask.code,
               };
 
@@ -498,16 +662,19 @@ export class IssuanceRunnerService {
               // ########################################################
               //
               // The outcome was never established, so a key may already exist
-              // for `ask.requestId`. Slice 3's `probe` rung re-asks THIS
-              // supplier THIS id; nothing here may ask a different one. The rule
-              // is enforced twice over — this branch returns, and even if it did
-              // not, the ladder would refuse to compute `fallThrough` while an
-              // attempt row for this order says `unknown`.
-              return {
-                outcome: IssuanceOutcome.Unresolved,
-                requestId: ask.requestId,
-                detail: ask.detail,
-              };
+              // for `ask.requestId`. The next rung is recomputed from the
+              // ledger, and the only two it can be are `probe` — THIS supplier,
+              // THIS id, again — and `settleNeverEstablished`. Nothing here may
+              // ask a different supplier, and nothing here needs to remember
+              // which id to re-ask: it is derived from the row.
+              //
+              // **Nothing is written to `issuance_attempts` on the way through**
+              // (see {@link IssuanceRunnerService.recordSilenceAndAdvance}),
+              // which is the difference between this branch and the refusal
+              // branch below it. The row already says `unknown` with
+              // `last_error` NULL and that is still exactly true.
+              turn = await this.recordSilenceAndAdvance(order, ask.requestId, ask.detail);
+              continue;
 
             case SupplierAskOutcome.Refused:
               // TRANSACTION A′. Record the refusal and recompute the rung from
@@ -523,6 +690,9 @@ export class IssuanceRunnerService {
         case IssuanceRung.SettleRefused:
           return this.reportSettled(order, step, turn.settled);
 
+        case IssuanceRung.SettleNeverEstablished:
+          return this.reportNeverEstablished(order, step, turn.settled);
+
         case IssuanceRung.Rest:
           return this.reportRest(order, step);
 
@@ -537,7 +707,7 @@ export class IssuanceRunnerService {
     this.logger.error({
       msg: "issuance runner: the ladder did not reach a resting state within its bound",
       order_id: order.id,
-      rungs: supplierLadder.length + 1,
+      rungs: this.maxSupplierCallsPerWalk() + 1,
     });
 
     return {
@@ -602,37 +772,106 @@ export class IssuanceRunnerService {
   }
 
   /**
+   * `settleNeverEstablished` — **the budget is spent, nobody answered, and the
+   * shop stops asking.**
+   *
+   * The order was moved to `delivery_failed` by the same transaction that
+   * computed the rung, and **no write was made to `issuance_attempts`**. That
+   * omission is the phase's whole subject, so it is worth saying plainly where
+   * the code is: the row says `unknown` with `last_error` NULL and
+   * `probe_count` at its ceiling, and that *is* the record functional spec
+   * §2.2's fourth criterion asks for. Writing `failed` there would be a claim
+   * nobody can support — and a licence for a later fall-through to ask a second
+   * supplier for a second key.
+   *
+   * `error`, not `warn`, and a level above {@link
+   * IssuanceRunnerService.reportSettled}'s: every supplier refusing is the
+   * system working, while a request whose outcome nobody knows is a key that may
+   * have left the pool with no delivery against it — the one condition that
+   * breaks stock accounting and the one the recovery list exists to surface.
+   */
+  private reportNeverEstablished(
+    order: Order,
+    step: SettleNeverEstablishedStep,
+    settled: OrderTransitionResult | undefined,
+  ): IssuanceResult {
+    if (settled?.outcome !== OrderTransitionOutcome.Transitioned) {
+      // The guarded settle matched zero rows: the order was not `delivering`
+      // when the rung was acted on, so somebody else has moved it. Reported, and
+      // the event stays pending — which keeps the order findable, exactly as it
+      // would be if this worker had never run.
+      this.logger.error({
+        msg: "issuance runner: the outcome was never established but the settling transition matched zero rows",
+        order_id: order.id,
+        request_id: step.outstandingRequestId,
+        provider: step.provider,
+        attempt: step.attempt,
+        probe_count: step.probeCount,
+        transition: step.transition,
+        observed_status:
+          settled?.outcome === OrderTransitionOutcome.NotInSourceState
+            ? settled.observed.status
+            : undefined,
+      });
+
+      return {
+        outcome: IssuanceOutcome.Unresolved,
+        requestId: step.outstandingRequestId,
+        detail: `the outcome of ${step.outstandingRequestId} was never established but ${step.transition} matched zero rows`,
+      };
+    }
+
+    this.logger.error({
+      msg:
+        "issuance runner: the outcome was never established after every probe; the order is delivery_failed " +
+        "and the attempt row is left saying unknown, which is the record",
+      order_id: order.id,
+      request_id: step.outstandingRequestId,
+      provider: step.provider,
+      attempt: step.attempt,
+      probe_count: step.probeCount,
+      max_probes_per_request: this.budget.maxProbesPerRequest,
+      transition: step.transition,
+      status: settled.order.status,
+      // Spelled out because this is the line somebody reads at 3am and the
+      // wrong reading of it — "the supplier failed" — is the bug this phase
+      // exists to prevent.
+      detail:
+        "a key MAY exist for this request_id; only another call with the same id can say, " +
+        "and an operator retry makes exactly that call",
+    });
+
+    return {
+      outcome: IssuanceOutcome.NeverEstablished,
+      requestId: step.outstandingRequestId,
+      provider: step.provider,
+      probeCount: step.probeCount,
+    };
+  }
+
+  /**
    * `rest` — **the ladder has nothing to offer and the order stays exactly where
    * it is.** Nothing is written, which is the point.
    *
-   * Today this covers an outstanding attempt, because `probe` and
-   * `settleNeverEstablished` are slice 3's. Resting there is Phase 1's behaviour
-   * and it is correct rather than merely tolerable: the attempt row says
-   * `unknown` with `last_error` NULL — which *is* the record §2.2's fourth
-   * criterion asks for — the order sits in `delivering`, and the payment event
-   * stays pending so the order is findable. What slice 3 adds is a way to make
-   * that resting place productive, not a way to make it safe.
+   * One case reaches here now that `probe` and `settleNeverEstablished` exist: a
+   * code is already bound for this order and the finishing status did not commit
+   * with it. Asking any supplier again would be asking for a second key for an
+   * order that has one.
    *
-   * Logged at `error` level: from a client's point of view a silent supplier is
-   * one failed call, but from here it is a paid order left undelivered with a
-   * request outstanding — the exact condition the recovery list exists to
-   * surface.
+   * Logged at `error` level: a paid order that holds a code and does not read
+   * `delivered` is the exact condition the recovery list exists to surface.
    */
   private reportRest(order: Order, step: RestStep): IssuanceResult {
     this.logger.error({
-      msg:
-        step.reason === IssuanceRestReason.OutcomeNeverEstablished
-          ? "issuance runner: an attempt is still outstanding; the order rests in delivering and no other supplier may be asked"
-          : "issuance runner: a code already exists for this order; there is nothing to ask for",
+      msg: "issuance runner: a code already exists for this order; there is nothing to ask for",
       order_id: order.id,
-      request_id: step.outstandingRequestId,
       rest_reason: step.reason,
       status: OrderStatus.Delivering,
     });
 
     return {
       outcome: IssuanceOutcome.Unresolved,
-      requestId: step.outstandingRequestId ?? order.id,
+      requestId: order.id,
       detail: step.reason,
     };
   }
@@ -670,7 +909,8 @@ export class IssuanceRunnerService {
    */
   private async claimAndOpenLadder(
     orderId: string,
-    claimWith: OrderTransitionName,
+    claimWith: readonly OrderTransitionName[],
+    round: IssuanceRound,
   ): Promise<OpeningTurn> {
     return this.database.transaction(async (tx) => {
       // (1) THE LOCK.
@@ -678,24 +918,102 @@ export class IssuanceRunnerService {
 
       // (2) THE LADDER'S INPUT — read inside the lock. See this file's header.
       const attempts = await this.history.readWithin(tx, orderId);
-      const step = nextIssuanceStep(orderId, attempts);
+      // The one place a fresh round can be opened. Read *before* the claim, so
+      // the rows it sees are the ones the order settled with — and the round is
+      // the caller's entry, never a status anybody read (see `entryRounds`).
+      const step = nextIssuanceStep(orderId, attempts, this.budget.maxProbesPerRequest, round);
 
-      // (3) THE CLAIM. Nothing above branched on the locked row; this statement
-      // is the decision, evaluated by Postgres against the row.
-      const claim = await this.transitions.transitionWithin(tx, orderId, claimWith);
+      // (3) THE CLAIM. Nothing above branched on the locked row; the statements
+      // below are the decision, evaluated by Postgres against the row.
+      const { claim, claimedWith } = await this.claimWithFirstMatching(tx, orderId, claimWith);
 
       if (claim.outcome !== OrderTransitionOutcome.Transitioned) {
-        return { claim, step, lockedStatus: locked?.status, reserved: undefined, settled: undefined };
+        return {
+          claim,
+          claimedWith,
+          step,
+          lockedStatus: locked?.status,
+          reserved: undefined,
+          probed: undefined,
+          settled: undefined,
+        };
       }
 
       // (4)
       return {
         claim,
+        claimedWith,
         step,
         lockedStatus: locked?.status,
         ...(await this.actOnStep(tx, orderId, step)),
       };
     });
+  }
+
+  /**
+   * Statement (3) of transaction A, for an entry whose {@link entryTransitions}
+   * row names more than one transition: **run them in order until one returns a
+   * row, and stop.**
+   *
+   * ###########################################################################
+   * # THIS IS THE ENTIRE DIFFERENCE BETWEEN THE OPERATOR AND THE AUTOMATIC
+   * # PATH, AND IT IS STILL NOT AN `if` ON A STATUS ANYBODY READ.
+   * ###########################################################################
+   *
+   * The obvious implementation is one statement shorter:
+   *
+   *     switch (locked.status) {                     // <-- DO NOT
+   *       case "out_of_stock": ... "retryIssuance";
+   *       case "delivering":   ... "resumeIssuance";
+   *       default: return refused;
+   *     }
+   *
+   * and it is the check-then-act this whole project argues against. The value it
+   * branches on was true when the `SELECT` ran; the transition is written a
+   * statement later. Under this lock the window is currently empty — which is
+   * exactly what makes the mistake survive review and then survive the day the
+   * lock moves.
+   *
+   * Here nothing reads a status to decide anything. Each candidate is a guarded
+   * UPDATE whose own `WHERE … status = ANY($3)` is evaluated by Postgres against
+   * the row as it stands at that instant, and the decision is which of them
+   * returned a row. §2.5's refusals are *zero rows from every candidate*, and
+   * the `409` upstairs is that and nothing else.
+   *
+   * The cost of the loop is one extra `SELECT` per non-matching candidate — the
+   * follow-up read `OrderTransitionService` issues to tell
+   * `not_in_source_state` from `order_not_found`. At most one extra on the
+   * operator path, inside a transaction that holds the lock for microseconds,
+   * and `order_not_found` short-circuits because every later candidate would ask
+   * the same question of the same missing row.
+   */
+  private async claimWithFirstMatching(
+    tx: Transaction,
+    orderId: string,
+    claimWith: readonly OrderTransitionName[],
+  ): Promise<{ claim: OrderTransitionResult; claimedWith: OrderTransitionName | undefined }> {
+    let claim: OrderTransitionResult | undefined;
+
+    for (const transition of claimWith) {
+      claim = await this.transitions.transitionWithin(tx, orderId, transition);
+
+      if (claim.outcome === OrderTransitionOutcome.Transitioned) {
+        return { claim, claimedWith: transition };
+      }
+
+      if (claim.outcome === OrderTransitionOutcome.OrderNotFound) break;
+    }
+
+    if (claim === undefined) {
+      // Unreachable: `entryTransitions` is `as const` and every entry names at
+      // least one transition. Thrown rather than papered over with a
+      // `not_in_source_state` nobody wrote, because an empty list would mean an
+      // entry that can never claim anything — every retry answering `409` with
+      // no log line able to say why.
+      throw new Error(`issuance runner: no transition was named to claim order ${orderId} with`);
+    }
+
+    return { claim, claimedWith: undefined };
   }
 
   /**
@@ -739,12 +1057,9 @@ export class IssuanceRunnerService {
       // (2) Resolve attempt n. `failed`, never `unknown`: the supplier answered.
       await this.history.resolveRefusedWithin(tx, requestId, reason);
 
-      // (3) Re-read the ladder's input, now including the refusal just written.
-      const attempts = await this.history.readWithin(tx, order.id);
-      const step = nextIssuanceStep(order.id, attempts);
-
-      // (4)
-      return { step, lockedStatus: locked?.status, ...(await this.actOnStep(tx, order.id, step)) };
+      // (3) + (4) Re-read the ladder's input, now including the refusal just
+      // written, and act on the rung it produces.
+      return this.ladderTurnWithin(tx, order.id, locked?.status);
     });
 
     this.logger.log({
@@ -762,6 +1077,112 @@ export class IssuanceRunnerService {
   }
 
   /**
+   * **Transaction A″ — the silence transaction, and the one that writes nothing
+   * about the attempt.**
+   *
+   *     BEGIN;
+   *       (1) SELECT … FROM "orders" WHERE "id" = $1 FOR UPDATE
+   *       -- DELIBERATELY NO WRITE TO issuance_attempts. The row already says
+   *       -- status = 'unknown' with last_error NULL, and it is still exactly
+   *       -- true: we asked and we do not know. There is nothing to correct.
+   *       (2) SELECT … FROM "issuance_attempts" WHERE "order_id" = $1
+   *           ORDER BY "attempt" DESC
+   *       (3) count one probe, or settle the order
+   *     COMMIT;
+   *
+   * Compare it statement for statement with {@link
+   * IssuanceRunnerService.recordRefusalAndAdvance}: the *only* difference is the
+   * `UPDATE … SET status = 'failed'` that is missing here. That missing
+   * statement is the phase in one line. A timeout is **unknown**, never
+   * **failed**, and the difference is not a log level — it decides whether a
+   * different supplier may be asked a different question while a key may already
+   * be sitting in this one's ledger.
+   *
+   * Why a transaction at all, when nothing is written about the attempt: the
+   * rung that follows must be computed from rows read **under the order row
+   * lock** (R4, and `./issuance-history.ts`'s header). Two workers reading
+   * different snapshots compute different rungs, and one of them can be a
+   * fall-through. `probe`'s own increment is then written inside the same
+   * transaction, so the count that bounds the loop is committed before the next
+   * pass reads it.
+   *
+   * §6 describes the re-probe as *"a bare HTTP call with the same `request_id` —
+   * no transaction at all"*, and that remains true of the **call**: this
+   * transaction opens and commits before a byte reaches the supplier, exactly as
+   * transaction A does.
+   */
+  private async recordSilenceAndAdvance(
+    order: Order,
+    requestId: string,
+    detail: string,
+  ): Promise<LadderTurn> {
+    const turn = await this.database.transaction(async (tx) => {
+      // (1) THE LOCK, first — this transaction takes a decision from a set of
+      // rows, which is the one decision in this codebase Postgres cannot take
+      // inside a guarded statement.
+      const locked = await this.orderLock.lockOrder(tx, order.id);
+
+      return this.ladderTurnWithin(tx, order.id, locked?.status);
+    });
+
+    this.logger.warn({
+      msg: "issuance runner: no answer; the attempt row is left untouched and the rung recomputed from the ledger",
+      order_id: order.id,
+      request_id: requestId,
+      detail,
+      next_rung: turn.step.rung,
+      // On a `probe` this is the SAME id as `request_id` above, and a reviewer
+      // reading two identical values on one line is reading the mechanism.
+      next_request_id: isAskStep(turn.step) ? turn.step.requestId : undefined,
+      probe_count: turn.probed,
+      max_probes_per_request: this.budget.maxProbesPerRequest,
+      locked_status: turn.lockedStatus,
+    });
+
+    return turn;
+  }
+
+  /**
+   * Read the ledger inside the caller's transaction, compute the rung, act on
+   * it — the three steps both ladder transactions end with.
+   *
+   * Shared so that "the rung is computed from rows read under the lock and acted
+   * on before the lock is released" is one piece of code rather than a property
+   * two call sites happen to preserve. The caller has already taken the lock;
+   * this function does not, which is why it takes `lockedStatus` as a value
+   * rather than a handle to take one with.
+   */
+  private async ladderTurnWithin(
+    tx: Transaction,
+    orderId: string,
+    lockedStatus: OrderStatus | undefined,
+  ): Promise<LadderTurn> {
+    const attempts = await this.history.readWithin(tx, orderId);
+    const step = nextIssuanceStep(orderId, attempts, this.budget.maxProbesPerRequest);
+
+    return { step, lockedStatus, ...(await this.actOnStep(tx, orderId, step)) };
+  }
+
+  /**
+   * The ladder walk's loop bound: **every supplier, asked its full budget.**
+   *
+   *     |supplierLadder| × SUPPLIER_MAX_PROBES_PER_REQUEST
+   *
+   * A product, because the two spends are independent: each supplier can be
+   * asked up to its probe budget before a definite refusal moves the walk on to
+   * the next one. It is the same product the boot-time budget line reports, one
+   * factor lighter — that one multiplies by `SUPPLIER_TIMEOUT_MS` to get a
+   * duration, this one counts calls.
+   *
+   * Computed rather than stored so that a re-read of the configuration could
+   * never leave the loop bound behind it, and so the two numbers cannot drift
+   * apart in two fields.
+   */
+  private maxSupplierCallsPerWalk(): number {
+    return supplierLadder.length * this.budget.maxProbesPerRequest;
+  }
+
+  /**
    * Do what the rung says, **inside the caller's transaction and under its
    * lock** — the only place in this file that acts on a computed rung.
    *
@@ -772,33 +1193,57 @@ export class IssuanceRunnerService {
    * a transaction to be used, and by then it is a snapshot rather than a
    * decision.
    *
-   *   - **An ask rung** reserves the attempt row before the call
-   *     ({@link IssuanceHistory.reserveWithin}), guarded on the order still
-   *     being `delivering`.
+   *   - **`probe`** increments `probe_count` and **nothing else** ({@link
+   *     IssuanceHistory.countProbeWithin}). Tested for *before* `isAskStep`,
+   *     because a probe and a first ask are the same kind of call and not the
+   *     same kind of record: one counts an ask against a row that exists, the
+   *     other creates the row. Sending a probe through `reserveWithin` would hit
+   *     `ON CONFLICT DO NOTHING`, count nothing, and loop until the bound.
+   *   - **An ask rung** (`askFirst`, `fallThrough`) reserves the attempt row
+   *     before the call ({@link IssuanceHistory.reserveWithin}), guarded on the
+   *     order still being `delivering`.
    *   - **`settleRefused`** moves the order with the transition §2.4 chose —
    *     `markOutOfStock` or `markDeliveryFailed`, both guarded on `delivering`.
-   *   - **`rest`** writes nothing. Deliberately: on the outstanding-attempt path
-   *     the row already says `unknown` with `last_error` NULL, and that *is* the
-   *     record §2.2's fourth criterion asks for. Writing `failed` there is the
-   *     exact bug this phase exists to prevent, and there is nothing truthful to
-   *     write instead.
+   *   - **`settleNeverEstablished`** moves the order to `delivery_failed` and
+   *     writes **nothing** to `issuance_attempts`. Deliberately: the row already
+   *     says `unknown` with `last_error` NULL and `probe_count` at its ceiling,
+   *     and that *is* the record §2.2's fourth criterion asks for. Writing
+   *     `failed` there is the exact bug this phase exists to prevent, and there
+   *     is nothing truthful to write instead.
+   *   - **`rest`** writes nothing either — a code already exists for this order.
    */
   private async actOnStep(
     tx: Transaction,
     orderId: string,
     step: IssuanceStep,
   ): Promise<ActedOnStep> {
-    if (isAskStep(step)) {
-      return { reserved: await this.history.reserveWithin(tx, orderId, step), settled: undefined };
-    }
-
-    if (step.rung === IssuanceRung.SettleRefused) {
+    if (step.rung === IssuanceRung.Probe) {
       return {
         reserved: undefined,
+        probed: await this.history.countProbeWithin(tx, orderId, step),
+        settled: undefined,
+      };
+    }
+
+    if (isAskStep(step)) {
+      return {
+        reserved: await this.history.reserveWithin(tx, orderId, step),
+        probed: undefined,
+        settled: undefined,
+      };
+    }
+
+    if (
+      step.rung === IssuanceRung.SettleRefused ||
+      step.rung === IssuanceRung.SettleNeverEstablished
+    ) {
+      return {
+        reserved: undefined,
+        probed: undefined,
         settled: await this.transitions.transitionWithin(tx, orderId, step.transition),
       };
     }
 
-    return { reserved: undefined, settled: undefined };
+    return { reserved: undefined, probed: undefined, settled: undefined };
   }
 }

@@ -36,6 +36,13 @@
       "when": 1789117984626,
       "tag": "0004_supplier_hang_placement",
       "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1789127576577,
+      "tag": "0005_recovery_list_indexes",
+      "breakpoints": true
     }
   ]
 }

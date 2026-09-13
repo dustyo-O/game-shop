@@ -204,9 +204,21 @@ export const ProcessPaymentEventOutcome = {
   OutOfStock: "out_of_stock",
 
   /**
-   * This caller won the claim, **every** supplier in the ladder definitely
-   * refused, and at least one of them refused for a reason that is not an empty
-   * pool. The order is `delivery_failed`. No key was issued and none is bound.
+   * This caller won the claim and the order ended in `delivery_failed`. **Two
+   * roads reach it and this member deliberately does not distinguish them**,
+   * because it names what happened to the *order*:
+   *
+   *   - every supplier in the ladder definitely refused, and at least one
+   *     refused for a reason that is not an empty pool — no key was issued and
+   *     none is bound; or
+   *   - an attempt's outcome was **never established** after every probe
+   *     ({@link IssuanceOutcome.NeverEstablished}) — in which case a key *may*
+   *     exist for the outstanding `request_id`, the attempt row says `unknown`
+   *     with `last_error` NULL, and that row is where the difference is
+   *     recorded. Two facts, two tables (technical-considerations §1.3).
+   *
+   * Which road it was is on the log line and in `issuance_attempts`; it is never
+   * read off this value, and nothing in the queue behaves differently for it.
    *
    * Event **settled**, for the same reason `out_of_stock` is: the order has
    * stopped moving, and re-applying this event could never do anything but the
@@ -701,6 +713,43 @@ export class PaymentEventProcessor {
         // what `settledOrderStatuses` and `terminalOrderStatuses` are for.
         await this.markProcessed(event);
 
+        return eventResult(ProcessPaymentEventOutcome.DeliveryFailed);
+
+      case IssuanceOutcome.NeverEstablished:
+        // ###############################################################
+        // # SETTLED, AND NOT BECAUSE ANYTHING FAILED. NOBODY KNOWS.
+        // ###############################################################
+        //
+        // The shop asked the same supplier the same `request_id` its full
+        // budget of times and never heard back. The order is `delivery_failed`
+        // — it has stopped moving, so the event settles for exactly the reason
+        // the two branches above settle: re-applying it could never do anything
+        // but the same thing again, and an operator retry re-enters under its
+        // own claim rather than through this row.
+        //
+        // Reported as its own outcome rather than folded into the branch below
+        // it, and the distinction is the phase's subject: **a key may exist for
+        // `request_id`**, the attempt row still says `unknown` with
+        // `last_error` NULL, and the only thing that can find out is another
+        // call with that same id. A line here saying "every supplier refused"
+        // would be the one-character mistake (`reason ?? "failed"`) made in
+        // prose.
+        this.logger.error({
+          msg: "payment event: the outcome was never established after every probe; the order is delivery_failed and a key MAY exist for this request_id",
+          event_id: event.eventId,
+          order_id: event.orderId,
+          request_id: issued.requestId,
+          provider: issued.provider,
+          probe_count: issued.probeCount,
+        });
+
+        await this.markProcessed(event);
+
+        // The *event's* outcome names what happened to the order, and what
+        // happened to the order is `delivery_failed` — the same status the
+        // branch above reaches by a different road. The road is recorded in the
+        // attempt row and in the line above it, which is where a person looks
+        // for it (§1.3: two different facts, two tables).
         return eventResult(ProcessPaymentEventOutcome.DeliveryFailed);
 
       case IssuanceOutcome.Unresolved:

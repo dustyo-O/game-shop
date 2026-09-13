@@ -7,7 +7,7 @@ acceptance criterion. One command:
 pnpm race
 ```
 
-That starts four real `apps/api` processes on ports 4201–4204, waits until each
+That starts four real `apps/api` processes on ports 4601–4604, waits until each
 one is genuinely serving, runs every check in this directory against all four,
 and stops all four afterwards — on success, on failure, and on Ctrl-C.
 
@@ -76,6 +76,9 @@ produces a convincing lie, and it is the first thing to rule out.
 | `same-event` | `payment-events.service.ts` — deleted `.onConflictDoNothing({ target: paymentEvents.eventId })` | `FAIL  all 20 concurrent redeliveries answered 2xx — 500 …` ×19, and `FAIL  exactly one of the concurrent copies was stored as first sight … — stored=1, duplicate=0, unrecognised=19`. |
 | `webhooks` | `order-transitions.ts` — `beginIssuance.from` widened from `[Paid]` to `[Paid, Delivering]`, removing the guard's exclusivity | `FAIL  webhooks  exited 1` on `error: update or delete on table "orders" violates foreign key constraint "deliveries_order_id_orders_id_fk"` during cleanup, because **50** workers logged `claimed the order for issuance` (against **1** with the guard intact) and the stragglers were still writing after the check had finished. Reproduced three times. |
 | `before-order` | `payment-event-processor.service.ts` — added `await this.markProcessed(event);` to `applyPaid`'s `OrderNotFound` branch, so `deferred_order_missing` settles the early event instead of leaving it pending | `Error: order ord_race_beforeorder_… did not settle within 15000ms (status=created)`. The event was discarded, so neither drain ever found it and the order never left `created`. |
+| `recover-refusal` | `issuance/issuance-ladder.ts` — the `fallThrough` rung's `requestId` read off the newest failed row (`req_{order}_a_1`) instead of `deriveIssuanceRequestId(orderId, untried, max(attempt)+1)`: a re-probe of a settled request wearing a fall-through's clothes, the exact shape the file's header names | 6 of 18 assertions. `FAIL  exactly two attempt rows for the order — found 1 row(s)`; `FAIL  a/1 reads failed with last_error supplier_rejected … — {…,"status":"ok","last_error":"supplier_rejected"}`; `FAIL  b/2 reads ok — the fall-through's own new request id … — undefined`; `FAIL  no supplier_requests row for a/1 … — 1 row(s)`; `FAIL  exactly one supplier_requests row for b/2, against provider b — {"n":0,"provider":null}`; `FAIL  exactly one supplier_keys row claimed by b/2's request id — 0 row(s)`. B was asked A's question: `reserveWithin`'s `ON CONFLICT (request_id) DO NOTHING` swallowed the insert, B's success was written over A's row, and the record now says a refusal succeeded. |
+| `recover-timeout` | `issuance/issuance-ladder.ts` — `isDefinitelySettled` widened to admit `unknown`, so the outstanding guard (branches 2 and 3) never fires and `fallThrough` runs past a timed-out attempt. Slice 3's own RED, repeated against the shipped check | 5 of 16 assertions, and they are R2's: `FAIL  stock accounting holds after this run (claimed keys == deliveries, R2) … — claimed=2, deliveries=1`; `FAIL  exactly one more key claimed and exactly one more delivery than before this run — claimed +2, deliveries +1`; `FAIL  no issuance_attempts row for provider b — the hard rule held, B was never asked — 1 row(s)`; `FAIL  exactly ONE attempt row for the order … — found 2 row(s)`; `FAIL  a/1 reads status=ok, probe_count=2 … — {…,"status":"unknown","probe_count":1,"last_error":null}`. **Still `PASS`:** `the order settles delivered`, `exactly one deliveries row for the order`, `exactly one supplier_keys row claimed by a/1's request id`. |
+| `recover-out-of-stock` | `issuance/issuance-ladder.ts` — the `IssuanceRound.Fresh` branch deleted, i.e. the pre-slice-5 ladder: an operator's opening turn recomputes `settleRefused` from the two refusals already on file | 9 of 25 assertions, every one of them after the restock. `POST …/retry` answered `200 {"outcome":"still_out_of_stock",…,"detail":"every supplier was asked and has nothing to issue (a: out_of_stock; b: out_of_stock)","delivered":false}` against a pool the check had just restocked to 50 — nobody was asked. `FAIL  exactly THREE attempt rows after the retry (a/1, b/2, a/3) … — found 2 row(s)`; `FAIL  a/3 reads ok, provider a, attempt 3 … — undefined`; `FAIL  the order settles delivered after the retry — status=out_of_stock`; `FAIL  a further retry on the now-delivered order answers 409 … — status=200`. The sixteen assertions up to and including the restock all passed: the automatic path is untouched by this weakening, which is what the two settle points are for. |
 
 The mechanism weakened for `before-order` is an *absence* — `payment_events.order_id`
 carries no foreign key — and adding one is a migration rather than a source edit.
@@ -122,6 +125,43 @@ ledger answers with the *same* code, and I3's `deliveries.order_id` UNIQUE binds
 it once. The guard's job is not to make the key count one — I5 and I3 do that.
 Its job is to stop forty-nine workers reaching the supplier at all, and `1`
 versus `50` in the `claimed the order for issuance` log is that job, measured.
+
+### What the three recovery REDs did not break
+
+All three Phase 3 weakenings were made to one file,
+`apps/api/src/issuance/issuance-ladder.ts`, and it was restored to
+`a5715427c387d7d27c9ac9d58a089dd1d68c80c6c9a762211e83972192b86a24` after each
+(weakened: `69610ae4…`, `e89e49e0…`, `67e74502…`). Each run was confirmed
+against `dist/issuance/issuance-ladder.js` before the result was read. None of
+the three came back null. What is worth reading is the assertions that stayed
+green while the mechanism was gone.
+
+**`recover-refusal`: the shopper got a key and stock accounting held.** The
+supplier's ledger (I5) is keyed by `request_id` alone, so when the fall-through
+asked B under A's id, B issued, the ledger filed it under `req_…_a_1`, and one
+key left the pool for one delivery — arithmetic that cannot tell the difference.
+What can is the attempt row, which now reads `status: "ok"` with
+`last_error: "supplier_rejected"` still on it: a refusal that succeeded. Nothing
+in the database can tell "the same id, asked again" from "a different question
+sent under a stolen id" — `UNIQUE (request_id)` is satisfied either way. The id
+derivation is the only thing standing between a fall-through and a re-probe of
+a refusal, which is why this check reads the attempt rows rather than stopping
+at `delivered`.
+
+**`recover-timeout`: the order delivered, with one delivery row — and the pool
+was short a key.** R2, measured on the shipped check rather than quoted: A had
+cut a key for `a/1` (an attempt still `unknown`, `probe_count` 1), B cut a
+second for `b/2`, and `deliveries.order_id` UNIQUE bound B's. Every assertion
+phrased about the shopper passed. `claimed=2, deliveries=1` is the only place
+the first key shows up, and the walkthrough for slice 3 §4 explains why that
+equality is asserted only on settled outcomes.
+
+**`recover-out-of-stock`: everything up to the restock passed.** The
+weakening removes the operator's fresh round and nothing else, so the automatic
+walk into an empty pool — two refusals, `out_of_stock`, zero keys — was
+exactly right. The break is confined to what happens after a person presses
+retry, and the retry's own report says so in words: *"every supplier was asked"*
+against a pool that had just been refilled, with no supplier call made.
 
 ---
 
@@ -392,7 +432,7 @@ All optional, all with working defaults.
 | --- | --- | --- |
 | `RACE_BASE_URLS` | unset | Set → external mode: use these targets, build and spawn nothing. Unset → local mode. |
 | `RACE_INSTANCES` | `4` | Local instances to start — the number `architecture.md` §7's measurement used. |
-| `RACE_BASE_PORT` | `4201` | First port. Clear of `pnpm dev` (3000, 5173) and the Vitest concurrency suite (4101–4104). |
+| `RACE_BASE_PORT` | `4601` | First port. Clear of `pnpm dev` (3000, 5173) and every port the Vitest suites bind (4101, 4201, 4301, 4401, 4501–4504). Moved from 4201 in Phase 2 when it turned out to collide with `test/acceptance/purchase-and-key-delivery.test.ts`, which binds that exact port. |
 | `RACE_SKIP_BUILD` | unset | Skip the rebuild. Faster to iterate, and **wrong for RED validation** — the spawned processes run `dist/`. |
 | `RACE_CHECK_TIMEOUT_MS` | `180000` | Per check. A hung check is killed and reported as a failure rather than hanging the run. |
 | `RACE_VERBOSE` | unset | Stream each instance's stdout too, not just its stderr. |
@@ -416,4 +456,4 @@ and are unused by Vitest:
 - `onSpawn` — register a child for teardown *before* the health poll. Vitest
   cannot need it (`afterAll` runs only after `beforeAll` returns), but a signal
   to the runner during startup would otherwise leave a booting `apps/api`
-  listening on 4201 for the reviewer to find later.
+  listening on 4601 for the reviewer to find later.

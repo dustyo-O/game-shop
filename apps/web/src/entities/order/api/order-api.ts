@@ -31,6 +31,15 @@
  * actually be shared is five lines of `typeof` checks whose error strings name
  * the slice they came from. A third parser is the moment to lift them into
  * `shared/`; two is not.
+ *
+ * **That third parser now exists** — `entities/undelivered-order/api` — and the
+ * lift was still declined, deliberately and with reasons recorded in that file's
+ * header rather than by letting this sentence go quietly stale. In short: the
+ * three overlap on two functions and about twelve lines, each of which throws
+ * its *own* error class with its own message prefix, so sharing them means
+ * threading an error factory through forty call sites to save twelve lines of
+ * body. The rule is re-armed at the point where two slices want the same reader
+ * with the same error.
  */
 import { Currency, isOrderStatus, minorUnits, OrderStatus } from "@game-shop/contracts";
 
@@ -254,7 +263,7 @@ function toOrder(value: unknown): Order {
  */
 export async function fetchOrder(orderId: string, signal?: AbortSignal): Promise<Order> {
   try {
-    return toOrder(await getJson(`/api/orders/${encodeURIComponent(orderId)}`, signal));
+    return toOrder(await getJson(`/api/orders/${encodeURIComponent(orderId)}`, { signal }));
   } catch (error: unknown) {
     if (error instanceof HttpError && error.status === notFoundStatus) {
       throw new OrderNotFoundError(orderId);

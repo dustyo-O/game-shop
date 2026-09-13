@@ -4,7 +4,7 @@
  * ---------------------------------------------------------------------------
  * WHY THIS AND NOT A ROUTING LIBRARY
  * ---------------------------------------------------------------------------
- * There are two routes. A router package would bring a history abstraction, a
+ * There are three routes. A router package would bring a history abstraction, a
  * route-matching DSL, and a component adapter — none of which this app has
  * anything to ask of, and all of which would ship to every visitor of a
  * storefront whose whole point is that it is hand-built without a framework.
@@ -35,6 +35,7 @@
  * that is Phase 6's business — recorded here so it is a known step rather than a
  * discovery made by a broken link after deploy.
  */
+import { createAdminRecoveryPage } from "../pages/admin-recovery/index.js";
 import { createCatalogPage } from "../pages/catalog/index.js";
 import { createOrderPage } from "../pages/order/index.js";
 
@@ -47,6 +48,26 @@ import { createOrderPage } from "../pages/order/index.js";
  * shopper reads «Заказ не найден» — the sentence functional spec §2.6 asks for.
  */
 const orderPathPattern = /^\/order\/([^/]+)\/?$/u;
+
+/**
+ * The operator's recovery screen, with an optional trailing slash. A fixed path
+ * with no parameter, so there is nothing to capture.
+ *
+ * ###########################################################################
+ * # THIS LINE IS NOT A ROUTE GUARD, AND NOTHING HERE MAY BECOME ONE.
+ * ###########################################################################
+ *
+ * `resolveRoute` answers this address for anybody who types it, with no check
+ * of any kind — see `pages/admin-recovery/ui/admin-recovery-page.ts` for the
+ * argument in full. The short version: a check the browser makes is a check the
+ * browser can be told to skip, so the page renders for everyone and shows
+ * nothing but a token form, while every byte of order data comes from an
+ * endpoint that refuses without the token. Adding a redirect here would protect
+ * nothing and would create the belief that something was protected.
+ *
+ * There is deliberately **no link to this path** anywhere in the storefront.
+ */
+const adminRecoveryPathPattern = /^\/admin\/recovery\/?$/u;
 
 /**
  * `location.pathname` is percent-encoded; an order id is not. `ord_` + ULID
@@ -76,7 +97,8 @@ function decodeSegment(segment: string): string {
 /**
  * Build the page for a path.
  *
- * Anything that is not an order path is the shop. There is no separate
+ * Anything that is neither the operator's screen nor an order path is the shop.
+ * There is no separate
  * "page not found" screen, and that is a decision rather than an omission: the
  * shop has one address a shopper can mistype into something else, `/order/…`,
  * and that case already has its own Russian message from the API's `404`. A
@@ -84,6 +106,10 @@ function decodeSegment(segment: string): string {
  * to be anyway.
  */
 export function resolveRoute(pathname: string): HTMLElement {
+  if (adminRecoveryPathPattern.test(pathname)) {
+    return createAdminRecoveryPage();
+  }
+
   const orderMatch = orderPathPattern.exec(pathname);
 
   if (orderMatch !== null) {

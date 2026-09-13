@@ -29,11 +29,12 @@
  */
 import { Logger, type Provider } from "@nestjs/common";
 
-import { readPositiveInteger, readUrl } from "./env.js";
+import { readPositiveInteger, readPositiveIntegerWithDefault, readUrl } from "./env.js";
 
 const SUPPLIER_A_URL = "SUPPLIER_A_URL";
 const SUPPLIER_B_URL = "SUPPLIER_B_URL";
 const SUPPLIER_TIMEOUT_MS = "SUPPLIER_TIMEOUT_MS";
+const SUPPLIER_MAX_PROBES_PER_REQUEST = "SUPPLIER_MAX_PROBES_PER_REQUEST";
 
 /**
  * One supplier's address and deadline.
@@ -322,3 +323,112 @@ export const supplierBConfigProvider: Provider = supplierConfigProvider(
   "b",
   readSupplierBConfig,
 );
+
+/**
+ * Injection token for {@link SupplierProbeBudgetConfig} — **how many times one
+ * request id may be asked, and how long each ask may take.**
+ *
+ * A third token rather than two more fields on {@link SupplierEndpointConfig},
+ * because neither number is a property of a supplier. `SUPPLIER_TIMEOUT_MS` is
+ * already documented here as *"a property of what the shop can afford to
+ * wait"*, and `SUPPLIER_MAX_PROBES_PER_REQUEST` is a property of the shop's
+ * **retry policy**: it bounds `issuance-ladder.ts`'s `probe` rung, which is not
+ * addressed to a supplier at all — it is addressed to one `request_id`, and the
+ * whole point of that rung is that the supplier on the other end never changes.
+ *
+ * Hung off the two numbers together so the invocation budget in
+ * technical-considerations §1.3 can be *computed* rather than assembled by a
+ * caller from two injections it happened to have:
+ *
+ *     SUPPLIER_MAX_PROBES_PER_REQUEST × SUPPLIER_TIMEOUT_MS × |supplierLadder|
+ *         +  overhead   <   function execution ceiling
+ *
+ * The third factor is the ladder's length and deliberately does **not** live in
+ * this file: which suppliers exist is the retry policy's business
+ * (`../issuance/issuance-ladder.ts`), and a copy of that list here would be a
+ * second list to disagree with the first. {@link IssuanceRunnerService} holds
+ * both halves and logs the product at boot.
+ */
+export const SUPPLIER_PROBE_BUDGET_CONFIG = Symbol("SUPPLIER_PROBE_BUDGET_CONFIG");
+
+/**
+ * **Assumption A1** (technical-considerations §1.3): one ask and two re-probes.
+ *
+ * The spec names no number. Three is the smallest count that distinguishes *"the
+ * socket died once"* from *"this supplier is not answering"* — two would let a
+ * single dropped packet settle an order as `delivery_failed` while a key sits in
+ * the supplier's ledger, and a larger number multiplies straight into the
+ * invocation budget above without telling anybody anything new.
+ *
+ * It counts **asks, not retries**: the row is born with `probe_count = 1`
+ * (`../issuance/issuance-history.ts`), so this value is reached after the
+ * original ask plus two probes, and the third silence is what settles the order.
+ */
+export const DEFAULT_SUPPLIER_MAX_PROBES_PER_REQUEST = 3;
+
+/**
+ * The two numbers the ladder's `probe` rung is bounded by.
+ *
+ * Both are shop-wide, both are read through `./env.ts`'s validators, and both
+ * are multiplied together in a budget that no code can enforce — the third term
+ * is the platform's execution ceiling, which is not in the environment and must
+ * not be guessed at here (R5).
+ */
+export interface SupplierProbeBudgetConfig {
+  /**
+   * How many times one `request_id` may be asked before the shop stops asking
+   * and records that the outcome was never established.
+   *
+   * **Not a retry count with a different name.** Every ask in this budget sends
+   * the *same three arguments* to `deriveIssuanceRequestId` and therefore the
+   * *same* id, so each one is the same question — *"did my earlier request
+   * produce a key?"* — answered by the supplier's own ledger (I5). Asking a
+   * different supplier instead is what this budget exists to make unnecessary,
+   * and `issuance-ladder.ts` is what makes it unrepresentable.
+   */
+  readonly maxProbesPerRequest: number;
+
+  /** `SUPPLIER_TIMEOUT_MS` — see {@link SupplierEndpointConfig.timeoutMs}, which reads the same variable. */
+  readonly timeoutMs: number;
+}
+
+/**
+ * Read and validate the probe budget.
+ *
+ * `SUPPLIER_MAX_PROBES_PER_REQUEST` is the one supplier value in this file whose
+ * absence is **not** fatal, and the asymmetry is deliberate: an address and a
+ * deadline name things outside this process, while the probe count is a policy
+ * constant this repository chose and defended (A1). Unset means
+ * {@link DEFAULT_SUPPLIER_MAX_PROBES_PER_REQUEST}; set-but-unusable still stops
+ * the boot, because `readPositiveIntegerWithDefault` delegates to the same
+ * checks `SUPPLIER_TIMEOUT_MS` goes through (`./env.ts`).
+ */
+export function readSupplierProbeBudgetConfig(): SupplierProbeBudgetConfig {
+  return {
+    maxProbesPerRequest: readPositiveIntegerWithDefault(
+      SUPPLIER_MAX_PROBES_PER_REQUEST,
+      DEFAULT_SUPPLIER_MAX_PROBES_PER_REQUEST,
+      "a shop that may ask a silent supplier zero times would settle every timeout as a " +
+        "delivery failure while a key sits in that supplier's ledger",
+    ),
+    timeoutMs: readPositiveInteger(
+      SUPPLIER_TIMEOUT_MS,
+      "without a deadline a hung supplier is waited on until the platform kills the function, " +
+        "which is the one outcome the timeout exists to prevent",
+    ),
+  };
+}
+
+/**
+ * The probe budget, resolved once while Nest builds its container.
+ *
+ * No log line of its own, unlike the two supplier providers above: the number
+ * that is worth reading at boot is the **product**, and a line carrying one
+ * factor of a three-factor budget invites exactly the arithmetic nobody does.
+ * {@link IssuanceRunnerService}'s constructor logs the computed worst case with
+ * every factor beside it, in the same startup output.
+ */
+export const supplierProbeBudgetConfigProvider: Provider = {
+  provide: SUPPLIER_PROBE_BUDGET_CONFIG,
+  useFactory: readSupplierProbeBudgetConfig,
+};

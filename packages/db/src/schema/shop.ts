@@ -76,6 +76,77 @@ export type OrderStatus = (typeof orderStatuses)[number];
 const orderStatusSqlList = sql.raw(orderStatuses.map((status) => `'${status}'`).join(", "));
 
 /**
+ * **Paid, and holding no key** — the four states the recovery list draws from,
+ * and the predicate of the `orders_undelivered_idx` partial index below (spec
+ * 003 technical-considerations §4 and §5).
+ *
+ * It is not a slice of anything `packages/contracts` already exports, which is
+ * why it is written out rather than derived: it is the in-flight set *minus*
+ * `created`, plus the recoverable pair. `created` is out because nobody has
+ * paid yet; `delivered` and `payment_failed` are out because they are I9's
+ * terminal pair. What is left is exactly the shop's unfinished business.
+ *
+ * **Wider than "stuck", deliberately** (technical-considerations §4, A5).
+ * `paid` and `delivering` are in the list so an order whose worker died between
+ * the claim and the outcome write is *visible* — the one class of stuck order
+ * that is otherwise invisible, because no automatic trigger can reach it.
+ * Whether such a row may be **retried** is a separate and narrower question,
+ * answered by a status-guarded UPDATE, never by this list.
+ *
+ * ######################################################################
+ * # ADDING A STATUS TO THIS ARRAY IS A MIGRATION, NOT AN EDIT.          #
+ * ######################################################################
+ *
+ * This array is a partial index's predicate. Postgres never re-evaluates a
+ * predicate against rows that were not in the index when they were written, so
+ * widening the list here without rebuilding the index raises **nothing**: the
+ * new status silently stops appearing in the operator's list. The failure mode
+ * is an absence, not an error. See the index's own comment below, and
+ * `0005_recovery_list_indexes`.
+ *
+ * The `satisfies` clause is the one tripwire this file can offer on its own: a
+ * status that `orderStatuses` has never heard of fails to compile here, before
+ * it can become an index predicate naming a value `orders_status_check` forbids.
+ */
+export const undeliveredOrderStatuses = [
+  "paid",
+  "delivering",
+  "out_of_stock",
+  "delivery_failed",
+] as const satisfies readonly OrderStatus[];
+
+/**
+ * `'paid', 'delivering', ...` — the index predicate's list, built from the array
+ * above.
+ *
+ * ######################################################################
+ * # EXPORTED, AND THE RECOVERY-LIST QUERY MUST USE THIS VERY FRAGMENT.  #
+ * ######################################################################
+ *
+ * `orders_undelivered_idx` below is partial on `status IN (<this list>)`, and
+ * `UndeliveredOrdersService` (`apps/api/src/admin/undelivered-orders.service.ts`)
+ * has to write the same list **as literals** in its `WHERE` clause — a bound
+ * `= ANY($1)` is planned without the values, and Postgres cannot prove a value
+ * it has not seen implies a partial index's predicate, so the plan degrades to
+ * `Seq Scan on orders  Filter: (status = ANY ($1))` (spec 003
+ * technical-considerations §4, "the bound-parameter trap"; the measurement is
+ * in `0005_recovery_list_indexes`).
+ *
+ * The fragment is exported rather than re-derived at the call site so that the
+ * predicate and the query are not two renderings of one array that could drift
+ * — they are one string, built once, embedded twice. Re-deriving it in
+ * `apps/api` would compile, would emit the identical text today, and would go
+ * quietly wrong the day somebody changes the quoting or the separator in one of
+ * the two places.
+ *
+ * Reusing one `SQL` object in several statements is safe: `sql.raw` holds a
+ * single static chunk and binds nothing.
+ */
+export const undeliveredOrderStatusSqlList = sql.raw(
+  undeliveredOrderStatuses.map((status) => `'${status}'`).join(", "),
+);
+
+/**
  * `products` — the supplied catalog (twelve items, loaded by the seed).
  *
  * `sku` UNIQUE is the shop's public handle for an item: `POST /api/orders`
@@ -226,6 +297,61 @@ export const orders = pgTable(
     // admin view — "paid but undelivered" — and the recovery sweeps.
     //   CREATE INDEX orders_status_idx ON orders (status);
     index("orders_status_idx").on(t.status),
+
+    // ---------------------------------------------------------------------
+    // THE RECOVERY LIST'S DRIVING SCAN — "paid, and holding no key".
+    //
+    //   CREATE INDEX orders_undelivered_idx ON orders (created_at)
+    //     WHERE status IN ('paid', 'delivering', 'out_of_stock', 'delivery_failed');
+    //
+    // Added by 0005_recovery_list_indexes. It serves the outer relation of the
+    // recovery-list query (spec 003 technical-considerations §4):
+    //
+    //   SELECT ... FROM orders o
+    //    WHERE o.status IN ('paid', 'delivering', 'out_of_stock', 'delivery_failed')
+    //      AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.order_id = o.id)
+    //    ORDER BY paid_at ASC NULLS LAST, o.created_at ASC
+    //    LIMIT 200;
+    //   -- 0 rows => THERE IS NOTHING TO RECOVER. Not an error and not an empty
+    //   --           screen: the operator is told so in words. It is the only
+    //   --           zero-row case in this schema that is a complete answer
+    //   --           rather than a signal that somebody else got there first.
+    //
+    // **THE STATUS LIST MUST BE WRITTEN AS LITERALS, NOT `= ANY($1)`** — the one
+    // place this codebase's own bound-parameter convention must not be copied.
+    // Measured: with the four values inlined the plan is
+    // `Index Scan using orders_undelivered_idx`; with a bound array under a
+    // generic plan it is `Seq Scan on orders  Filter: (status = ANY ($1))`.
+    // Postgres cannot prove that a value it has not seen implies a partial
+    // index's predicate. Custom planning saves it today because `client.ts`
+    // forbids `.prepare()`, but that is a planner heuristic protecting the
+    // query, not a property of the query.
+    //
+    // WHY A PARTIAL INDEX IS SOUND HERE — the same argument that licenses
+    // `payment_events_unprocessed_order_idx` above. The predicate is stable in
+    // the direction that matters: rows leave the set and never come back. An
+    // order may move *inside* it (`out_of_stock → delivering` on a retry), but
+    // the two ways out — `delivered` and `payment_failed` — are terminal by I9.
+    // The index therefore holds exactly the shop's unfinished business and
+    // shrinks as that business is finished. Measured at 72 kB against
+    // `orders_status_idx`'s 552 kB on the same 20 000-order fixture.
+    //
+    // #################################################################
+    // # CAVEAT — A LATER PHASE THAT ADDS ANOTHER UNDELIVERED STATUS    #
+    // # MUST REBUILD THIS INDEX, AND THE FAILURE MODE IS NOT AN ERROR: #
+    // # IT IS THE NEW STATUS SILENTLY FALLING OUT OF THE OPERATOR'S    #
+    // # LIST.                                                          #
+    // #################################################################
+    //
+    // Nothing raises. The query still runs, the index is still used, and the
+    // orders in the new status are simply not in it — so they are not returned,
+    // and the screen whose whole purpose is "nothing paid-for is invisible"
+    // quietly stops being true. Widening `undeliveredOrderStatuses` above is
+    // therefore a migration (drop and re-create this index), not an edit.
+    // ---------------------------------------------------------------------
+    index("orders_undelivered_idx")
+      .on(t.createdAt)
+      .where(sql`"status" IN (${undeliveredOrderStatusSqlList})`),
   ],
 );
 
@@ -343,6 +469,52 @@ export const paymentEvents = pgTable(
     index("payment_events_unprocessed_order_idx")
       .on(t.orderId)
       .where(sql`"processed_at" IS NULL`),
+
+    // ---------------------------------------------------------------------
+    // `paid_at` — THE SINGLE LARGEST PERFORMANCE WIN IN PHASE 3, and the one
+    // nobody goes looking for.
+    //
+    //   CREATE INDEX payment_events_paid_order_idx
+    //     ON payment_events (order_id, received_at) WHERE status = 'paid';
+    //
+    // Added by 0005_recovery_list_indexes. It serves the correlated scalar the
+    // recovery list derives "when was this paid for" from, once per listed
+    // order (spec 003 technical-considerations §4 and §5):
+    //
+    //   SELECT min(pe.received_at) FROM payment_events pe
+    //    WHERE pe.order_id = $1 AND pe.status = 'paid';
+    //   -- NULL => paid with no `paid` event on file. The order is LISTED, not
+    //   --         hidden: a missing event is a thing an operator must see.
+    //   -- Plan: InitPlan -> Limit -> Index Only Scan using
+    //   --       payment_events_paid_order_idx. `min()` over an indexed column
+    //   --       is rewritten by the planner as "first row of an ordered scan",
+    //   --       which is why `received_at` is the second index column and not
+    //   --       merely along for the ride.
+    //
+    // WITHOUT IT: `Seq Scan on payment_events` once per listed order — 1 599
+    // scans, 436 527 of the query's 443 383 buffers, and 1 723.8 ms of its
+    // 1 723.8 ms. With it, 12.7 ms. Measured on the 20 000-order fixture; see
+    // 0005's header for the full table.
+    //
+    // **The finding worth keeping**, because it is the counter-intuitive one:
+    // the expensive part of that query was never the per-order-latest-attempt
+    // problem everyone looks at. All three strategies for "the newest attempt
+    // row per order" measured within 5 % of each other, because all three were
+    // carrying this sequential scan. It was `paid_at`, and it is invisible
+    // until you look at `Buffers` rather than at row counts.
+    //
+    // WHY PARTIAL, ON AN EVEN STRONGER PREDICATE than
+    // `payment_events_unprocessed_order_idx` above: `processed_at IS NULL` is a
+    // predicate rows leave (which is sound, and is why that index stays small);
+    // `status = 'paid'` is one they can never leave, because
+    // `payment_events.status` is written once by the INSERT that records the
+    // event and is never UPDATEd anywhere in the codebase. Membership is fixed
+    // at birth. The caveat attached to `orders_undelivered_idx` — a predicate
+    // over a value that later changes meaning — cannot arise here.
+    // ---------------------------------------------------------------------
+    index("payment_events_paid_order_idx")
+      .on(t.orderId, t.receivedAt)
+      .where(sql`"status" = 'paid'`),
   ],
 );
 

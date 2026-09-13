@@ -59,25 +59,109 @@ import {
  * indefinitely, then dies silently" into "waits a fixed time, then reports what
  * it abandoned".
  *
- * **Five seconds**, chosen against the two neighbours it has to sit between:
+ * ###########################################################################
+ * # THE TWO CONSTRAINTS NO LONGER BOTH FIT, AND THIS IS WHICH ONE GIVES.
+ * ###########################################################################
  *
- *   - *Above the longest continuation this shop can legitimately produce.* The
- *     slowest is a payment continuation that runs a full issuance: a handful of
- *     guarded UPDATEs either side of one supplier call, and that call is itself
- *     bounded by `SUPPLIER_TIMEOUT_MS` (2000 ms locally — `.env.example`, and
- *     the shop's own term in the ordered chain in
- *     `../config/supplier-config.ts`, which sits below the function ceiling and
- *     may sit either side of the supplier's injected hang).
- *     Two seconds of supplier plus statements against a local pool leaves well
- *     over half the budget spare, so a *healthy* continuation is never
- *     abandoned. If `SUPPLIER_TIMEOUT_MS` is ever raised past ~4 s, this
- *     constant is the thing that has to move with it.
- *   - *Below the shortest grace period anything gives us before `SIGKILL`.*
- *     `docker stop` sends `SIGTERM` and kills 10 s later by default; that is
- *     the tightest supervisor in this project's local stack
- *     (`docker-compose.yml`). Exceeding it would mean the process is killed
- *     mid-drain and the give-up line — the entire point of the bound — never
- *     prints.
+ * This constant has always been described as sitting *between* two neighbours:
+ *
+ *   1. **Above the longest continuation this shop can legitimately produce**, so
+ *      a healthy one is never abandoned; and
+ *   2. **below the shortest grace period anything gives us before `SIGKILL`**,
+ *      so the give-up line — the entire point of the bound — actually prints.
+ *
+ * Spec 003 slice 3 made those two mutually exclusive. The ladder now walks to a
+ * resting state inside **one** invocation (technical-considerations §1.4, A2),
+ * so the longest legitimate continuation is no longer one supplier call, it is
+ * the whole budget the API logs at boot:
+ *
+ *     SUPPLIER_MAX_PROBES_PER_REQUEST × SUPPLIER_TIMEOUT_MS × |supplierLadder|
+ *         = 3 × 2000 × 2 = 12 000 ms          (measured at boot: worst_case_ms: 12000)
+ *
+ * and even the *ordinary* exhausted path — one supplier silent through all three
+ * asks — measures **6102 ms**, which is already past where this bound used to
+ * sit. Constraint 1 now asks for something north of 12 s. Constraint 2 caps us
+ * at 5 s (below). There is no number that satisfies both.
+ *
+ * **Constraint 1 gives.** Not because the walk does not matter, but because the
+ * two failures are not comparable:
+ *
+ *   - Breaking constraint 1 — cutting a walk mid-flight — is **recoverable and
+ *     loud**. `issuance_attempts.status` is written `unknown` *before* the
+ *     supplier call, so no `catch` has to run for the row to stay truthful; the
+ *     order stays `delivering`; `payment_events.processed_at` stays NULL, which
+ *     is what keeps the other three triggers (`architecture.md` §4) able to find
+ *     it; and the abandoned continuation is named — `order_id`, `event_id` — in
+ *     the `error` line below. Slice 4's operator recovery list surfaces exactly
+ *     that shape. §1.4 already accepts this outcome for the platform ceiling;
+ *     accepting it for a shutdown costs nothing new.
+ *   - Breaking constraint 2 is **silent**. `SIGKILL` mid-drain means no give-up
+ *     line, no pool drain, and an operator who learns nothing at all. A bound
+ *     whose one product is that line must never be the thing that loses the race
+ *     to print it.
+ *
+ * A bound that chased the 12 s walk would also make every `Ctrl-C` on the dev
+ * server wait up to twelve seconds for work whose loss costs *promptness* and
+ * nothing else.
+ *
+ * ---------------------------------------------------------------------------
+ * THREE SECONDS, AND WHICH SUPERVISOR THAT IS UNDER
+ * ---------------------------------------------------------------------------
+ * The grace period this has to fit inside was stated wrongly here until now, as
+ * *"`docker stop` … kills 10 s later; that is the tightest supervisor in this
+ * project's local stack (`docker-compose.yml`)."* It is not: Compose runs **only
+ * Postgres** (see that file's header — "Only the database is containerised"), so
+ * `docker stop` never signals a process that selects this implementation at all.
+ * The supervisors that really exist are:
+ *
+ * | Who sends `SIGTERM`                                     | `SIGKILL` after |
+ * | ------------------------------------------------------- | --------------- |
+ * | `../../test/concurrency/support/api-instance.ts`, `stopApiInstance` | **5 000 ms** |
+ * | `scripts/race/run-checks.ts` (via the same helper)       | 5 000 ms        |
+ * | An interactive `Ctrl-C` on `pnpm dev`                    | never           |
+ *
+ * **5 000 ms is the real ceiling, and the old value was equal to it** — the
+ * give-up line and the `SIGKILL` were a photo finish that the line loses, since
+ * it only prints *after* this timer resolves.
+ *
+ * And the inequality is not `bound < grace`, because this drain is not the last
+ * thing shutdown does. What has to fit is:
+ *
+ *     SHUTDOWN_DRAIN_TIMEOUT_MS  +  the shutdown tail  <  the tightest grace
+ *
+ * The tail is the give-up line itself, `DatabaseModule` closing the pool behind
+ * it, and the abandoned continuation's own failure (it wakes on a pool that has
+ * been `end`ed and logs through `guardContinuation`). **Measured on this project
+ * at `SIGTERM` mid-walk: `waited_ms: 4001`, process exit 4 790 ms after the
+ * signal — a tail of ~790 ms, and 210 ms of a 5 000 ms grace left over.** That
+ * is not headroom, it is a coin toss on a loaded machine.
+ *
+ * Three seconds was then measured the same way — `SIGTERM` one second into a
+ * walk whose supplier is silent — and gives **`waited_ms: 3001`, process exit
+ * 3 055 ms after the signal, 1 945 ms of the grace left over.** That is
+ * headroom.
+ *
+ * Every *healthy* continuation still finishes far inside it: the guarded
+ * statements around a supplier call run in tens of milliseconds against a local
+ * pool (16 ms, 24 ms and 41 ms for the three ladder transactions of a measured
+ * walk), so even a slow-but-successful supplier — a hang placed under
+ * `SUPPLIER_TIMEOUT_MS`, `../config/supplier-config.ts`'s first scenario —
+ * lands near 2 s. What 3 s excludes is a walk that has already spent one
+ * supplier timeout and started another, which is the pathological case and the
+ * one whose abandonment is recoverable.
+ *
+ * **What a shutdown mid-walk costs, stated plainly:** the order is left in
+ * `delivering` with its newest `issuance_attempts` row saying `unknown` and
+ * `last_error` NULL, its payment event still pending, and no key delivered. That
+ * is not a lost order — it is the recovery list's entry for it, and an operator
+ * retry re-asks the *same* `request_id`, which the supplier's ledger (I5)
+ * answers with the code it already issued if it issued one.
+ *
+ * **If either neighbour moves, this constant moves with it.** Raising
+ * `SUPPLIER_TIMEOUT_MS` does *not* require raising this (constraint 1 is already
+ * conceded); raising `SHUTDOWN_TIMEOUT_MS` in `api-instance.ts` is the only
+ * change that would let this grow, and it would have to grow by the tail as
+ * well as by the bound.
  *
  * A constant rather than an environment variable, deliberately. `../config/`
  * exists for values that name something *outside* the process and have no right
@@ -87,7 +171,7 @@ import {
  * that only ever gets turned to work around a continuation that should have
  * been made faster.
  */
-const SHUTDOWN_DRAIN_TIMEOUT_MS = 5_000;
+const SHUTDOWN_DRAIN_TIMEOUT_MS = 3_000;
 
 /**
  * The local {@link ContinuationScheduler}: tracked, awaited on shutdown,

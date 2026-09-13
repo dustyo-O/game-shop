@@ -421,8 +421,12 @@ export class OrdersController {
    * state, and the key once it has one (functional spec §2.2 and §2.6).
    *
    * This is the endpoint `apps/web` polls once a second while the order is in
-   * flight and stops calling when it settles (technical-considerations §2.6).
-   * The stop condition is `status` read through `isSettledOrderStatus` from
+   * flight, every five seconds while it is recoverable, and stops calling only
+   * when it is terminal (spec 003 §2.6, slice 6). It used to stop on
+   * `isSettledOrderStatus`; that became wrong the moment `delivery_failed`
+   * joined the recoverable set, because "settled" then meant exactly the two
+   * states an operator can move — and a page that stopped there never saw the
+   * retry arrive. The stop condition is now `isTerminalOrderStatus` from
    * `@game-shop/contracts`; see {@link OrderView} for why no `settled` flag is
    * put on the wire.
    *

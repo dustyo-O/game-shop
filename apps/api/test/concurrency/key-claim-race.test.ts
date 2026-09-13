@@ -68,6 +68,7 @@ import { execFileSync } from "node:child_process";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { isSettledOrderStatus } from "@game-shop/contracts";
 import type { DatabaseClient } from "@game-shop/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 
@@ -187,23 +188,41 @@ async function fetchOrderView(baseUrl: string, orderId: string): Promise<OrderVi
 }
 
 const SETTLE_POLL_INTERVAL_MS = 25;
-const SETTLE_TIMEOUT_MS = 10_000;
+
+/**
+ * 20s, raised from 10s in Phase 3 — and the old value was not merely tight, it
+ * was **below the shop's own worst case**.
+ *
+ * One ladder walk can spend `SUPPLIER_MAX_PROBES_PER_REQUEST × SUPPLIER_TIMEOUT_MS
+ * × |supplierLadder|` = 3 × 2000 × 2 = 12s in suppliers alone, which the API logs
+ * at boot. A 10s budget therefore failed orders that were behaving exactly as
+ * designed, and it failed them as `status=delivering` — which reads like a stuck
+ * order rather than like a deadline that was set before the ladder existed.
+ */
+const SETTLE_TIMEOUT_MS = 20_000;
 
 /**
  * Wait for one order to leave the in-flight states.
  *
- * In this phase the webhook applies its event inline
- * (`docs/walkthrough/slice-5-issuance.md` §9 measured under 20ms, no injected
- * delay), so in practice `payOrder`'s response has already been preceded by
- * the order settling. This poll is a safety margin against scheduling jitter
- * under load — four processes and up to 55 concurrent requests — not
- * something the architecture depends on.
+ * This comment used to say the webhook applies its event inline, measured under
+ * 20ms, and that the poll was a safety margin the architecture did not depend
+ * on. Both halves stopped being true: Phase 2 moved the work off the response
+ * path onto a scheduled continuation, and Phase 3 added a retry ladder that can
+ * legitimately spend 12s in suppliers. The poll is now load-bearing.
+ *
+ * **Settledness is asked, never restated.** `isSettledOrderStatus` is
+ * `terminal ∪ recoverable` from `@game-shop/contracts`, so `delivery_failed`
+ * joined it the moment Phase 3 classified it — with no edit here. The previous
+ * version hardcoded three status strings and silently omitted the fourth, so an
+ * order that settled correctly into `delivery_failed` was polled until the
+ * deadline and then reported as a failure. A local copy of a status list is a
+ * copy that stops being true without anybody editing it.
  */
 async function waitUntilSettled(baseUrl: string, orderId: string): Promise<OrderView> {
   const deadline = Date.now() + SETTLE_TIMEOUT_MS;
   for (;;) {
     const view = await fetchOrderView(baseUrl, orderId);
-    if (view.status === "delivered" || view.status === "out_of_stock" || view.status === "payment_failed") {
+    if (isSettledOrderStatus(view.status)) {
       return view;
     }
     if (Date.now() > deadline) {

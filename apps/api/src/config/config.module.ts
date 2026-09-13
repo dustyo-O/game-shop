@@ -51,10 +51,19 @@
  * in. Nothing fails closed on its absence because there is nothing to fail —
  * `POST /api/orders` behaves exactly as it did before this file existed.
  *
- * What is *not* asymmetric, for either of them, is when the check runs. A
- * token that is present but too short to be a secret, or a flag set to
- * anything but `"true"`/`"false"`, still stops the boot from this module, at
- * the same moment a malformed `SUPPLIER_A_URL` would.
+ * `SUPPLIER_MAX_PROBES_PER_REQUEST` (`SUPPLIER_PROBE_BUDGET_CONFIG`) is the
+ * third, added in slice 3, and its reason is a third one again: it is not a
+ * fact about the world outside this process at all. It is a **policy constant
+ * this repository chose and defended** — technical-considerations §1.3's
+ * assumption A1 — so unset means that number rather than a guess, and a fresh
+ * clone boots with the retry policy the specification describes. Its address-
+ * and-deadline neighbours in the same file keep refusing the boot, because
+ * nobody can supply a default for where a supplier lives.
+ *
+ * What is *not* asymmetric, for any of them, is when the check runs. A token
+ * that is present but too short to be a secret, a flag set to anything but
+ * `"true"`/`"false"`, or a probe count written `"2e3"`, still stops the boot
+ * from this module, at the same moment a malformed `SUPPLIER_A_URL` would.
  *
  * ---------------------------------------------------------------------------
  * WHAT IS DELIBERATELY NOT HERE
@@ -85,20 +94,24 @@ import {
 import {
   SUPPLIER_A_CONFIG,
   SUPPLIER_B_CONFIG,
+  SUPPLIER_PROBE_BUDGET_CONFIG,
   supplierAConfigProvider,
   supplierBConfigProvider,
+  supplierProbeBudgetConfigProvider,
 } from "./supplier-config.js";
 
 @Module({
   providers: [
     supplierAConfigProvider,
     supplierBConfigProvider,
+    supplierProbeBudgetConfigProvider,
     adminTokenConfigProvider,
     clientSuppliedOrderIdConfigProvider,
   ],
   exports: [
     SUPPLIER_A_CONFIG,
     SUPPLIER_B_CONFIG,
+    SUPPLIER_PROBE_BUDGET_CONFIG,
     ADMIN_TOKEN_CONFIG,
     CLIENT_SUPPLIED_ORDER_ID_CONFIG,
   ],

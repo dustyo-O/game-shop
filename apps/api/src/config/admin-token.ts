@@ -146,16 +146,21 @@ export const adminTokenConfigProvider: Provider = {
 
     if (config.configured) {
       logger.log({
-        msg: "admin token configured; the payment-event sweep is available",
+        msg: "admin token configured; the admin surface is available",
         admin_token_configured: true,
       });
     } else {
+      // Names every route behind the guard, not just the first one. The list
+      // grows with `AdminModule`, and a boot warning that still names only the
+      // sweep would tell an operator the recovery list was merely broken.
       logger.error({
         msg:
-          "ADMIN_TOKEN is not set; the admin payment-event sweep is DISABLED and answers 503. " +
-          "The shop still delivers — the sweep is the fourth of four processing triggers " +
-          "(architecture.md §4) — but the backstop for events the other three miss is gone. " +
-          "Set ADMIN_TOKEN (see .env.example) to enable it.",
+          "ADMIN_TOKEN is not set; the whole admin surface is DISABLED and answers 503 — " +
+          "the payment-event sweep and the paid-but-undelivered recovery list. " +
+          "The shop still delivers, but two things are gone: the backstop for events the " +
+          "other three processing triggers miss (architecture.md §4), and the only screen " +
+          "that shows an order that was paid for and never delivered (spec 003 §2.4). " +
+          "Set ADMIN_TOKEN (see .env.example) to enable them.",
         admin_token_configured: false,
       });
     }

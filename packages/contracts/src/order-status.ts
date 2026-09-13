@@ -125,8 +125,12 @@ export type TerminalOrderStatus = (typeof terminalOrderStatuses)[number];
  * So it is *settled* but not *terminal*, and code must not treat the two as
  * interchangeable. Anything that means "no further transitions are legal"
  * (I9, the transition helper's guard lists) uses {@link terminalOrderStatuses};
- * anything that means "nothing more will happen on its own" (the poll's stop
- * condition, the admin panel's inbox) uses {@link settledOrderStatuses}.
+ * anything that means "nothing more will happen on its own" (the payment
+ * processor's settle rule, the admin panel's inbox) uses
+ * {@link settledOrderStatuses}. **The order page asks this set directly**, and
+ * asks it as its own question: an order here is still being read — slowly —
+ * because the operator's retry is exactly the event the shopper is waiting to
+ * see (spec 003 technical-considerations §9.1).
  *
  * **Why `delivery_failed` is here and not above.** Terminal is the set the
  * guarded `UPDATE ... WHERE status = ANY($3)` draws its permitted source states
@@ -144,14 +148,18 @@ export type RecoverableOrderStatus = (typeof recoverableOrderStatuses)[number];
 /**
  * Terminal ∪ recoverable — the states in which an order stops moving by itself.
  *
- * **This is the frontend's polling stop condition.** The order page polls
- * `GET /api/orders/:id` once a second while the order is in-flight and stops on
- * `delivered`, `payment_failed`, `out_of_stock` or `delivery_failed`
- * (technical-considerations §2.6). Deriving that set here rather than restating
- * the strings in the page is what stopped `delivery_failed` from producing a
- * page that polls a dead order forever: adding it to
- * {@link recoverableOrderStatuses} above was the whole edit — this list, and the
- * poll that reads it, needed no change at all.
+ * **This is the server's settle rule, and it is no longer the order page's
+ * stop condition.** The payment-event processor and the drain ask it to decide
+ * whether an order still needs work; the admin inbox is its complement. Until
+ * spec 003 the page stopped polling here too, and the derivation is what let
+ * `delivery_failed` join {@link recoverableOrderStatuses} without touching the
+ * page. But the moment an operator could *move* a recoverable order, "stopped
+ * moving by itself" and "stop watching" became different questions: a page that
+ * stops on this set never sees the retry land, and functional spec §2.6's third
+ * criterion fails by definition rather than by bug (technical-considerations
+ * §9.1, R10). The page now stops on {@link terminalOrderStatuses} and keeps
+ * reading {@link recoverableOrderStatuses} at a slower cadence — it asks the
+ * two sets separately, never this union.
  */
 export const settledOrderStatuses = [
   ...terminalOrderStatuses,
@@ -169,8 +177,9 @@ export type SettledOrderStatus = (typeof settledOrderStatuses)[number];
  * stopped this alias compiling — *Type `"delivery_failed"` does not satisfy the
  * constraint `never`* — until the new status was classified into one of the
  * lists above, which is the point. Without it, an unclassified status silently
- * reads as "in-flight" to {@link isSettledOrderStatus} and the status page polls
- * it forever.
+ * reads as "in-flight" — to {@link isSettledOrderStatus}, and to the status
+ * page, which treats whatever is neither terminal nor recoverable as moving and
+ * polls it once a second forever.
  */
 type AssertNoUnclassifiedStatus<TUnclassified extends never> = TUnclassified;
 type _EveryOrderStatusIsClassified = AssertNoUnclassifiedStatus<
@@ -185,21 +194,32 @@ export function isOrderStatus(value: unknown): value is OrderStatus {
 /**
  * `delivered` or `payment_failed` — no further transitions are legal from here.
  *
- * Use this for the I9 question ("may this transition run at all?"), not for
- * "should the page stop polling?" — see {@link recoverableOrderStatuses}.
+ * Two callers with two questions: the I9 question ("may this transition run at
+ * all?"), and the order page's ("can anything ever change what I am showing?",
+ * which is where it stops polling — spec 003 technical-considerations §9.1).
+ * For "will this move on its own?" see {@link isSettledOrderStatus}.
  */
 export function isTerminalOrderStatus(status: OrderStatus): status is TerminalOrderStatus {
   return (terminalOrderStatuses as readonly OrderStatus[]).includes(status);
 }
 
-/** `out_of_stock` or `delivery_failed` — settled, and retryable by an operator. */
+/**
+ * `out_of_stock` or `delivery_failed` — settled, and retryable by an operator.
+ *
+ * The order page keeps reading these, every five seconds, so the retry is seen
+ * when it lands (spec 003 technical-considerations §9.1).
+ */
 export function isRecoverableOrderStatus(status: OrderStatus): status is RecoverableOrderStatus {
   return (recoverableOrderStatuses as readonly OrderStatus[]).includes(status);
 }
 
 /**
  * `delivered`, `payment_failed`, `out_of_stock` or `delivery_failed` — the order
- * will not move on its own. **The status page's stop-polling condition.**
+ * will not move on its own. **The server's settle rule; not the status page's
+ * stop-polling condition** — the page stops on {@link isTerminalOrderStatus}
+ * and keeps reading the recoverable pair, because "will not move on its own"
+ * says nothing about whether an operator is about to move it (spec 003
+ * technical-considerations §9.1).
  */
 export function isSettledOrderStatus(status: OrderStatus): status is SettledOrderStatus {
   return (settledOrderStatuses as readonly OrderStatus[]).includes(status);

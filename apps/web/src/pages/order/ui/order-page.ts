@@ -17,20 +17,46 @@
  * A paid order goes `created → paid → delivering → delivered` in the shop, in
  * under a second, with nobody pressing anything. Functional spec §2.4 asks that
  * the shopper see each of those *"without the shopper reloading"*, so the page
- * reads `GET /api/orders/:id` once a second for as long as the order is still
- * moving and stops the moment it settles.
+ * reads `GET /api/orders/:id` once a second for as long as the order is in
+ * flight.
  *
- * **What "settled" means is not decided here.** `isSettledOrderStatus` comes
- * from `@game-shop/contracts`, which classifies every status as in-flight or
- * settled and fails to compile if a new one is left out. Restating «delivered,
- * payment_failed, out_of_stock» in this file would be the third copy of that
- * list, and the one nobody would remember to update when Phase 3 adds
- * `delivery_failed` — a page polling a dead order forever.
+ * **Where it stops is not "settled" — it is "terminal".** Spec 003 split the
+ * question the page asks after each read into two, because the two sets of
+ * states that used to answer it the same way no longer do
+ * (technical-considerations §9.1, R10):
+ *
+ *   - `delivered`, `payment_failed` — **terminal**, `isTerminalOrderStatus`.
+ *     Nothing can ever move them, by any path. The page stops.
+ *   - `out_of_stock`, `delivery_failed` — **recoverable**,
+ *     `isRecoverableOrderStatus`. Nothing moves them *by itself*, but an
+ *     operator does (`POST /api/admin/orders/:id/retry`), and functional spec
+ *     §2.6 promises the shopper their key appears *"without them taking any
+ *     action"*. So the page keeps reading — every five seconds rather than every
+ *     one, since it is waiting on a person, not a worker — and **snaps back to a
+ *     second the moment a read shows the order moving again**, so the retry's
+ *     own `delivering → delivered` is watched at the same beat as the original
+ *     purchase and spec 002 §2.5's visible stages are not quietly lost.
+ *   - Anything else is in flight and read once a second, as before.
+ *
+ * Stopping on `isSettledOrderStatus` — terminal ∪ recoverable — was the previous
+ * rule, and it is the trap: it compiles, ships, keeps every check green, and
+ * leaves the shopper looking at «Ключей сейчас нет в наличии» while the operator's
+ * retry delivers a key the page will never read.
+ *
+ * Both classifications come from `@game-shop/contracts`, which puts every status
+ * in exactly one set and fails to compile if a new one is left out. Restating
+ * the strings in this file would be the copy nobody updates.
+ *
+ * The reading of a recoverable order is bounded (assumption A9): after five
+ * minutes the page stops and says so. That is the one message on this page
+ * that does tell the shopper to reload, and correctly — a page that has
+ * stopped refreshing itself should not claim otherwise.
  *
  * The loop itself is `../model/poll.js`; that file explains why the next read is
- * chained off the end of the previous one rather than run on an interval.
+ * chained off the end of the previous one rather than run on an interval, and
+ * why changing the interval from inside a read is safe.
  */
-import { isSettledOrderStatus, type OrderStatus } from "@game-shop/contracts";
+import { isRecoverableOrderStatus, isTerminalOrderStatus, type OrderStatus } from "@game-shop/contracts";
 
 import {
   fetchOrder,
@@ -43,8 +69,24 @@ import { createPaymentControls, type PaymentControls } from "../../../features/s
 import { createElement } from "../../../shared/lib/dom.js";
 import { createPoll, PollDecision, type Poll } from "../model/poll.js";
 
-/** Technical-considerations §2.6: *"polls `GET /api/orders/:id` every second"*. */
-const pollIntervalMs = 1000;
+/** Technical-considerations §2.6: *"polls `GET /api/orders/:id` every second"* — while the order is in flight. */
+const inFlightIntervalMs = 1000;
+
+/**
+ * Spec 003 technical-considerations §9.1: a recoverable order is read every
+ * five seconds. It is waiting on an operator, and a person takes minutes, not
+ * milliseconds — five times fewer reads for a wait that is five orders of
+ * magnitude longer. The cost of each is small regardless: a settled order's
+ * read is answered from the order row alone, with no drain and no index probe.
+ */
+const recoverableIntervalMs = 5000;
+
+/**
+ * Assumption A9: how long the page keeps reading a recoverable order before it
+ * stops and says so. Measured from the first read that found the order
+ * recoverable, and reset whenever a read finds it moving again.
+ */
+const recoverableWatchWindowMs = 5 * 60 * 1000;
 
 const noticeClass = "order__notice";
 
@@ -69,6 +111,12 @@ const noticeClass = "order__notice";
  * already a real order on screen. It says the same thing as `error` without
  * throwing away what the shopper is looking at.
  *
+ * `stopped` is the one sentence here that *does* tell the shopper to reload,
+ * and the rule above is why it may: it is shown only once the page has stopped
+ * reading the order (assumption A9 — five minutes of watching a recoverable
+ * order), at which point «страница обновится сама» would be a lie and asking
+ * them to refresh is the honest instruction.
+ *
  * The payment controls' own wording is not here: it belongs to
  * `features/simulate-payment`, which owns the behaviour it describes.
  */
@@ -78,6 +126,7 @@ const text = {
   notFound: "Заказ не найден. Проверьте адрес страницы.",
   error: "Не удалось загрузить заказ. Проверьте соединение — страница обновится сама.",
   offline: "Связь с магазином потеряна. Страница обновится сама, как только связь появится.",
+  stopped: "Страница перестала обновляться автоматически. Обновите её, чтобы увидеть текущее состояние заказа.",
 } as const;
 
 function renderStatus(message: string, modifier: string): HTMLParagraphElement {
@@ -89,17 +138,23 @@ function renderStatus(message: string, modifier: string): HTMLParagraphElement {
 }
 
 /**
- * The connection notice, which sits *under* an order that is already on screen
- * rather than replacing it.
- *
- * `role="status"` and not `alert`: nothing was lost, the page is retrying, and a
- * screen reader should mention it politely rather than interrupt.
+ * What a notice under the order is about — the value of its `data-order-notice`
+ * handle, which is what a check reads to tell the two apart.
  */
-function renderNotice(message: string): HTMLParagraphElement {
+type NoticeKind = "offline" | "stopped";
+
+/**
+ * A notice that sits *under* an order that is already on screen rather than
+ * replacing it: the connection has gone, or the page has stopped watching.
+ *
+ * `role="status"` and not `alert`: nothing was lost, and a screen reader should
+ * mention it politely rather than interrupt.
+ */
+function renderNotice(message: string, kind: NoticeKind): HTMLParagraphElement {
   return createElement("p", {
     className: noticeClass,
     text: message,
-    attributes: { role: "status", "data-order-notice": "offline" },
+    attributes: { role: "status", "data-order-notice": kind },
   });
 }
 
@@ -215,19 +270,91 @@ export function createOrderPage(orderId: string): HTMLElement {
     }
 
     if (content.querySelector(`.${noticeClass}`) === null) {
-      content.append(renderNotice(text.offline));
+      content.append(renderNotice(text.offline, "offline"));
     }
+  }
+
+  /**
+   * The watch window has run out (assumption A9). The order stays on screen —
+   * it is still what the shopper came for — and a line under it says the page
+   * is no longer keeping it current.
+   *
+   * Appended after the final read painted, and nothing removes it: `showOrder`
+   * clears `.order__notice` on every read, but there are no more reads.
+   */
+  function showStoppedWatching(): void {
+    content.append(renderNotice(text.stopped, "stopped"));
+  }
+
+  /**
+   * When the page first found the order in a recoverable state, on the
+   * monotonic clock, or `null` while it is not in one. The A9 window is measured
+   * from here.
+   */
+  let recoverableSince: number | null = null;
+
+  /**
+   * The three-way split from spec 003 technical-considerations §9.1, applied to
+   * an order that has just been painted. This is the whole of the stop
+   * condition, and the order of the questions is the point:
+   *
+   *   - **Terminal** (`delivered`, `payment_failed`) — stop. Nothing can move
+   *     it, so a further read can only ever return the same answer.
+   *   - **Recoverable** (`out_of_stock`, `delivery_failed`) — keep reading,
+   *     every five seconds, for up to the A9 window. An operator's retry is the
+   *     only thing that moves it, and the shopper is promised they will see it
+   *     land (functional spec §2.6).
+   *   - **In flight** — every second, as for a fresh purchase, and this branch
+   *     is also the **snap-back**: a recoverable order that a read now shows as
+   *     `delivering` has been picked up by a retry, and the retry runs
+   *     `delivering → delivered` in the same 25–65 ms the original issuance
+   *     did. Left at five seconds, the page would hold «Выдаём ключ» for up to
+   *     five seconds after the key existed, and would miss the state entirely
+   *     unless the read happened to land inside it. Back at one second, the
+   *     recovery is watched exactly as spec 002 §2.5 asks the first attempt to
+   *     be.
+   *
+   * Unclassified statuses fall to the in-flight branch — the same default
+   * `isSettledOrderStatus` had — but `@game-shop/contracts` refuses to compile
+   * with an unclassified status, so none reaches here.
+   */
+  function decideNextRead(status: OrderStatus): PollDecision {
+    if (isTerminalOrderStatus(status)) {
+      return PollDecision.Stop;
+    }
+
+    if (!isRecoverableOrderStatus(status)) {
+      recoverableSince = null;
+      poll.setIntervalMs(inFlightIntervalMs);
+
+      return PollDecision.Continue;
+    }
+
+    const now = performance.now();
+    recoverableSince ??= now;
+
+    if (now - recoverableSince >= recoverableWatchWindowMs) {
+      showStoppedWatching();
+
+      return PollDecision.Stop;
+    }
+
+    poll.setIntervalMs(recoverableIntervalMs);
+
+    return PollDecision.Continue;
   }
 
   /**
    * One read of the order, and the decision about whether to read it again.
    *
-   * Called immediately when the page is built and once a second after that. Four
-   * outcomes:
+   * Called immediately when the page is built and after every quiet interval
+   * since. Four outcomes:
    *
-   *   - **The order arrived.** Paint it if it changed, then stop iff it has
-   *     settled — `delivered`, `payment_failed` or `out_of_stock`, as
-   *     `@game-shop/contracts` classifies them.
+   *   - **The order arrived.** Paint it if it changed, then let
+   *     `decideNextRead` answer from the status: stop on a terminal one
+   *     (`delivered`, `payment_failed`), read a recoverable one (`out_of_stock`,
+   *     `delivery_failed`) every five seconds, read anything else every second
+   *     — as `@game-shop/contracts` classifies them.
    *   - **The read was aborted.** The poll is shutting down, so the page is on
    *     its way out. Paint nothing: the only thing worse than a stale screen is
    *     a stale screen drawn on the way to a different page.
@@ -249,9 +376,7 @@ export function createOrderPage(orderId: string): HTMLElement {
 
       showOrder(order);
 
-      return isSettledOrderStatus(order.status) || !content.isConnected
-        ? PollDecision.Stop
-        : PollDecision.Continue;
+      return content.isConnected ? decideNextRead(order.status) : PollDecision.Stop;
     } catch (error: unknown) {
       if (signal.aborted) {
         return PollDecision.Stop;
@@ -312,7 +437,7 @@ export function createOrderPage(orderId: string): HTMLElement {
     },
   });
 
-  const poll: Poll = createPoll({ intervalMs: pollIntervalMs, run: readOrder });
+  const poll: Poll = createPoll({ intervalMs: inFlightIntervalMs, run: readOrder });
 
   const page = createElement("section", { className: "order" }, [
     createElement("h1", { className: "order__title", text: text.title }),

@@ -72,6 +72,16 @@ import type { IssuanceAsk } from "./issuance-ladder.js";
 const FIRST_PROBE_COUNT = 1;
 
 /**
+ * How many asks one probe adds: **one.**
+ *
+ * Named rather than inlined into the `SET` clause because the statement it
+ * appears in is the only place in this system where a column is written by
+ * reading its own current value, and a reviewer should be able to see the
+ * increment without parsing SQL inside a template literal.
+ */
+const ONE_MORE_PROBE = 1;
+
+/**
  * The columns the reservation writes, **taken from the schema objects rather
  * than typed as strings.**
  *
@@ -258,6 +268,99 @@ returning ${sql.identifier(issuanceAttempts.requestId.name)}`);
           : ReserveAttemptOutcome.OrderNotDelivering,
       observedStatus: observed?.status,
     };
+  }
+
+  /**
+   * **Count one re-probe** — §1.2's narrow `ON CONFLICT DO UPDATE`, and the one
+   * write the `probe` rung makes.
+   *
+   * Emitted SQL (copied from `.toSQL()`, §1.2's block letter for letter):
+   *
+   *   insert into "issuance_attempts"
+   *     ("id", "request_id", "order_id", "provider", "attempt", "status",
+   *      "probe_count", "code", "last_error", "created_at")
+   *   values (default, $1, $2, $3, $4, $5, $6, default, default, default)
+   *   on conflict ("request_id") do update
+   *     set "probe_count" = "issuance_attempts"."probe_count" + $7
+   *   returning "probe_count";
+   *   -- $5 = 'unknown' — always. A row is never born in any other state.
+   *   -- $6 = 1         — one ask. **Passed, never `default`**: migration 0002
+   *   --                  dropped the column default, so `default` raises 23502
+   *   --                  (`packages/db/src/schema/shop.ts`). The row exists
+   *   --                  because we are about to ask, so 1 is always the right
+   *   --                  first value — stated rather than assumed. Note that
+   *   --                  `probe_count` is the one column in the list with a
+   *   --                  bound value where its neighbours say `default`.
+   *   -- $7 = 1         — one more ask.
+   *   -- "id" default   => `GENERATED ALWAYS AS IDENTITY` refuses a *value* and
+   *   --                  accepts `DEFAULT`, which is why the builder's full
+   *   --                  column list is legal here where `reserveWithin`'s
+   *   --                  `INSERT … SELECT` could not be expressed at all.
+   *   -- 1 row  => ALWAYS. Unlike `DO NOTHING`, `DO UPDATE` returns the row on
+   *   --           both paths, which removes the follow-up SELECT that would
+   *   --           otherwise be needed to read the new count.
+   *
+   * ### `DO UPDATE` TOUCHES `probe_count` AND NOTHING ELSE
+   *
+   * That is the whole design of this statement, and the omission is the
+   * load-bearing part. On the probe path the row **may already say `ok`**: the
+   * supplier answered our previous ask, transaction B wrote the code, and this
+   * worker is one that had already decided to probe. A `SET status = 'unknown'`
+   * alongside the increment — the obvious thing to write, since every other
+   * column in the `VALUES` list is there — would erase the one fact worth
+   * having and un-deliver an order that had been delivered. So the `SET` clause
+   * names exactly one column, and the `VALUES` list exists only for the insert
+   * path that in practice never fires.
+   *
+   * ### Why the row is upserted rather than updated
+   *
+   * `UPDATE … SET probe_count = probe_count + 1 WHERE request_id = $1` would be
+   * shorter and would be a silent no-op on zero rows. The rung that reaches here
+   * was computed from a row that *was* read inside this transaction, so zero
+   * rows cannot happen — and if it ever did, the insert path leaves a truthful
+   * `unknown` row with one ask on it rather than a supplier call nobody wrote
+   * down. Same reason the reservation is written before the call: the record of
+   * an ask must exist before the ask.
+   *
+   * ### Counted before the call, not after
+   *
+   * This runs in the caller's transaction, which commits *before* the supplier
+   * is asked (§6: no transaction spans a supplier call). It counts **asks, not
+   * answers**, so a process killed mid-request leaves a truthful count with no
+   * `catch` having run. §1.2's accepted cost, stated so nobody optimises it
+   * away: a worker that dies before sending burns a probe. Incrementing
+   * afterwards would lose the count on exactly the failure it exists to count.
+   */
+  async countProbeWithin(
+    tx: Transaction,
+    orderId: string,
+    ask: IssuanceAsk,
+  ): Promise<number | undefined> {
+    const [probed] = await tx
+      .insert(issuanceAttempts)
+      .values({
+        requestId: ask.requestId,
+        orderId,
+        provider: ask.provider,
+        attempt: ask.attempt,
+        status: IssuanceAttemptStatus.Unknown,
+        probeCount: FIRST_PROBE_COUNT,
+      })
+      .onConflictDoUpdate({
+        target: issuanceAttempts.requestId,
+        // The table's own current value, not `excluded` — `excluded.probe_count`
+        // is the 1 this statement tried to insert, and would pin every probe at
+        // 2 for ever.
+        set: { probeCount: sql`${issuanceAttempts.probeCount} + ${ONE_MORE_PROBE}` },
+      })
+      .returning({ probeCount: issuanceAttempts.probeCount });
+
+    // `undefined` is unreachable: the statement returns its row on both the
+    // insert and the update path. Typed as optional anyway because the caller
+    // only logs it — a count that could not be read is not a reason to fail an
+    // issuance, and `noUncheckedIndexedAccess` would otherwise be silenced with
+    // a `!` here.
+    return probed?.probeCount;
   }
 
   /**

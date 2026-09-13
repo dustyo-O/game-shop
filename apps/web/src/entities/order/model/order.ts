@@ -85,7 +85,7 @@ export type Order =
       /**
        * Terminal, and the key below is final: reloading the page in a month
        * shows the same one (functional spec §2.4, last two criteria). The page
-       * stops polling here — see `isSettledOrderStatus` in `@game-shop/contracts`.
+       * stops polling here — see `isTerminalOrderStatus` in `@game-shop/contracts`.
        */
       readonly status: typeof OrderStatus.Delivered;
 

@@ -26,6 +26,29 @@ export class HttpError extends Error {
   }
 }
 
+/** Everything a `GET` may need beyond its path. */
+export interface GetOptions {
+  /**
+   * Cancels a read that is no longer wanted — see {@link getJson}.
+   */
+  readonly signal?: AbortSignal;
+
+  /**
+   * Extra request headers, spread **after** the default `Accept` so a caller
+   * could replace it, and typed as a plain record because that is what every
+   * call site has.
+   *
+   * **This is how the operator's `Authorization: Bearer …` reaches the wire**,
+   * and it is the whole of what this file knows about it. The token's value,
+   * where it is kept and when it is forgotten belong to
+   * `features/present-admin-token`; a transport that read a credential out of
+   * storage for itself would be a transport holding an opinion about who the
+   * caller is, on behalf of every endpoint. The same argument `postJson` makes
+   * about `Idempotency-Key`, for the same reason.
+   */
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
 /**
  * `GET` a JSON document.
  *
@@ -34,15 +57,23 @@ export class HttpError extends Error {
  * three are the same thing to a caller: the data did not arrive, show the
  * failure state.
  *
- * **`signal` cancels a read that is no longer wanted.** The order page's poll
- * passes one so that a request still in flight when the page goes away is
- * aborted rather than left to resolve — `fetch` then rejects with an
+ * **`options.signal` cancels a read that is no longer wanted.** The order
+ * page's poll passes one so that a request still in flight when the page goes
+ * away is aborted rather than left to resolve — `fetch` then rejects with an
  * `AbortError` (a `DOMException`), which the caller tells apart from a real
- * failure by checking `signal.aborted`. Optional because the two one-shot reads
- * in this app — the catalogue and an order creation — outlive nothing.
+ * failure by checking `signal.aborted`. Optional because the one-shot reads in
+ * this app — the catalogue, an order creation, the operator's recovery list —
+ * outlive nothing.
+ *
+ * An options object rather than positional parameters: the second reader of
+ * this function needs headers and not a signal, and
+ * `getJson(path, undefined, headers)` is a call site that has to be read twice.
  */
-export async function getJson(path: string, signal?: AbortSignal): Promise<unknown> {
-  const response = await fetch(path, { headers: { Accept: "application/json" }, signal });
+export async function getJson(path: string, options: GetOptions = {}): Promise<unknown> {
+  const response = await fetch(path, {
+    headers: { Accept: "application/json", ...options.headers },
+    signal: options.signal,
+  });
 
   if (!response.ok) {
     throw new HttpError(`GET ${path} responded ${String(response.status)}`, response.status);

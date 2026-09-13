@@ -246,9 +246,13 @@ interface OrderViewCore {
  * WHAT DECIDES WHETHER THE PAGE KEEPS POLLING
  * ---------------------------------------------------------------------------
  * `status`, and nothing else. The page polls this endpoint once a second while
- * the order is in flight and stops when it settles (technical-considerations
- * §2.6); *which* statuses those are is classified once, in
- * `@game-shop/contracts` — `isSettledOrderStatus` / `settledOrderStatuses`.
+ * the order is in flight, every five seconds while it is *recoverable*, and
+ * stops only when it is *terminal* (spec 003 §2.6, slice 6). It used to stop
+ * on `isSettledOrderStatus`, and that became wrong the moment
+ * `delivery_failed` joined the recoverable set: "settled" then named exactly
+ * the two states an operator can move, and a page that stopped there never
+ * saw the retry arrive. Which statuses are which is classified once, in
+ * `@game-shop/contracts` — `isTerminalOrderStatus` / `isRecoverableOrderStatus`.
  *
  * This response deliberately carries **no** `settled`, `final` or `polling`
  * boolean. A second copy of that classification on the wire is a second thing to

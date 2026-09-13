@@ -86,7 +86,9 @@
  * housekeeping, not the shopper's business, and it belongs to the admin sweep
  * (trigger 4), which exists to clear whatever the targeted triggers left.
  *
- * The page already stops polling on those states, so this costs almost nothing
+ * The page stops polling on the *terminal* states and slows to one read every
+ * five seconds on the *recoverable* ones (Phase 3 slice 6 — so an operator's
+ * retry reaches a page someone left open), so this costs almost nothing
  * either way — but "almost" is the wrong thing to build on: a bookmarked link
  * or a reload still reads a settled order, and a crawler or a monitor could
  * read one in a loop forever. Making the answer *never* rather than *rarely*

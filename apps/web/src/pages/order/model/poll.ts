@@ -2,7 +2,14 @@
  * The loop behind the order page's live updates: run something, wait, run it
  * again, and stop when it says so or when the page goes away
  * (technical-considerations §2.6 — *"the order page polls `GET /api/orders/:id`
- * every second while the order is in a non-terminal state"*).
+ * every second while the order is in a non-terminal state"*; spec 003
+ * technical-considerations §9.1 — a recoverable order is read more slowly, and
+ * the beat snaps back the moment it moves).
+ *
+ * How long the quiet between runs is, is the caller's decision, not this file's:
+ * the interval is handed in at construction and can be changed at any time
+ * through {@link Poll.setIntervalMs}. The loop only ever looks at it when it is
+ * about to schedule the next wait.
  *
  * ---------------------------------------------------------------------------
  * WHY IT LIVES IN THE PAGE SLICE
@@ -45,7 +52,10 @@ export const PollDecision = {
 export type PollDecision = (typeof PollDecision)[keyof typeof PollDecision];
 
 export interface PollOptions {
-  /** Quiet time between the end of one run and the start of the next. */
+  /**
+   * Quiet time between the end of one run and the start of the next, until
+   * {@link Poll.setIntervalMs} says otherwise.
+   */
   readonly intervalMs: number;
 
   /**
@@ -80,6 +90,24 @@ export interface Poll {
   readonly refreshNow: () => void;
 
   /**
+   * Change the quiet time between runs, from the next wait onwards.
+   *
+   * The order page uses this to read a recoverable order every five seconds
+   * instead of every one, and to **snap back to a second the moment a read
+   * shows the order moving again** (spec 003 technical-considerations §9.1).
+   *
+   * Takes effect when the next wait is scheduled, which is the only moment the
+   * loop reads the interval — so calling this from inside
+   * {@link PollOptions.run}, which is where the page calls it, sets the wait
+   * that follows that very run. It does not touch a wait that is already
+   * counting down: a page that wants a read *now* has {@link refreshNow}, and
+   * keeping the two apart is what keeps the no-overlap guarantee above intact —
+   * nothing here can start a run, it can only change how long the next one is
+   * away.
+   */
+  readonly setIntervalMs: (intervalMs: number) => void;
+
+  /**
    * Stop for good. Idempotent, and safe to call from anywhere — including from
    * inside {@link PollOptions.run}.
    *
@@ -110,6 +138,14 @@ export function createPoll(options: PollOptions): Poll {
   let isRunning = false;
   let isRefreshPending = false;
   let isStopped = false;
+
+  /**
+   * Read in exactly one place — `runOnce`, as it schedules the wait that
+   * follows it — and written from outside through `setIntervalMs`. Because it
+   * is never consulted mid-run, changing it cannot produce a second concurrent
+   * run or reorder answers; it can only lengthen or shorten the next quiet.
+   */
+  let intervalMs = options.intervalMs;
 
   function stop(): void {
     if (isStopped) {
@@ -168,7 +204,7 @@ export function createPoll(options: PollOptions): Poll {
     const runAgainImmediately = isRefreshPending;
     isRefreshPending = false;
 
-    scheduleIn(runAgainImmediately ? 0 : options.intervalMs);
+    scheduleIn(runAgainImmediately ? 0 : intervalMs);
   }
 
   return {
@@ -201,6 +237,10 @@ export function createPoll(options: PollOptions): Poll {
       }
 
       void runOnce();
+    },
+
+    setIntervalMs(nextIntervalMs: number): void {
+      intervalMs = nextIntervalMs;
     },
 
     stop,
