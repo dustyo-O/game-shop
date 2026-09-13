@@ -1,14 +1,31 @@
 /**
- * The whole stylesheet, and it is meant to stay this small.
+ * The order page, the operator's recovery page, and the buy feature's failure
+ * message — and it is meant to stay this small.
  *
- * Phase 1's pages are explicitly plain (functional spec §3); Phase 4 replaces
- * the storefront with the one built from the design and brings its own styles.
- * Everything here exists only so twelve rows are legible — spacing, a readable
- * measure, and a visible boundary between items. No colours beyond the
- * browser's, no fonts to download, no layout that would have to be undone.
+ * This is NOT the storefront's sheet. The shop's front page at `/` is
+ * `pages/storefront/`, and its styles live in
+ * `pages/storefront/ui/storefront.css`, imported by that page's module. Phase
+ * 1's `.catalog*` rules went with the page they dressed, and its
+ * `.product-card*` rules moved into that sheet — they had to: a card rule left
+ * here would have landed on the storefront's cards as well.
  *
- * The order page's rules are plainer still, and permanently: Phase 4 redresses
- * the storefront and leaves the status page alone, because
+ * ---------------------------------------------------------------------------
+ * THIS FILE MUST STAY FREE OF STOREFRONT RULES, AND MUST NEVER GAIN A
+ * `body`-LEVEL RULE BEYOND THE ONE BELOW
+ * ---------------------------------------------------------------------------
+ * Placement does not scope CSS. `app/router.ts` imports every page statically,
+ * so both sheets — this one and `storefront.css` — are in every route's
+ * bundle: this file is on `/`, and the storefront's is on `/order/:id` and
+ * `/admin/recovery` (spec 004 technical-considerations §2.6, R4). What keeps
+ * each off the other's pages is selectors alone. So nothing here may start
+ * with `.storefront`, `.header`, `.banner`, `.product-card` or any other
+ * storefront-owned block, and the only element-level rule is the
+ * `body { margin; font-family; line-height }` below, which the storefront
+ * deliberately inherits — a second `body`, `html` or `*` declaration here
+ * would reach the storefront as surely as its rules would reach here.
+ *
+ * The order page's rules are plain, and permanently so: Phase 4 redressed the
+ * storefront and left the status page alone, because spec 001's
  * technical-considerations §2.6 gives it a working view and nothing more.
  */
 
@@ -16,54 +33,6 @@ body {
   margin: 0;
   font-family: system-ui, sans-serif;
   line-height: 1.5;
-}
-
-.catalog {
-  max-width: 40rem;
-  margin: 0 auto;
-  padding: 1.5rem 1rem 3rem;
-}
-
-.catalog__title {
-  font-size: 1.5rem;
-}
-
-.catalog__status {
-  padding: 1rem 0;
-}
-
-.catalog__list {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-}
-
-.product-card {
-  padding: 0.75rem 0;
-  border-top: 1px solid #ddd;
-}
-
-.product-card__name {
-  margin: 0;
-  font-size: 1rem;
-}
-
-.product-card__price {
-  margin: 0.25rem 0 0.5rem;
-}
-
-.product-card__buy {
-  font: inherit;
-  padding: 0.4rem 1rem;
-  cursor: pointer;
-}
-
-/* While the order is being created. The control is disabled for the length of
-   the request (see features/buy-product), and this is the only sign a shopper
-   would otherwise get that pressing it did something. */
-.product-card__buy:disabled {
-  cursor: default;
-  opacity: 0.6;
 }
 
 /* A failed purchase, next to the control that failed. Red because it is the one

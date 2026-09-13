@@ -22,8 +22,12 @@
  *
  * And it stays *inside* the slice rather than in `shared/lib`, even though not a
  * line of it mentions an order: shared code earns its place by being used twice,
- * and this is used once. The catalogue does not poll and neither does anything
- * else. When a second page needs it, this file moves down a layer unchanged.
+ * and this is used once. The storefront does not poll and neither does anything
+ * else. The second page to want a timer — the storefront's banner — wants a
+ * different one: a countdown that waits before its first tick, can pause,
+ * resume and restart, and comes back on `pageshow`, none of which this loop
+ * does or should. It keeps its own rather than share this file, because one
+ * abstraction over both would blur the contract documented below.
  *
  * ---------------------------------------------------------------------------
  * WHY `setTimeout` AFTER EACH RUN AND NOT `setInterval`

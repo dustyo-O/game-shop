@@ -3,14 +3,8 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!--
-      An empty data URI, not an icon. The browser requests /favicon.ico on its
-      own whether or not anything asks it to, and with no file there it logs a
-      404 into every console session — noise that hides the errors worth seeing.
-      This satisfies the request without shipping an asset. Phase 4 brings the
-      real artwork and replaces this line.
-    -->
-    <link rel="icon" href="data:," />
+    <!-- Safari ignores SVG favicons and requests /favicon.ico instead; that single 404 in Safari only is accepted. -->
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
     <title>Магазин</title>
   </head>
   <body>

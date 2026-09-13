@@ -2,9 +2,11 @@
  * One catalogue item on the shop page: name, price, and — only where the
  * catalogue allows buying — a «Купить» control (functional spec §2.1).
  *
- * This is Phase 1's plain version. Appearance is explicitly out of scope
- * (functional spec §3, "Plain, functional pages"), and Phase 4 replaces the
- * whole storefront with the one built from the design.
+ * Still Phase 1's plain markup — name, price, «Купить» — but it now renders
+ * inside the storefront's «Популярные товары» row (`pages/storefront/`), which
+ * replaced the catalogue page in Phase 4, and it is styled by that page's
+ * `storefront.css` and nothing else. The image and the `__media` / `__body`
+ * markup arrive in Slice 5 of that phase; until then there is no `<img>` here.
  */
 import { createElement } from "../../../shared/lib/dom.js";
 import { formatPrice } from "../../../shared/lib/format-price.js";

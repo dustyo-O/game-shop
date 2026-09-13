@@ -4,7 +4,16 @@
     "noEmit": true,
     "module": "ESNext",
     "moduleResolution": "bundler",
-    "types": ["node"]
+    "types": ["node"],
+
+    // DOM only for this Node-side config's benefit: `e2e/**` runs under
+    // Node/Playwright, never in a bundle, but `page.evaluate(() => ...)`
+    // callbacks are still ordinary TypeScript in this file and reference
+    // browser globals (`document`, `window`, `NodeFilter`) that only exist
+    // once the callback is serialised into the page. `tsconfig.json` (the
+    // app bundle) still carries `types: []` and is untouched by this file,
+    // so it never sees Playwright or Node — see that file's own comment.
+    "lib": ["ES2023", "DOM", "DOM.Iterable"]
   },
-  "include": ["vite.config.ts"]
+  "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts", "e2e"]
 }

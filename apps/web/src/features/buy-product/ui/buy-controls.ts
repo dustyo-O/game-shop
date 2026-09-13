@@ -16,10 +16,10 @@
  * shopper clicks one* — a request, an in-flight state, two Russian failure
  * sentences and a navigation. They change for different reasons: the page
  * changes when the catalogue does, this changes when creating an order does.
- * Phase 4 replaces the catalogue page wholesale with the storefront built from
- * the design, and that page has «Купить» controls too — behaviour left on the
- * page is behaviour rewritten then, while a feature is one call from the new
- * page.
+ * Phase 4 replaced the catalogue page wholesale with `pages/storefront/`, the
+ * storefront built from the design, and that page has «Купить» controls too —
+ * behaviour left on the old page would have been behaviour rewritten then,
+ * while this feature was one call from the new page.
  *
  * The project prefers light ceremony, and the ceremony here is genuinely light:
  * two files, one public function, no config and no model segment invented for

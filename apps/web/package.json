@@ -8,14 +8,19 @@
     "dev": "vite",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
     "clean": "rm -rf dist"
   },
   "dependencies": {
     "@game-shop/contracts": "workspace:*"
   },
   "devDependencies": {
+    "@game-shop/db": "workspace:*",
+    "@playwright/test": "1.63.0",
     "@types/node": "^22.18.8",
     "typescript": "^5.9.3",
-    "vite": "^7.1.9"
+    "vite": "^7.1.9",
+    "vitest": "^5.0.0"
   }
 }

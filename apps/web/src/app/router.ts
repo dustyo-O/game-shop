@@ -36,14 +36,14 @@
  * discovery made by a broken link after deploy.
  */
 import { createAdminRecoveryPage } from "../pages/admin-recovery/index.js";
-import { createCatalogPage } from "../pages/catalog/index.js";
 import { createOrderPage } from "../pages/order/index.js";
+import { createStorefrontPage } from "../pages/storefront/index.js";
 
 /**
  * `/order/{id}`, with an optional trailing slash. `[^/]+` rather than a
  * `ord_`-plus-ULID shape on purpose: matching the *format* of an id here would
  * be a second place that has to stay true of every id the shop has ever issued,
- * and it would answer a bad id by falling through to the catalogue. Anything in
+ * and it would answer a bad id by falling through to the storefront. Anything in
  * the slot is taken as an id and handed to the API, which answers `404`, and the
  * shopper reads «Заказ не найден» — the sentence functional spec §2.6 asks for.
  */
@@ -102,8 +102,8 @@ function decodeSegment(segment: string): string {
  * "page not found" screen, and that is a decision rather than an omission: the
  * shop has one address a shopper can mistype into something else, `/order/…`,
  * and that case already has its own Russian message from the API's `404`. A
- * mistyped `/shp` landing on the catalogue is a shopper who is where they wanted
- * to be anyway.
+ * mistyped `/shp` landing on the storefront is a shopper who is where they
+ * wanted to be anyway.
  */
 export function resolveRoute(pathname: string): HTMLElement {
   if (adminRecoveryPathPattern.test(pathname)) {
@@ -118,5 +118,5 @@ export function resolveRoute(pathname: string): HTMLElement {
     return createOrderPage(decodeSegment(orderMatch[1] ?? ""));
   }
 
-  return createCatalogPage();
+  return createStorefrontPage();
 }
