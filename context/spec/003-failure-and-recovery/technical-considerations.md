@@ -1,7 +1,7 @@
 # Technical Considerations: Failure and Recovery
 
 - **Spec:** `003-failure-and-recovery`
-- **Status:** Draft
+- **Status:** Completed
 - **Architecture:** `context/product/architecture.md` §3 (invariants I1–I9), §3.1 (their SQL), §4 (retry policy), §5 (runtime), §8 (errors), §9 (trade-offs)
 
 > **On the SQL in this document.** `architecture.md` §3.1 now requires its blocks to be copied from the code's `.toSQL()` output rather than written by hand, because I1 and I2 drifted that way once. The same rule applies here: every block below is either a measured statement (§2, §5) or a shape the query builder will emit and must be re-copied once the code exists.

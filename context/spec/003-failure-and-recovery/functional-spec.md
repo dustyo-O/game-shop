@@ -1,7 +1,7 @@
 # Functional Specification: Failure and Recovery
 
 - **Roadmap Item:** Phase 3 — Unreliable Suppliers, Handled; Recoverable, Not Broken
-- **Status:** Draft
+- **Status:** Completed
 - **Author:** Alexander Shleyko
 
 ---

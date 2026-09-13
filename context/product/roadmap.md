@@ -51,15 +51,15 @@ _Concepts to walk away able to explain: at-least-once delivery, idempotency keys
 
 _Failure and recovery. Suppliers are unreliable on purpose here, and the most valuable trap in the whole assignment lives in this phase._
 
-- [ ] **Unreliable Suppliers, Handled** _(~2h)_
-  - [ ] **Two Supplier Stubs:** A primary and a fallback, each able to fail outright or hang past a timeout at configurable rates, so every failure scenario can be reproduced on demand.
-  - [ ] **Same Request, Same Code:** A repeated request carrying the same identifier returns the identical code rather than issuing a new one — the property that makes safe retrying possible at all.
-  - [ ] **Ambiguous Timeouts Handled Correctly:** A timeout is treated as *unknown*, never as *failed*. The system retries the same supplier with the same request identifier to discover what actually happened, and only falls through to the backup after a definite failure. This is the difference between one key issued and two.
+- [x] **Unreliable Suppliers, Handled** _(~2h)_
+  - [x] **Two Supplier Stubs:** A primary and a fallback, each able to fail outright or hang past a timeout at configurable rates, so every failure scenario can be reproduced on demand.
+  - [x] **Same Request, Same Code:** A repeated request carrying the same identifier returns the identical code rather than issuing a new one — the property that makes safe retrying possible at all.
+  - [x] **Ambiguous Timeouts Handled Correctly:** A timeout is treated as *unknown*, never as *failed*. The system retries the same supplier with the same request identifier to discover what actually happened, and only falls through to the backup after a definite failure. This is the difference between one key issued and two.
 
-- [ ] **Recoverable, Not Broken** _(~1.5h)_
-  - [ ] **Graceful Stock Exhaustion:** An order paid against an empty pool lands in a recoverable state instead of crashing, and the buyer is told the truth about it.
-  - [ ] **Admin Recovery View:** A working list of paid-but-undelivered orders with a retry action, so a human can resolve stuck orders after restocking. No design, no real authentication.
-  - [ ] **Safe Re-Issuance:** Retrying a recovered order yields exactly one key, however many times the button is pressed. Settles acceptance criterion 4.
+- [x] **Recoverable, Not Broken** _(~1.5h)_
+  - [x] **Graceful Stock Exhaustion:** An order paid against an empty pool lands in a recoverable state instead of crashing, and the buyer is told the truth about it.
+  - [x] **Admin Recovery View:** A working list of paid-but-undelivered orders with a retry action, so a human can resolve stuck orders after restocking. No design, no real authentication.
+  - [x] **Safe Re-Issuance:** Retrying a recovered order yields exactly one key, however many times the button is pressed. Settles acceptance criterion 4.
 
 _Concepts to walk away able to explain: why a timeout is not a failure, how to recover from a partially-completed operation, and how the fallback rule prevents double issuance._
 

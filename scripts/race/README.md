@@ -432,7 +432,7 @@ All optional, all with working defaults.
 | --- | --- | --- |
 | `RACE_BASE_URLS` | unset | Set → external mode: use these targets, build and spawn nothing. Unset → local mode. |
 | `RACE_INSTANCES` | `4` | Local instances to start — the number `architecture.md` §7's measurement used. |
-| `RACE_BASE_PORT` | `4601` | First port. Clear of `pnpm dev` (3000, 5173) and every port the Vitest suites bind (4101, 4201, 4301, 4401, 4501–4504). Moved from 4201 in Phase 2 when it turned out to collide with `test/acceptance/purchase-and-key-delivery.test.ts`, which binds that exact port. |
+| `RACE_BASE_PORT` | `4601` | First port. Clear of `pnpm dev` (3000, 5173) and every port the Vitest suites bind (4101–4104, 4201, 4301, 4401–4402, 4501–4504, 4701–4704, 4801–4804, 4901). Moved from 4201 in Phase 2 when it turned out to collide with `test/acceptance/purchase-and-key-delivery.test.ts`, which binds that exact port — and this list lagged again in Phase 3, when `test/concurrency/supplier-refusal-and-recovery.test.ts` bound 4601–4604 for two slices before the acceptance slice noticed; that suite moved to 4701. |
 | `RACE_SKIP_BUILD` | unset | Skip the rebuild. Faster to iterate, and **wrong for RED validation** — the spawned processes run `dist/`. |
 | `RACE_CHECK_TIMEOUT_MS` | `180000` | Per check. A hung check is killed and reported as a failure rather than hanging the run. |
 | `RACE_VERBOSE` | unset | Stream each instance's stdout too, not just its stderr. |

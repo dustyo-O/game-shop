@@ -1,10 +1,27 @@
 // @layer: unit
 // @spec: 002-single-issuance-under-races
+// @spec: 003-failure-and-recovery
 // @regression
 /**
  * Functional spec §2.8's one testable fact for this phase: *"When the shopper
  * reads any text this phase adds or changes, then that text is in Russian, as
  * established in spec 001 §2.8."*
+ *
+ * ---------------------------------------------------------------------------
+ * EXTENDED FOR SPEC 003 §2.9, RATHER THAN DUPLICATED
+ * ---------------------------------------------------------------------------
+ * Spec 003 adds a second table of shopper-facing text —
+ * `apps/web/src/entities/order/lib/order-recovery-explanation.ts`, the
+ * sentence under the status line for `out_of_stock` and `delivery_failed`
+ * (technical-considerations §9.2) — and functional spec §2.9's own words are
+ * "any text this phase adds **or changes**", which names it directly. The
+ * spec 003 task brief ("check the contracts/labels the way this file does,
+ * extend it rather than duplicate if that's cleaner") is followed literally
+ * below: same regex-over-source-text technique, same "do not import what you
+ * are checking" stance, second `describe` block rather than a second file.
+ * The second `@spec` line above is deliberate — this file now carries
+ * regression coverage for both specs' §2.8/§2.9, and `/awos:regression`'s
+ * grep for either spec's tag finds it.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS IS WORTH A TEST NOW, WHEN SPEC 001'S SUITE ONLY "VERIFIED BY
@@ -44,7 +61,7 @@ import { dirname, resolve } from "node:path";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-import { orderStatuses } from "@game-shop/contracts";
+import { orderStatuses, recoverableOrderStatuses } from "@game-shop/contracts";
 import { describe, expect, it } from "vitest";
 
 const TEST_DIR = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +81,20 @@ const ORDER_STATUS_LABEL_FILE = resolve(
   "order",
   "lib",
   "order-status-label.ts",
+);
+
+/** Same directory as {@link ORDER_STATUS_LABEL_FILE}, spec 003's second table (technical-considerations §9.2). */
+const ORDER_RECOVERY_EXPLANATION_FILE = resolve(
+  TEST_DIR,
+  "..",
+  "..",
+  "..",
+  "web",
+  "src",
+  "entities",
+  "order",
+  "lib",
+  "order-recovery-explanation.ts",
 );
 
 /**
@@ -118,3 +149,92 @@ describe("functional spec §2.8 — every order status label is in Russian", () 
     expect(distinct.size, `labels: ${JSON.stringify(labels)}`).toBe(labels.length);
   });
 });
+
+/**
+ * §2.3's fourth criterion, shopper-visible: both recoverable explanations open
+ * with the same reassurance that the payment was not lost. Checked as a
+ * literal prefix rather than a Cyrillic-content scan, because this property is
+ * about the two sentences *agreeing* with each other, not about either one's
+ * script.
+ */
+const PAYMENT_RETAINED_PREFIX = "Оплата прошла";
+
+describe(
+  "functional spec §2.3 criterion 2 & §2.9 — the recovery explanation for each recoverable status is in " +
+    "Russian, distinguishable, and opens by confirming the payment was not lost",
+  () => {
+    const source = readFileSync(ORDER_RECOVERY_EXPLANATION_FILE, "utf8");
+    const explanations = extractLabels(source);
+
+    // @regression
+    it(
+      "the explanation table defines exactly one entry per RECOVERABLE status (out_of_stock, delivery_failed) " +
+        "— none missing, none duplicated, and none for a status that needs no apology",
+      () => {
+        // `order-recovery-explanation.ts` is typed
+        // `Readonly<Record<RecoverableOrderStatus, string>>` — total over
+        // `recoverableOrderStatuses`, not the whole `OrderStatus` union (see
+        // that file's own header for why `delivered`/`payment_failed`/etc.
+        // are deliberately absent). This is the same "the compiler already
+        // enforces it; this independent read confirms it agrees" stance the
+        // block above takes for `order-status-label.ts`.
+        expect(
+          explanations.length,
+          `found ${String(explanations.length)} explanation entries in ${ORDER_RECOVERY_EXPLANATION_FILE}`,
+        ).toBe(recoverableOrderStatuses.length);
+      },
+    );
+
+    // @regression
+    it("every recovery explanation is non-empty and contains a Cyrillic character (functional spec §2.9)", () => {
+      for (const [index, explanation] of explanations.entries()) {
+        expect(explanation.length, `explanation #${String(index)} ("${explanation}") is empty`).toBeGreaterThan(0);
+        expect(
+          CYRILLIC_PATTERN.test(explanation),
+          `explanation #${String(index)} ("${explanation}") has no Cyrillic character`,
+        ).toBe(true);
+      }
+    });
+
+    // @regression
+    it(
+      "out_of_stock and delivery_failed read differently from each other — functional spec §2.3's second " +
+        "criterion, that a shopper can tell the two failures apart",
+      () => {
+        const distinct = new Set(explanations);
+        expect(distinct.size, `explanations: ${JSON.stringify(explanations)}`).toBe(explanations.length);
+      },
+    );
+
+    // @regression
+    it(
+      'both explanations open with «Оплата прошла» — functional spec §2.3\'s fourth criterion, that the ' +
+        "payment stays recorded rather than being discarded, said to the shopper in the first words they read",
+      () => {
+        for (const [index, explanation] of explanations.entries()) {
+          expect(
+            explanation.startsWith(PAYMENT_RETAINED_PREFIX),
+            `explanation #${String(index)} ("${explanation}") does not open with "${PAYMENT_RETAINED_PREFIX}"`,
+          ).toBe(true);
+        }
+      },
+    );
+
+    // @regression
+    it(
+      "negative — neither explanation promises a refund or an email, both of which spec 003 §3 puts " +
+        "out of scope and the shop cannot deliver",
+      () => {
+        const outOfScopePromises = [/возврат/iu, /email/iu, /электронн\w*\s+почт/iu];
+        for (const [index, explanation] of explanations.entries()) {
+          for (const pattern of outOfScopePromises) {
+            expect(
+              pattern.test(explanation),
+              `explanation #${String(index)} ("${explanation}") appears to promise something spec 003 §3 rules out (matched ${pattern.toString()})`,
+            ).toBe(false);
+          }
+        }
+      },
+    );
+  },
+);

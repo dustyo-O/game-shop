@@ -110,9 +110,9 @@ const API_ROOT = resolve(TEST_DIR, "..", "..");
 /** The repository root — where `pnpm run build:packages` resolves from. */
 const REPO_ROOT = resolve(API_ROOT, "..", "..");
 
-/** Four real processes — see this file's header. Ports clear of every other concurrency suite's range. */
+/** Four real processes — see this file's header. 4701-4704: clear of every other suite's range AND of `pnpm race`'s default 4601-4604 (`scripts/race/run-checks.ts`), which this suite bound until Phase 3 slice 9 noticed the collision. */
 const PROCESS_COUNT = 4;
-const BASE_PORT = 4601;
+const BASE_PORT = 4701;
 
 /** The full pool size — `packages/db/src/fixtures/supplier-key-pool.ts`. */
 const KEY_POOL_SIZE = 50;

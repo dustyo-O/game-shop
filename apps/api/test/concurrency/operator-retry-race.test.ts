@@ -99,7 +99,7 @@ const REPO_ROOT = resolve(API_ROOT, "..", "..");
  * Four real processes — the number this slice's own task names ("verify
  * across four processes"), and the same number `./key-claim-race.test.ts` and
  * `./supplier-refusal-and-recovery.test.ts` use. Ports clear of every other
- * concurrency suite's range (4101, 4401, 4501, 4601).
+ * concurrency suite's range (4101, 4401, 4501, 4701).
  */
 const PROCESS_COUNT = 4;
 const BASE_PORT = 4801;

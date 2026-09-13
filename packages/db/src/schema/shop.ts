@@ -593,9 +593,14 @@ export const issuanceAttempts = pgTable(
      * count lives in a column and the retry ladder bounds it with
      * `SUPPLIER_MAX_PROBES_PER_REQUEST` (spec 003 technical-considerations §1.2).
      *
-     * It counts **asks, not answers**: it is incremented before the call and
-     * outside any transaction, so a process killed mid-request leaves a truthful
-     * count with no `catch` having had to run. Accepted cost — a worker that
+     * It counts **asks, not answers**: it is incremented before the call, inside
+     * the same short transaction that reads the ladder's inputs under the order
+     * row lock and commits before the supplier is contacted — so the count that
+     * bounds the loop is committed before the next pass reads it, and a process
+     * killed mid-request still leaves a truthful count with no `catch` having
+     * had to run. (An earlier version of this comment said "outside any
+     * transaction"; the increment was moved into the silence transaction when
+     * the probe rung landed, and the walkthrough for that slice records why.) Accepted cost — a worker that
      * dies before sending burns a probe; incrementing afterwards would lose the
      * count on exactly the failure the column exists to count.
      *

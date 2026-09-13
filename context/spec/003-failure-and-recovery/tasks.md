@@ -1,7 +1,7 @@
 # Tasks: Failure and Recovery
 
 - **Spec:** `003-failure-and-recovery`
-- **Functional:** `functional-spec.md` — 9 requirements, 38 acceptance criteria
+- **Functional:** `functional-spec.md` — 9 requirements, 40 acceptance criteria
 - **Technical:** `technical-considerations.md` — 12 sections, 12 risks, 10 assumptions
 
 > **Standing requirement.** Every slice ends with a task explaining to the user how that feature works and its role among the key points of the test task. This is a deliverable, not a courtesy: the assignment grades «способность объяснить решения».
@@ -86,19 +86,19 @@
   - [x] Verify: run the whole set twice with no tidying between, confirm 8/8 both times, and confirm the new checks skip or run honestly against a single external base URL. Delete temporary artifacts. **[Agent: testing-expert]**
   - [x] Explain to the user how this concrete feature works and what its role is among the key points of the test task in particular — here: which of the assignment's five adversarial scenarios are now settled and runnable, and what each new check's RED result actually proves. **[Agent: nestjs-backend]**
 
-- [ ] **Slice 8: The walkthrough of what was built**
+- [x] **Slice 8: The walkthrough of what was built**
 
   > §2.8. A deliverable of the phase, not documentation overhead.
 
-  - [ ] Write `docs/walkthrough/phase-3.md` covering the three required keystones: why an unanswered request is not a failed one; why asking the same supplier again is safe while asking a different one is not; and how a purchase can be recovered long after it went wrong. Each entry states the decision, the more obvious alternative, what breaks without it, and — where a guarantee is enforced by the records — the exact statement and what zero returned rows means. Match the existing phase walkthroughs and cite the per-slice ones rather than re-deriving them. **[Agent: nestjs-backend]**
-  - [ ] Review it against §2.8's criteria in two passes: first reading **only** the walkthrough, standing in for a reader who has never seen the source, listing every term that carries load without being explained; then opening the source to fact-check its SQL, constraint names and numbers. Revise what genuinely fails a criterion; do not rewrite for taste. **[Agent: general-purpose]**
-  - [ ] Explain to the user how this concrete feature works and what its role is among the key points of the test task in particular — here: how Phase 3's keystones complete the argument Phases 1 and 2 built, and which interview question each answers. Update `docs/walkthrough/phases-1-and-2.md` into `phases-1-to-3.md`, or extend it, so the question→answer index stays the single map. **[Agent: general-purpose]**
+  - [x] Write `docs/walkthrough/phase-3.md` covering the three required keystones: why an unanswered request is not a failed one; why asking the same supplier again is safe while asking a different one is not; and how a purchase can be recovered long after it went wrong. Each entry states the decision, the more obvious alternative, what breaks without it, and — where a guarantee is enforced by the records — the exact statement and what zero returned rows means. Match the existing phase walkthroughs and cite the per-slice ones rather than re-deriving them. **[Agent: nestjs-backend]**
+  - [x] Review it against §2.8's criteria in two passes: first reading **only** the walkthrough, standing in for a reader who has never seen the source, listing every term that carries load without being explained; then opening the source to fact-check its SQL, constraint names and numbers. Revise what genuinely fails a criterion; do not rewrite for taste. **[Agent: general-purpose]**
+  - [x] Explain to the user how this concrete feature works and what its role is among the key points of the test task in particular — here: how Phase 3's keystones complete the argument Phases 1 and 2 built, and which interview question each answers. Update `docs/walkthrough/phases-1-and-2.md` into `phases-1-to-3.md`, or extend it, so the question→answer index stays the single map. **[Agent: general-purpose]**
 
-- [ ] **Slice 9: Feature Testing & Regression**
+- [x] **Slice 9: Feature Testing & Regression**
 
   > Verifies the whole feature end-to-end against functional-spec.md, run after all implementation slices are complete.
-  - [ ] Read functional-spec.md acceptance criteria in full. Generate acceptance-level tests that verify the entire feature as a whole — not individual slices. Cover applicable layers (unit for pure logic, integration for service interactions, e2e for user flows) based on the project's testing stack. Annotate each test with `@spec: 003-failure-and-recovery` and `@regression` if suitable for long-term regression. **[Agent: testing-expert]**
+  - [x] Read functional-spec.md acceptance criteria in full. Generate acceptance-level tests that verify the entire feature as a whole — not individual slices. Cover applicable layers (unit for pure logic, integration for service interactions, e2e for user flows) based on the project's testing stack. Annotate each test with `@spec: 003-failure-and-recovery` and `@regression` if suitable for long-term regression. **[Agent: testing-expert]**
     - _On RED validation here: the implementation is already complete, so "write it failing first" is not available. Demonstrate instead that each test **can** fail by a method that does not modify production source — inverting an expectation, or pointing the assertion at a scenario the shop genuinely does not satisfy. Slices 3, 6 and 7 already establish RED by weakening production code; do not repeat that here._
     - _Mark honestly what is not testable at this layer rather than covering it with an adjacent assertion. A coverage table whose every row says "covered" is a table nobody checked._
-  - [ ] Run all generated tests. All must pass. Fix any failures before proceeding. **[Agent: testing-expert]**
-  - [ ] Explain to the user how this concrete feature works and what its role is among the key points of the test task in particular — here: what the suite covers, what it deliberately does not, and where each uncovered criterion was actually verified. **[Agent: nestjs-backend]**
+  - [x] Run all generated tests. All must pass. Fix any failures before proceeding. **[Agent: testing-expert]**
+  - [x] Explain to the user how this concrete feature works and what its role is among the key points of the test task in particular — here: what the suite covers, what it deliberately does not, and where each uncovered criterion was actually verified. **[Agent: nestjs-backend]**
