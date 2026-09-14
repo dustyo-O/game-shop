@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="456" height="304" viewBox="0 0 456 304" role="img" aria-label="PlayStation — PlayStation Store карта 1000 ₽">
+  <!-- GIFT- palette. Rendered to public/assets/psn.png by ../render-card-art.ts; text only, no logos. -->
+  <style>
+    text { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; fill: #fff; text-anchor: middle; }
+    .brand { font-size: 64px; font-weight: 700; letter-spacing: -1px; }
+    .name { font-size: 24px; font-weight: 400; opacity: 0.85; }
+  </style>
+  <rect width="456" height="304" fill="#1d6b45"/>
+  <text class="brand" x="228" y="152">PlayStation</text>
+  <text class="name" x="228" y="198">PlayStation Store карта 1000 ₽</text>
+</svg>

@@ -69,16 +69,16 @@ _Concepts to walk away able to explain: why a timeout is not a failure, how to r
 
 _The storefront. With the engine proven, the product gets the face the assignment asked for. Structurally close to the mockup; pixel-perfect explicitly not required._
 
-- [ ] **Storefront per the Design** _(~2.5h)_
-  - [ ] **Page Structure:** Header, banner, service icon row, Steam top-up block and one product row, matching the mockup's structure. Reviews, footer, mobile and dark variants are out.
-  - [ ] **Banner Carousel:** Advances automatically and by arrows, with active position indicators. _(Required interaction 1)_
-  - [ ] **Catalog Menu:** Opens on click, closes on a second click or a click outside. Column detail may be simplified — menu accuracy is explicitly not graded. _(Required interaction 2)_
-  - [ ] **Currency Toggle:** The $/₸/₽ control changes its active state on click. No amount recalculation — the assignment waives it, and the mockup's ₽/$ mismatch stays as-is. _(Required interaction 3)_
-  - [ ] **Service Icon Hover:** A smooth highlight on hover across the service row. _(Required interaction 4)_
-  - [ ] **Product Card Hover:** A light lift — shadow, raise or outline, to taste. _(Required interaction 5)_
+- [x] **Storefront per the Design** _(~2.5h)_
+  - [x] **Page Structure:** Header, banner, service icon row, Steam top-up block and one product row, matching the mockup's structure. Reviews, footer, mobile and dark variants are out.
+  - [x] **Banner Carousel:** Advances automatically and by arrows, with active position indicators. _(Required interaction 1)_
+  - [x] **Catalog Menu:** Opens on click, closes on a second click or a click outside. Column detail may be simplified — menu accuracy is explicitly not graded. _(Required interaction 2)_
+  - [x] **Currency Toggle:** The $/₸/₽ control changes its active state on click. No amount recalculation — the assignment waives it, and the mockup's ₽/$ mismatch stays as-is. _(Required interaction 3)_
+  - [x] **Service Icon Hover:** A smooth highlight on hover across the service row. _(Required interaction 4)_
+  - [x] **Product Card Hover:** A light lift — shadow, raise or outline, to taste. _(Required interaction 5)_
 
-- [ ] **Connecting Face to Engine** _(~0.5h)_
-  - [ ] **Buy Through to Delivery:** Купить on the real card runs the Phase 1 pipeline, and the status page carries the buyer to their key.
+- [x] **Connecting Face to Engine** _(~0.5h)_
+  - [x] **Buy Through to Delivery:** Купить on the real card runs the Phase 1 pipeline, and the status page carries the buyer to their key.
 
 _Concepts to walk away able to explain: which interactions were graded and why the rest was deliberately left static._
 

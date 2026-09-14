@@ -42,18 +42,54 @@
  * and the overlay's text columns are `auto-fit`. No `min-width` and no
  * `overflow-x` anywhere.
  *
- * Hover transitions, `:hover` and `:focus-visible` rules and the
- * reduced-motion query belong to Slice 4; this sheet has none. The currency
- * control's `:checked` / `:focus-visible` pairing is state, not motion, and is
- * here.
+ * ---------------------------------------------------------------------------
+ * MOTION: THREE DURATIONS, ONE REDUCED-MOTION RULE, NO OUTLINE RESET
+ * ---------------------------------------------------------------------------
+ * Every hover state in this sheet fades rather than switching (functional spec
+ * §2.5 and §2.6 say "fades in", "animates rather than switching instantly"),
+ * and there are exactly three durations, from technical-considerations §2.6:
+ *   160 ms — the service tiles (`background-color`, `box-shadow`);
+ *   180 ms — the product cards (`transform`, `box-shadow`: the lift);
+ *   120 ms — every other control: chips, the Каталог pill, the search and
+ *            profile buttons, the banner arrows and dots, the Steam block's
+ *            pay and promo buttons, the currency labels, Купить, and the
+ *            overlay's categories.
+ * Each control's `transition` names only the properties its hover changes, so
+ * nothing else on it ever animates by accident. Three things are deliberately
+ * NOT transitions: the slide change (a `hidden` swap — the spec says the next
+ * slide "appears at once", and a crossfade with a tick landing mid-fade of an
+ * arrow press is a state to get wrong for no graded gain; so `.banner__slide`
+ * has no `transition`), the dot's width (state, painted instantly), and the
+ * overlay's open/close (`hidden`, instant).
+ *
+ * `:focus-visible` shares every `:hover` rule but one (the currency label's —
+ * its keyboard state is the `:checked`/`:focus-visible + label` ring), and the card uses
+ * `:focus-within` so the keyboard user on Купить gets the same lift as the
+ * pointer. Nothing here resets `outline` to none or to zero — the browser's
+ * own ring stays on every control, and the only `outline` rule in the sheet
+ * *adds* one (the currency label, whose radio is off screen).
+ *
+ * `@media (prefers-reduced-motion: reduce)` drops the `transform` half of the
+ * card lift and nothing else (R11): the colour and shadow fades stay, because
+ * a fade is not motion, and §2.5/§2.6 accept "a raised shadow, an outline, or
+ * a rise". The banner's auto-advance is untouched by that query — the spec
+ * mandates it, and the pointer pause is its stop mechanism.
+ *
+ * Two hover shades appear as literals rather than tokens: `#3a3a3f` (ink, a
+ * step lighter — already the Каталог pill's pressed colour) for the black
+ * controls, and `#e4e4e8` (ground, a step darker) for the grey ones. They
+ * are hover-only, so they stay out of the seven tokens §2.6 lists.
  */
 
 /* --- The page frame ------------------------------------------------------- */
 
-/* The six tokens, scoped here rather than on `:root` so "no tokens" stays true
-   for the rest of the app. Colours: the grey of fields, chips and panels, the
-   white surface the page itself is painted in edge to edge, near-black ink,
-   grey secondary text. */
+/* The seven tokens, scoped here rather than on `:root` so "no tokens" stays
+   true for the rest of the app. Colours: the grey of fields, chips and panels,
+   the white surface the page itself is painted in edge to edge, near-black
+   ink, grey secondary text. Two shadows: the resting one (the overlay, a
+   hovered tile) and the lifted one a hovered card rises onto — deeper and
+   further down, so the card reads as closer to the shopper, not merely
+   outlined. */
 .storefront {
   --sf-ground: #f2f2f4;
   --sf-surface: #ffffff;
@@ -61,6 +97,7 @@
   --sf-muted: #6b6b73;
   --sf-radius: 16px;
   --sf-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  --sf-shadow-lift: 0 16px 40px rgba(0, 0, 0, 0.18);
 
   min-height: 100vh;
   background: var(--sf-surface);
@@ -132,11 +169,16 @@
   font: inherit;
   font-weight: 600;
   cursor: pointer;
+  transition: background-color 120ms ease;
 }
 
 /* Pressed look while the overlay is open: a step lighter than the resting
-   black, so the button reads as "held down" over the menu it owns. */
-.header__catalog[aria-expanded="true"] {
+   black, so the button reads as "held down" over the menu it owns. The hover
+   and keyboard-focus state is the same step, so pointing at the closed pill
+   previews the colour pressing it will hold. */
+.header__catalog[aria-expanded="true"],
+.header__catalog:hover,
+.header__catalog:focus-visible {
   background: #3a3a3f;
 }
 
@@ -185,6 +227,14 @@
   background: transparent;
   color: var(--sf-ink);
   cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+/* The heart sits bare on the grey pill, so its hover is a white circle
+   surfacing under it. */
+.search__favourites:hover,
+.search__favourites:focus-visible {
+  background: var(--sf-surface);
 }
 
 /* The search glyph sits in a dark circle at the pill's end, as the mockup
@@ -192,6 +242,11 @@
 .search__submit {
   background: var(--sf-ink);
   color: var(--sf-surface);
+}
+
+.search__submit:hover,
+.search__submit:focus-visible {
+  background: #3a3a3f;
 }
 
 .header__profile {
@@ -207,6 +262,12 @@
   background: var(--sf-ground);
   color: var(--sf-ink);
   cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.header__profile:hover,
+.header__profile:focus-visible {
+  background: #e4e4e8;
 }
 
 /* --- The glyphs ------------------------------------------------------------ */
@@ -380,11 +441,21 @@
   font: inherit;
   text-align: left;
   cursor: pointer;
+  transition: background-color 120ms ease;
 }
 
 .catalog-menu__category--active {
   background: var(--sf-ground);
   font-weight: 600;
+}
+
+/* A step darker than the active row's grey, so the pointer's row and the
+   drawn-active row stay distinguishable — the active row itself darkens the
+   same way under the pointer. Placed after `--active` and one class more
+   specific, so it wins on both counts. */
+.catalog-menu__category:hover,
+.catalog-menu__category:focus-visible {
+  background: #e4e4e8;
 }
 
 .catalog-menu__category-label {
@@ -509,6 +580,12 @@
   background: var(--sf-ground);
   color: var(--sf-ink);
   cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.banner__arrow:hover,
+.banner__arrow:focus-visible {
+  background: #e4e4e8;
 }
 
 .banner__arrow--prev,
@@ -536,6 +613,16 @@
   border-radius: 4px;
   background: rgba(255, 255, 255, 0.4);
   cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+/* A dot brightens under the pointer; the current dot, below, is already
+   full white and wider, and its rule comes after this one at equal
+   specificity so hovering it never dims it. Only the colour transitions:
+   the width is the slide's state and switches with the slide. */
+.banner__dot:hover,
+.banner__dot:focus-visible {
+  background: rgba(255, 255, 255, 0.7);
 }
 
 .banner__dot[aria-current="true"] {
@@ -567,7 +654,10 @@
 
 /* A tile is a `<button type="button">` with no handler, «еще 841» included
    (services-strip.ts). Transparent and borderless so the picture and its
-   caption are the whole control; the hover and focus highlight is Slice 4's. */
+   caption are the whole control. The `transition` names the two properties
+   the highlight below changes and nothing else, so the highlight fades in
+   and out over 160 ms (functional spec §2.5 crits 1–2) and no other property
+   of the tile ever animates. */
 .service-tile {
   display: flex;
   flex-direction: column;
@@ -582,6 +672,20 @@
   color: var(--sf-ink);
   font: inherit;
   cursor: pointer;
+  transition: background-color 160ms ease, box-shadow 160ms ease;
+}
+
+/* Graded interaction 4: the tile under the pointer — and only that one,
+   since `:hover` matches one element along the pointer's path — surfaces as a
+   grey rounded square with the resting shadow. One rule for both selectors so
+   a tile reached by Tab shows exactly what a tile under the pointer shows
+   (§2.5 crit 4); the browser's own focus ring stays on top of it. There is no
+   `:last-child` or `--more` exception: «еще 841» is the eleventh tile with
+   the same class, so it gets the same highlight (§2.5 crit 1). */
+.service-tile:hover,
+.service-tile:focus-visible {
+  background: var(--sf-ground);
+  box-shadow: var(--sf-shadow);
 }
 
 /* 72-px rounded square; the raster under it is 144 × 144, so this is 2×. */
@@ -686,6 +790,14 @@
   font: inherit;
   font-size: 14px;
   cursor: pointer;
+  transition: color 120ms ease;
+}
+
+/* A text button: its hover is the text — and the chevron, which is
+   `currentColor` — going from grey to ink. */
+.steam-topup__promo:hover,
+.steam-topup__promo:focus-visible {
+  color: var(--sf-ink);
 }
 
 .steam-topup__promo-label {
@@ -763,9 +875,21 @@
   white-space: nowrap;
 }
 
-/* The currency control is a fieldset of three radios with their labels
-   (steam-topup.ts). The fieldset's own border, padding, margin and
-   `min-inline-size: min-content` are reset so it lays out as a plain row. */
+/* --- The currency control: native radios, no script ---------------------- */
+
+/* The graded «$ / ₸ / ₽» control is a `<fieldset role="radiogroup">` of three
+   `<input type="radio" name="currency">` with their labels (steam-topup.ts;
+   technical-considerations §2.2, assumption 4). The radio group *is* the
+   state: exactly one is checked by construction, the arrow keys move the
+   check, Tab enters the group on the checked one — so the rules below only
+   paint what the browser already knows, through `:checked + label` and
+   `:focus-visible + label`. The alternative, `role="radio"` buttons plus a
+   handler, reimplements the group to get a handler whose only logic is "set
+   this one true, the others false"; a reviewer looking for that handler
+   should read the comment on `renderCurrencyOption` in steam-topup.ts
+   instead. No motion rule lives in this block — the hover rules own motion.
+   The fieldset's own border, padding, margin and `min-inline-size:
+   min-content` are reset so it lays out as a plain row. */
 .currency {
   display: flex;
   gap: 4px;
@@ -794,7 +918,10 @@
 }
 
 /* Three 36-px squares. The label is the visible control, so it is the one
-   that gets the hand cursor. */
+   that gets the hand cursor. The 120-ms transition is on the label's two
+   painted properties, so both the pointer's hover and the check moving from
+   one square to another fade rather than snap; the check itself is still the
+   radio's instant state — task 3's spec reads `:checked`, never a colour. */
 .currency__option {
   display: inline-flex;
   align-items: center;
@@ -808,18 +935,28 @@
   font-weight: 600;
   user-select: none;
   cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
+}
+
+/* The pointer over an unchecked square: a step darker. The checked rule
+   below is one class more specific (input + `:checked` + label), so the
+   active square stays ink under the pointer rather than fading to grey. */
+.currency__option:hover {
+  background: #e4e4e8;
 }
 
 /* The active option: the radio group's own `:checked` painted onto the label
    that follows it. Exactly one is dark because exactly one radio in a group
-   is checked — there is no script behind this. */
+   is checked — there is no script behind this (assumption 4). */
 .currency__input:checked + .currency__option {
   background: var(--sf-ink);
   color: var(--sf-surface);
 }
 
 /* The keyboard's ring, on the label, since the radio it belongs to is off
-   screen. */
+   screen. Nothing in this sheet or in `app/styles.css` resets `outline`, so
+   this is the only ring rule the label needs; a mouse click on a radio does
+   not match `:focus-visible`, so the ring is the keyboard's alone. */
 .currency__input:focus-visible + .currency__option {
   outline: 2px solid var(--sf-ink);
   outline-offset: 2px;
@@ -840,6 +977,12 @@
   font-weight: 600;
   white-space: nowrap;
   cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.steam-topup__pay:hover,
+.steam-topup__pay:focus-visible {
+  background: #3a3a3f;
 }
 
 /* --- The «Популярные товары» row ------------------------------------------- */
@@ -889,11 +1032,26 @@
   font: inherit;
   font-size: 14px;
   cursor: pointer;
+  transition: background-color 120ms ease, color 120ms ease;
 }
 
 .chip--active {
   background: var(--sf-ink);
   color: var(--sf-surface);
+}
+
+/* A grey chip darkens a step under the pointer; the drawn-active «Донат»
+   lightens a step instead, so it never reads as having lost its state. The
+   second rule follows the first at equal specificity, so it wins for the
+   active chip. */
+.chip:hover,
+.chip:focus-visible {
+  background: #e4e4e8;
+}
+
+.chip--active:hover,
+.chip--active:focus-visible {
+  background: #3a3a3f;
 }
 
 .chip__label {
@@ -920,9 +1078,8 @@
 }
 
 /* As many cards to a row as 227-px columns fit — five at the mockup's
-   1 200-px measure, fewer in a narrower window, more in a wider one. Until
-   Slice 5 selects five, every product the catalogue returns lands here and
-   wraps into further rows. */
+   1 200-px measure, so the five `selectPopularProducts` picks sit on one
+   line there, and fewer per line in a narrower window, where they wrap. */
 .popular__list {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(227px, 1fr));
@@ -934,38 +1091,143 @@
 
 /* --- The product card ------------------------------------------------------ */
 
-/* The entity's card as `entities/product/ui/product-card.ts` renders it today:
-   name, price, and «Купить» where the item is purchasable. These five rules
-   were `app/styles.css`'s `.product-card*` rules, moved here unchanged in
-   effect; that sheet no longer carries any, and must not again (its header
-   says why). Slice 5 rebuilds the card (image, `__media`, `__body`); nothing
-   here styles what does not exist yet. */
+/* The entity's card as `entities/product/ui/product-card.ts` renders it:
+   `__media` (the picture, or the `--empty` panel in its place) above
+   `__body` (name, price, and «Купить» where the item is purchasable). The
+   card is a white rounded panel on the page's white ground, and at rest it
+   carries **no shadow and no border** — the picture's rounded box is what
+   the eye reads as the card, as in the mockup, and the lift below is what
+   draws the panel's edge. (Slice 4's hover check pins the resting
+   `box-shadow` to `none` and the hovered one to `--sf-shadow-lift`, so a
+   resting shadow here would be a regression, not a refinement.) A column
+   flexbox so the grid can stretch every card in a row to one height and
+   `__buy` can sit at the bottom of it. No `overflow: hidden` on the card:
+   `__media` clips its own picture, and clipping here would cut the focus
+   ring off a «Купить» that sits at the card's edge. */
 .product-card {
-  padding: 0.75rem 0;
-  border-top: 1px solid #ddd;
+  display: flex;
+  flex-direction: column;
+  border-radius: var(--sf-radius);
+  background: var(--sf-surface);
+  transition: transform 180ms ease, box-shadow 180ms ease;
 }
 
+/* Graded interaction 5: the card rises 4 px and lands on the deeper shadow,
+   both over 180 ms (§2.6 crit 2: "animates rather than switching instantly");
+   off the pointer it settles back the same way (crit 3). `:focus-within`
+   rather than `:focus-visible`: the card itself is never focused — Купить
+   inside it is — so the keyboard user who tabs onto the button lifts the
+   card they are about to press, exactly as the pointer does. A card without
+   Купить has nothing focusable and lifts on hover only. The transform half
+   of this rule is withdrawn under reduced motion at the end of the sheet. */
+.product-card:hover,
+.product-card:focus-within {
+  transform: translateY(-4px);
+  box-shadow: var(--sf-shadow-lift);
+}
+
+/* The picture's box: 3:2, the ratio the files under `public/assets/` are
+   drawn at and the `width`/`height` attributes on the `<img>` declare. The
+   attributes reserve the box before the bytes arrive; `aspect-ratio` keeps
+   that box fluid as the grid column widens or narrows; `overflow: hidden`
+   rounds the picture's corners. A grey ground under the picture so a
+   still-loading card is a neutral panel, not a white hole in the row. */
+.product-card__media {
+  aspect-ratio: 3 / 2;
+  overflow: hidden;
+  border-radius: var(--sf-radius);
+  background: var(--sf-ground);
+}
+
+.product-card__image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+/* A card with no picture — `image: null` in the catalogue, or a file that
+   failed to load (the entity's `error` listener adds this modifier and drops
+   the `<img>`). The same grey panel, with a picture-frame glyph drawn by the
+   pseudo-element below so it reads as "no artwork" rather than "not loaded
+   yet". Drawn in CSS, not shipped as a file: a placeholder that could itself
+   404 would defeat its purpose. */
+.product-card__media--empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* A 44 × 32 rounded frame in the muted tone with a dot in its upper left —
+   the "landscape" shorthand for a picture, both parts in `--sf-muted`. */
+.product-card__media--empty::before {
+  content: "";
+  box-sizing: border-box;
+  width: 44px;
+  height: 32px;
+  border: 2px solid var(--sf-muted);
+  border-radius: 6px;
+  background: radial-gradient(circle at 30% 38%, var(--sf-muted) 0 4px, transparent 5px);
+  opacity: 0.55;
+}
+
+/* The text half. `flex: 1` so it takes whatever height the grid gives the
+   card beyond the picture, which is what lets `__buy` settle at the bottom. */
+.product-card__body {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  gap: 6px;
+  padding: 12px 8px 8px;
+}
+
+/* Two lines at most, cut with an ellipsis, as the mockup does — the seed's
+   longest name («Escape from Tarkov ключ (Standard)») wraps to two at the
+   227-px column and a longer one must not push its price out of line with
+   its neighbours'. `-webkit-line-clamp` is the form every engine ships; the
+   unprefixed `line-clamp` is newer and not yet everywhere. */
 .product-card__name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  overflow: hidden;
   margin: 0;
-  font-size: 1rem;
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.3;
 }
 
 .product-card__price {
-  margin: 0.25rem 0 0.5rem;
+  margin: 0;
+  font-size: 18px;
+  font-weight: 700;
 }
 
-/* `font`, `padding` and `cursor` are the moved declarations; the border,
-   radius, colours and weight are this sheet's own, so Купить is the mockup's
-   black pill from this slice on. */
+/* The mockup's black pill, the card's full width, pushed to the card's
+   bottom edge by `margin-top: auto` so five cards in a row line their buttons
+   up whatever their names did above. A display-only card has no `__buy` and
+   nothing else in its body that looks like one (§2.6 crit 4). */
 .product-card__buy {
-  font: inherit;
-  padding: 0.4rem 1rem;
+  margin-top: auto;
+  width: 100%;
+  height: 40px;
+  padding: 0 16px;
   border: 0;
   border-radius: 999px;
   background: var(--sf-ink);
   color: var(--sf-surface);
+  font: inherit;
   font-weight: 600;
   cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+/* `:enabled` so the pill stops answering the pointer for the length of the
+   request, when the rule below has already dimmed it; a disabled button
+   cannot be focused, so `:focus-visible` needs no such guard. */
+.product-card__buy:enabled:hover,
+.product-card__buy:focus-visible {
+  background: #3a3a3f;
 }
 
 /* While the order is being created. The control is disabled for the length of
@@ -974,4 +1236,21 @@
 .product-card__buy:disabled {
   cursor: default;
   opacity: 0.6;
+}
+
+/* --- Reduced motion --------------------------------------------------------- */
+
+/* The one thing on this page that moves on hover is the card's 4-px rise,
+   and this withdraws it — and only it — for a shopper whose system asks for
+   less motion (R11). The shadow still deepens, the tiles still tint, the
+   chips still darken: a colour or shadow fade is not motion, and §2.5/§2.6
+   accept "a raised shadow, an outline, or a rise" as the visible response.
+   Nothing here touches the banner's auto-advance: the spec mandates it, and
+   the pointer pause is its stop mechanism. Same two selectors as the lift
+   rule, so the keyboard user's `:focus-within` is covered too. */
+@media (prefers-reduced-motion: reduce) {
+  .product-card:hover,
+  .product-card:focus-within {
+    transform: none;
+  }
 }

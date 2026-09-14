@@ -19,10 +19,15 @@
  * handler on `document` that closes — has a bug built into the event order: the
  * opening click bubbles from the button up to `document`, so the second
  * handler sees it too and closes what the first one just opened (R3). The
- * usual patch is `stopPropagation()` in the button handler, which hides the
- * click from every listener above the button — including the delegated one
- * `enableBuyControls` keeps on the product row, which is how «Купить» works at
- * all. The other patch, registering the document listener from inside the
+ * usual patch is `stopPropagation()` in the button handler — and, for inner
+ * clicks, on the overlay. That makes "stop the event to be exempt from the
+ * closer" the page's mechanism, and stopping is untargeted: it hides the
+ * event from whoever is above, which on this page means the delegated
+ * listener `enableBuyControls` keeps on the product row (for any click
+ * stopped inside the row) and this very `document` listener, which needs the
+ * «Купить» click to reach it so the overlay closes before `location.assign`.
+ * A design that never stops an event never has to decide where stopping is
+ * safe. The other patch, registering the document listener from inside the
  * open handler on a zero-delay timeout so it misses the click that is still
  * bubbling, is a bet on ordering rather than a design.
  *

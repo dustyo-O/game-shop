@@ -10,7 +10,9 @@
  * above this layer should be assembling money strings of its own either way.
  *
  * Named exports only — no `export *` — so this list is the honest inventory of
- * what the slice offers.
+ * what the slice offers. `parseCatalogResponse` is not on it: `fetchProducts`
+ * is the only caller with a body to parse, and the unit test that exercises
+ * the parser is colocated and imports `./api/products-api.js` directly.
  */
 export { fetchProducts, CatalogResponseError } from "./api/products-api.js";
 export type { Product } from "./model/product.js";

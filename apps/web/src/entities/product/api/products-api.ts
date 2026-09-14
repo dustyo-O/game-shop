@@ -2,7 +2,7 @@
  * Reading the catalogue from `GET /api/products`.
  *
  * The endpoint answers a bare JSON array of twelve rows with snake_case wire
- * fields (technical-considerations §2.3). This file is the only place that
+ * fields (spec 001 technical-considerations §2.3). This file is the only place that
  * knows that, and the only place where an untyped `unknown` becomes a
  * {@link Product}.
  *
@@ -51,6 +51,30 @@ function readString(row: Record<string, unknown>, field: string): string {
 }
 
 /**
+ * A nullable text column on the wire: a string or JSON `null`, nothing else.
+ *
+ * A *missing* key is `undefined`, and it is rejected rather than read as
+ * `null`. `CatalogService` writes `image: row.image` for every row and the
+ * column is `string | null`, so the key is always on the wire —
+ * `JSON.stringify` omits `undefined`, never `null`. A body without the key is
+ * therefore not "a row with no picture"; it is a body that is not the one
+ * `GET /api/products` promises (a renamed field, another endpoint answering
+ * on the same path), and it is rejected for the same reason `{"products": []}`
+ * is. Read as `null`, it would blank every card without a word in the console.
+ * Same rule as {@link readString}, which also treats an absent key as a wrong
+ * type.
+ */
+function readNullableString(row: Record<string, unknown>, field: string): string | null {
+  const value = row[field];
+
+  if (value !== null && typeof value !== "string") {
+    throw new CatalogResponseError(`product.${field}: expected a string or null, got ${typeof value}`);
+  }
+
+  return value;
+}
+
+/**
  * The one place a raw JSON number becomes a branded amount.
  *
  * The finiteness check is not ceremony: `JSON.parse` cannot produce `NaN`, but
@@ -88,13 +112,17 @@ function readPurchasable(row: Record<string, unknown>): boolean {
 }
 
 /**
- * `products.image` is read but not carried into {@link Product}, and that is on
- * purpose. The column holds paths like `assets/steam.png`; **those files do not
- * exist in this repository**, and this deliberately plain page has no picture
- * to show anyway. Dropping the field here means no `<img>` is ever constructed,
- * so there are no 404s in the network panel and no `net::ERR` lines in the
- * console. Phase 4 builds the real storefront against the Figma design, ships
- * the artwork with it, and reinstates the field then.
+ * One wire row → one {@link Product}. Every field is read through a checked
+ * reader; nothing is copied across on trust.
+ *
+ * `image` is carried through as the wire holds it — `assets/cs2.png`, or
+ * `null` for a row without artwork. The artwork ships with the page under
+ * `apps/web/public/assets/`, at the very paths the seed already holds, so the
+ * value needs no rewriting here; resolving it against the page's origin is the
+ * card's job (`../ui/product-card.ts`), which keeps this function a pure
+ * statement about the wire. (Phases 1–3 dropped the field at this line on
+ * purpose: no files existed and the plain page had nowhere to show one, so not
+ * constructing an `<img>` was what kept the network panel free of 404s.)
  */
 function toProduct(value: unknown): Product {
   const row = asRecord(value, "product");
@@ -104,8 +132,27 @@ function toProduct(value: unknown): Product {
     name: readString(row, "name"),
     priceMinor: readPriceMinor(row),
     currency: readCurrency(row),
+    image: readNullableString(row, "image"),
     purchasable: readPurchasable(row),
   };
+}
+
+/**
+ * The parser proper, separated from the request so it can be exercised on
+ * hand-built bodies in `products-api.test.ts` without a server. Takes the
+ * decoded JSON as `unknown` — a bare array of rows is the promised shape, and
+ * anything else (`{"products": []}`, an HTML error page, a lone row) throws.
+ * Row order is the API's, which is the seed's.
+ *
+ * Exported for the colocated test only; the slice's `index.ts` does not
+ * re-export it, because nothing above the entity has a body to parse.
+ */
+export function parseCatalogResponse(body: unknown): readonly Product[] {
+  if (!Array.isArray(body)) {
+    throw new CatalogResponseError(`${productsEndpoint}: expected an array`);
+  }
+
+  return body.map(toProduct);
 }
 
 /**
@@ -118,11 +165,5 @@ function toProduct(value: unknown): Product {
  * page renders a different message for each.
  */
 export async function fetchProducts(): Promise<readonly Product[]> {
-  const body = await getJson(productsEndpoint);
-
-  if (!Array.isArray(body)) {
-    throw new CatalogResponseError(`${productsEndpoint}: expected an array`);
-  }
-
-  return body.map(toProduct);
+  return parseCatalogResponse(await getJson(productsEndpoint));
 }

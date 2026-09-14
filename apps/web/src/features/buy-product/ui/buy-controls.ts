@@ -93,6 +93,57 @@
  * click, by a second tab and by a retry after a visible failure, and forgotten
  * only once an order for it exists. That file carries the reasoning; the two
  * calls below are the whole of its use.
+ *
+ * ---------------------------------------------------------------------------
+ * THE BACK/FORWARD CACHE: THE ONE PLACE THE DISABLED BUTTON OUTLIVES ITS PAGE
+ * ---------------------------------------------------------------------------
+ * `buy` disables the control synchronously and leaves it disabled while
+ * `location.assign` runs. That is right for the page that is leaving — the
+ * section above says why — and it rests on the page actually leaving: the
+ * navigation discards the document, and the dead button goes with it.
+ *
+ * The back/forward cache breaks that assumption in exactly one direction. A
+ * browser that caches the storefront on the way out restores it on the way
+ * back *as it was left* — same document, same listeners, same DOM — and the
+ * DOM was left with one «Купить» disabled. The shopper who bought a game,
+ * looked at their order and pressed back would meet a control that does
+ * nothing, with no request open and no message saying why: the broken control
+ * spec 004's functional spec §1 says the storefront never shows (its
+ * technical-considerations §2.3; R12).
+ *
+ * So on a persisted `pageshow` — `event.persisted === true` is a restore from
+ * the cache, and nothing else — every disabled buy button inside the container
+ * is re-enabled. **A second press is then correct as a new order, not a
+ * double charge.** `forgetPurchaseIntent(sku)` already ran on success, before
+ * the navigation, so the intent that produced the first order no longer exists
+ * in storage; the next click on that SKU mints a fresh key, and the fresh key
+ * names a fresh intent. The shop is not charging twice for one decision — it
+ * is selling a second copy on a second decision, which is spec 002 §2.1's
+ * fifth criterion (buy, come back, buy again) reached by the back button
+ * instead of by the shop's own link.
+ *
+ * The guard on `persisted` is not what protects a fresh load — a fresh load
+ * never has a disabled button, because `mountApp` builds the page from
+ * nothing. It is there so that this handler does exactly one thing on exactly
+ * one event and is a no-op everywhere else, which is what makes the next
+ * paragraph true.
+ *
+ * **Nothing else in the feature changes.** The click path is the same
+ * delegated listener; the key is still minted by `../lib/purchase-intent.js`
+ * and still forgotten only on success; every failure path still re-enables
+ * and still speaks Russian; `POST /api/orders` still receives the same
+ * `Idempotency-Key`. This handler touches the `disabled` property of buttons
+ * that are already in the container and nothing more. Its listener is never
+ * removed — the app has no unmount, and a cached page keeps its listeners
+ * along with everything else, which is exactly what lets `pageshow` find it
+ * (the same stance `pages/storefront/ui/banner.ts` takes for its clock and
+ * `ui/catalog-menu.ts` for its overlay).
+ *
+ * This path is not reachable under Playwright: any CDP session disables the
+ * back/forward cache, so under automation back is always a full reload and
+ * the button is enabled by construction. Its proof is a person in real Chrome
+ * (spec 004 technical-considerations §2.3, "both restore paths must be
+ * exercised, by different means").
  */
 import { createOrder, ProductNotPurchasableError } from "../../../entities/order/index.js";
 import { createElement } from "../../../shared/lib/dom.js";
@@ -219,5 +270,22 @@ export function enableBuyControls(container: HTMLElement): void {
 
     // Fire-and-forget: `buy` handles both outcomes itself and never rejects.
     void buy(button, sku);
+  });
+
+  // Page lifecycle — see the file header's back/forward-cache section. Never
+  // removed: there is no unmount. The selector narrows to `:disabled` so an
+  // enabled button is not touched at all, and the `instanceof` is the same
+  // line as the click path's — `querySelectorAll` promises `Element`, and
+  // this is what makes it a button with a `disabled` property to clear.
+  window.addEventListener("pageshow", (event) => {
+    if (!event.persisted) {
+      return;
+    }
+
+    for (const button of container.querySelectorAll(`${buyButtonSelector}:disabled`)) {
+      if (button instanceof HTMLButtonElement) {
+        button.disabled = false;
+      }
+    }
   });
 }

@@ -5,6 +5,41 @@
  * instead of `@playwright/test` directly.
  *
  * ---------------------------------------------------------------------------
+ * WHY EVERY SIBLING SPEC UNDER `e2e/` CARRIES `@regression`, AND
+ * `acceptance.spec.ts` DOES NOT — STATED ONCE HERE, NOT EIGHT TIMES
+ * ---------------------------------------------------------------------------
+ * `docs/walkthrough/phase-2-slice-8-the-acceptance-suite.md` reads the
+ * Phase 1–3 convention as "`@regression` is on the two files that belong in
+ * the permanent regression suite — the concurrency test and the unit test —
+ * and not on the acceptance suite" (`apps/api/test/acceptance/
+ * failure-and-recovery.test.ts` carries `@layer: integration` and `@spec`,
+ * never `@regression`, for the same reason). This project has no concurrency
+ * layer, so the reading that carries over is "the permanent, one-criterion-
+ * at-a-time regression guards carry it; the feature-level walk of the whole
+ * assembled path does not."
+ *
+ * By that reading, `banner.spec.ts`, `catalog-menu.spec.ts`, `currency.spec.ts`,
+ * `hover.spec.ts`, `inert-controls.spec.ts`, `layout.spec.ts`, `products.
+ * spec.ts` and `buy-through.spec.ts` are the behaviour-level guards — each
+ * `test()` inside them is one acceptance criterion, each was written before
+ * the behaviour it checks existed (write-first, per `tasks.md`'s standing
+ * RED requirement) and RED-validated on its own, and every one of them is
+ * meant to keep failing forever if that one criterion regresses. That is
+ * exactly what `@regression` is for, so all eight keep it — a decision made
+ * once, here, rather than repeated in eight file headers.
+ *
+ * `acceptance.spec.ts` is the odd one out on purpose: it is the Slice 7
+ * feature-level spec (`context/spec/004-storefront-per-the-design/tasks.md`,
+ * "Feature Testing & Regression"), one test that walks the whole path once —
+ * every graded interaction touched in a single session, then a real
+ * buy-through and back — to prove the seams between slices hold, not to
+ * re-prove any one criterion `hover.spec.ts` or `buy-through.spec.ts` already
+ * owns. A failure in it says "something about the composed page broke", not
+ * "which criterion regressed" — the same reason
+ * `failure-and-recovery.test.ts` is not a regression file either. It carries
+ * `@layer: e2e` and `@spec` like every file here, and no `@regression`.
+ *
+ * ---------------------------------------------------------------------------
  * WHY THIS CAPTURES THE ORDER ID THROUGH ROUTE INTERCEPTION, NOT
  * `page.on("response")`
  * ---------------------------------------------------------------------------
@@ -59,6 +94,25 @@
  * `layout.spec.ts` and `inert-controls.spec.ts` create no orders, so their
  * teardown here is the early return below — paid for once, in this file,
  * rather than as a rule every spec has to remember.
+ *
+ * ---------------------------------------------------------------------------
+ * `createdOrderIds` — EXPOSED SO A TEST CAN ASSERT "N ORDERS EXIST", NOT ONLY
+ * "N REQUESTS WERE SENT" (SLICE 7 GAP)
+ * ---------------------------------------------------------------------------
+ * The array `trackCreatedOrders` pushes captured ids into used to live only
+ * inside that fixture's own closure, invisible to a test — which is fine for
+ * cleanup, but wrong for `buy-through.spec.ts`'s R9 test: functional spec
+ * §2.7 crit 3 says *"one order exists"*, a fact about the `orders` table, not
+ * about the network log. Counting `POST /api/orders` requests (the request
+ * log a test can already see) proves "one attempt was sent", which is a
+ * different claim — indistinguishable from "one order exists" only because
+ * this shop happens to create exactly one order per successful `POST`, a fact
+ * that assertion itself takes for granted rather than checks. Splitting the
+ * array out into its own fixture, still populated by `trackCreatedOrders`
+ * below (which now depends on it instead of owning a private one), lets a
+ * test read `createdOrderIds` directly and assert on the ids this route
+ * handler actually captured off real `2xx` responses — the same signal the
+ * cleanup below already trusts enough to delete rows by.
  */
 import { test as base, expect, type Route } from "@playwright/test";
 
@@ -97,12 +151,18 @@ async function captureOrderId(route: Route, orderIds: string[]): Promise<void> {
   await route.fulfill({ response, body: bodyText });
 }
 
-export const test = base.extend<{ trackCreatedOrders: void }>({
-  trackCreatedOrders: [
-    async ({ page }, use) => {
-      const orderIds: string[] = [];
+export const test = base.extend<{ createdOrderIds: string[]; trackCreatedOrders: void }>({
+  // Plain array, populated by `trackCreatedOrders` below — see this file's
+  // header. A test that never presses «Купить» gets an empty array, exactly
+  // like `layout.spec.ts` and `inert-controls.spec.ts` already get a no-op
+  // cleanup.
+  createdOrderIds: async ({}, use) => {
+    await use([]);
+  },
 
-      await page.route(ORDERS_ROUTE_PATTERN, (route) => captureOrderId(route, orderIds));
+  trackCreatedOrders: [
+    async ({ page, createdOrderIds }, use) => {
+      await page.route(ORDERS_ROUTE_PATTERN, (route) => captureOrderId(route, createdOrderIds));
 
       // Belt-and-braces: the id straight from the address bar, in case some
       // future path (a redirect, a service worker) reaches `/order/…`
@@ -111,14 +171,14 @@ export const test = base.extend<{ trackCreatedOrders: void }>({
         if (frame !== page.mainFrame()) return;
         const match = ORDER_URL_ID_PATTERN.exec(frame.url());
         const id = match?.[1];
-        if (id !== undefined && !orderIds.includes(id)) orderIds.push(id);
+        if (id !== undefined && !createdOrderIds.includes(id)) createdOrderIds.push(id);
       });
 
       await use();
 
       await page.unroute(ORDERS_ROUTE_PATTERN);
 
-      const uniqueOrderIds = Array.from(new Set(orderIds));
+      const uniqueOrderIds = Array.from(new Set(createdOrderIds));
       if (uniqueOrderIds.length === 0) return;
 
       const client = openE2eDatabase();

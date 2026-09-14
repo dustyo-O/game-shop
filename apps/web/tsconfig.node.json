@@ -6,7 +6,7 @@
     "moduleResolution": "bundler",
     "types": ["node"],
 
-    // DOM only for this Node-side config's benefit: `e2e/**` runs under
+    // DOM only for this Node-side config's benefit: `e2e/**` and `scripts/**` run under
     // Node/Playwright, never in a bundle, but `page.evaluate(() => ...)`
     // callbacks are still ordinary TypeScript in this file and reference
     // browser globals (`document`, `window`, `NodeFilter`) that only exist
@@ -15,5 +15,5 @@
     // so it never sees Playwright or Node — see that file's own comment.
     "lib": ["ES2023", "DOM", "DOM.Iterable"]
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts", "e2e"]
+  "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts", "e2e", "scripts"]
 }

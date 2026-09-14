@@ -1,3 +1,5 @@
+> **Superseded.** The single map is now `phases-1-to-4.md`, which carries this document forward unchanged, with Phase 4 as an appendix; this file is kept as the end-of-Phase-3 snapshot and is no longer updated.
+
 # Phases 1 to 3 — one argument, and the question each part of it answers
 
 > Every other document in this folder explains **one slice** or **one phase**. This one is the map. It

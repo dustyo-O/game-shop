@@ -5,12 +5,25 @@
  *
  * The region works exactly as Phase 1's page did: the element is returned
  * **synchronously** with «Загрузка каталога…» in it and is filled in when the
- * request lands, so the shopper never looks at a blank row and the four blocks
- * above never wait on the API. Every failure — unreachable, non-2xx, a body
- * that is not the promised array — lands in the same branch and shows the same
- * Russian sentence, because they are the same event to a shopper: the goods
- * did not arrive. The sentence is Phase 1's, verbatim, which is what §2.6 crit
- * 5 asks for.
+ * request lands. Every failure — unreachable, non-2xx, a body that is not the
+ * promised array — lands in the same branch and shows the same Russian
+ * sentence, because they are the same event to a shopper: the goods did not
+ * arrive. The sentence is Phase 1's, verbatim, which is what §2.6 crit 5 asks
+ * for.
+ *
+ * ---------------------------------------------------------------------------
+ * ONLY THE REGION DEPENDS ON THE REQUEST
+ * ---------------------------------------------------------------------------
+ * `createPopularProducts` builds the heading and the chips and returns the
+ * section before `fetchProducts` has answered — it does not `await` anything,
+ * and neither does `storefront-page.ts` above it. So the header, the banner,
+ * the tile strip and the Steam block are on the page and answering the
+ * pointer whether the catalogue takes a second to arrive or never arrives at
+ * all; the loading, empty and error states are painted into `region` and
+ * nowhere else (§2.6 crit 5: "the product row alone shows the shop's existing
+ * Russian message"). Anything that later needs the catalogue on this page
+ * goes through `loadInto`, not through a second request the other blocks
+ * might wait on.
  *
  * `enableBuyControls` is given the region rather than each button, because the
  * buttons do not exist yet: they arrive with the catalogue, into this element,
@@ -18,16 +31,18 @@
  * «Купить» press *does* belongs to `features/buy-product`; that one line is
  * the whole of this file's involvement in it.
  *
- * For now the row shows every product through `renderProductCard` as it is
- * today; the selection of five and the redesigned card are Slice 5's. The
- * chips are `<button type="button">` with no handler, «Донат» carrying
- * `chip--active` as the mockup draws it and no `aria-pressed`, which would
- * claim a toggle that does not exist (technical-considerations §2.8).
+ * Which five of the twelve appear is `selectPopularProducts`'s decision in
+ * `../model/`, a pure function checked without a browser; this file only
+ * hands it the catalogue and renders what it returns, one `renderProductCard`
+ * per item. The chips are `<button type="button">` with no handler, «Донат»
+ * carrying `chip--active` as the mockup draws it and no `aria-pressed`, which
+ * would claim a toggle that does not exist (technical-considerations §2.8).
  */
 import { fetchProducts, renderProductCard, type Product } from "../../../entities/product/index.js";
 import { enableBuyControls } from "../../../features/buy-product/index.js";
 import { createElement } from "../../../shared/lib/dom.js";
 import { text } from "../config/text.js";
+import { selectPopularProducts } from "../model/select-popular-products.js";
 import { createIcon, type GlyphName } from "./icon.js";
 
 interface Chip {
@@ -65,11 +80,19 @@ function renderList(products: readonly Product[]): HTMLElement {
   return createElement("ul", { className: "popular__list" }, products.map(renderProductCard));
 }
 
+/**
+ * The whole of the row's dependence on the network, in one place. «Каталог
+ * пуст.» is about the catalogue, so it is the *catalogue's* length that
+ * decides it, before the selection: a non-empty catalogue always selects at
+ * least one card, and an empty one has nothing to select from.
+ */
 async function loadInto(region: HTMLElement): Promise<void> {
   try {
     const products = await fetchProducts();
 
-    region.replaceChildren(products.length === 0 ? renderStatus(text.popular.empty) : renderList(products));
+    region.replaceChildren(
+      products.length === 0 ? renderStatus(text.popular.empty) : renderList(selectPopularProducts(products)),
+    );
   } catch {
     region.replaceChildren(renderStatus(text.popular.error, "error"));
   }

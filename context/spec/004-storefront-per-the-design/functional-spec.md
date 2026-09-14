@@ -1,7 +1,7 @@
 # Functional Specification: Storefront per the Design
 
 - **Roadmap Item:** Phase 4 — Storefront per the Design; Connecting Face to Engine
-- **Status:** Draft
+- **Status:** Completed
 - **Author:** Alexander Shleyko
 
 ---

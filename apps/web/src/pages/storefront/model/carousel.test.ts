@@ -1,5 +1,6 @@
 // @layer: unit
 // @spec: 004-storefront-per-the-design
+// @regression
 /**
  * The banner's policy table (technical-considerations §2.2), one case per row.
  *

@@ -225,6 +225,63 @@ test.describe("layout — the mockup's structure at / (functional spec §2.1, am
     expect(offenders, `non-Russian, non-allowlisted text found: ${offenders.join(" | ")}`).toEqual([]);
   });
 
+  /**
+   * Slice 7 (feature-level acceptance) gap: the sweep above only walks
+   * *visible* text nodes, and on a freshly loaded page that is banner slide 1
+   * and a closed catalog menu — `storefront.css`'s `.banner__slide[hidden]`
+   * and `.catalog-menu[hidden]` both resolve to `display: none`, so slides
+   * 2–4's headlines/text and every category and column item inside the
+   * overlay never reach `document.createTreeWalker`'s visibility filter in
+   * that test. Neither `banner.spec.ts` nor `catalog-menu.spec.ts` checks
+   * language at all — they only drive structure and timing — so nothing in
+   * the suite had ever read those strings for Cyrillic before this test.
+   * `textContent` is readable on a `hidden` element regardless of paint, so
+   * this reads it directly rather than opening the menu or clicking through
+   * all four slides — the config files those strings come from
+   * (`config/banner-slides.ts`, `config/catalog-menu.ts`) render unconditionally
+   * into the DOM at mount, hidden or not.
+   */
+  test("banner slides 2–4 and the catalog menu's categories/columns are Russian too — hidden by default, so the sweep above never reveals them (functional spec §2.10)", async ({
+    page,
+  }) => {
+    await page.goto("/");
+
+    const offenders = await page.evaluate((allowlist: readonly string[]) => {
+      const cyrillic = /[\u0400-\u04ff]/u;
+      const letter = /\p{L}/u;
+      const sortedAllowlist = [...allowlist].sort((a, b) => b.length - a.length);
+
+      function stripsToNoLetters(value: string): boolean {
+        let rest = value;
+        for (const brand of sortedAllowlist) rest = rest.split(brand).join(" ");
+        return !letter.test(rest);
+      }
+
+      const bad: string[] = [];
+      // `.banner__slide` (all four, hidden or not) and `.catalog-menu` (the
+      // whole overlay, hidden by default) — the two containers whose content
+      // the main sweep's `isVisible` filter can never reach on a fresh load.
+      const containers = document.querySelectorAll(".banner__slide, .catalog-menu");
+      for (const container of Array.from(containers)) {
+        const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+        let node = walker.nextNode();
+        while (node !== null) {
+          const text = (node.textContent ?? "").trim();
+          if (text !== "" && !cyrillic.test(text) && letter.test(text) && !stripsToNoLetters(text)) {
+            bad.push(text);
+          }
+          node = walker.nextNode();
+        }
+      }
+      return bad;
+    }, BRAND_ALLOWLIST);
+
+    expect(
+      offenders,
+      `non-Russian, non-allowlisted text found inside a hidden-by-default container: ${offenders.join(" | ")}`,
+    ).toEqual([]);
+  });
+
   test("no request answers 4xx/5xx while the page loads (R5/R10)", async ({ page }) => {
     const failures: string[] = [];
     page.on("response", (response) => {
@@ -236,5 +293,61 @@ test.describe("layout — the mockup's structure at / (functional spec §2.1, am
     await page.waitForLoadState("networkidle");
 
     expect(failures, `request(s) answered 4xx/5xx: ${failures.join(" | ")}`).toEqual([]);
+  });
+
+  /**
+   * Slice 7 gap: the status-only sweep above is blind to a missing asset on
+   * this project's dev server. `apps/web`'s `vite --port 5101 --strictPort`
+   * (this config's own `webServer` entry) answers a request for a *missing*
+   * file under `public/` with its SPA fallback — `index.html`, `200
+   * text/html` — rather than a `404`, because Vite cannot tell "this is a
+   * route the client-side router will handle" from "this file genuinely does
+   * not exist" for any path that is not an asset it recognises up front. So
+   * a deleted service-tile SVG or a renamed card-art PNG would sail through
+   * the check above with a `200` and be invisible to it. `content-type` is
+   * the fact the fallback cannot fake: `index.html` is always `text/html`, a
+   * real image response is always `image/*`, and nothing under `/assets/`,
+   * `/icons/` or the favicon is ever meant to legitimately answer HTML.
+   */
+  test("every asset response is actually an image, not Vite's SPA-fallback HTML for a missing file (R5/R10)", async ({
+    page,
+  }) => {
+    const offenders: string[] = [];
+    // Matches product-card art (`/assets/<name>.png`), every service-tile
+    // and UI glyph under `/icons/` at any depth (`icons/services/*.png`,
+    // `icons/ui/*.svg`), and the favicon — 31 real responses on this seed,
+    // the matched count logged once while writing this test and confirmed on
+    // an isolated single-test run (`playwright test e2e/layout.spec.ts
+    // --grep "every asset response"`, 1 worker): eleven service-tile
+    // glyphs — the nine PNG brand tiles, `tiktok.svg` (the brand strip's
+    // tenth tile), and the "more" glyph `more.svg` — plus sixteen of the
+    // seventeen files under `icons/ui/` (`ls apps/web/public/icons/ui | wc
+    // -l` → 17; `menu-chevron.svg` is on disk but never requested by this
+    // page, so it is not one of the 31), plus the four distinct product-card
+    // PNGs the five popular cards load (cs2, gta5, eft, steam — one image,
+    // steam.png, is reused across the two Steam top-up cards, so five cards
+    // produce four responses, not five). `favicon.svg` did not appear as its
+    // own response in either the isolated run or the full suite — Chromium
+    // answers the icon-link request from its own cache before this
+    // listener ever sees a network round trip for it, so it is matched by
+    // the pattern but contributes 0 of the 31 in practice. 11 + 16 + 4 = 31.
+    const assetUrlPattern = /\/(assets\/[^/]+\.png|icons\/.+|favicon\.svg)(?:[?#]|$)/u;
+
+    page.on("response", (response) => {
+      if (!assetUrlPattern.test(new URL(response.url()).pathname)) return;
+      const contentType = response.headers()["content-type"] ?? "";
+      if (!contentType.startsWith("image/")) {
+        offenders.push(`${response.url()} answered content-type "${contentType}" (status ${String(response.status())})`);
+      }
+    });
+
+    await page.goto("/");
+    await waitForRowToSettle(page);
+    await page.waitForLoadState("networkidle");
+
+    expect(
+      offenders,
+      `asset request(s) that did not answer an image content-type — a status-only check would have missed these: ${offenders.join(" | ")}`,
+    ).toEqual([]);
   });
 });

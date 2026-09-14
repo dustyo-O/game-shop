@@ -1,5 +1,6 @@
 // @layer: unit
 // @spec: 004-storefront-per-the-design
+// @regression
 /**
  * The countdown behind the banner's auto-advance, under fake timers
  * (technical-considerations §2.2, "Countdown"; §4.1's table).

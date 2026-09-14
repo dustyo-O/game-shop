@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.node.json",
     "test": "vitest run",
     "test:e2e": "playwright test",
+    "assets:card-art": "node scripts/render-card-art.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {

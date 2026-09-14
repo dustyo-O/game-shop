@@ -12,7 +12,7 @@
  * ---------------------------------------------------------------------------
  * WHY SIX LINES OF LOGIC EARN A FILE
  * ---------------------------------------------------------------------------
- * Four of the five graded menu criteria are what any menu does. The fifth —
+ * Five of the six graded menu criteria are what any menu does. The fifth —
  * "click any category or item inside the overlay, then nothing changes"
  * (§2.3 crit 5) — is the one a menu gets wrong by accident, because the
  * shortest correct-looking implementation is a document listener that closes

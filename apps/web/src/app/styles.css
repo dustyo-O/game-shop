@@ -37,7 +37,7 @@ body {
 
 /* A failed purchase, next to the control that failed. Red because it is the one
    place on this page where something went wrong, and the shopper has to find it
-   among twelve otherwise identical rows. */
+   among five otherwise identical cards. */
 .buy-product__error {
   margin: 0.5rem 0 0;
   color: #b00020;

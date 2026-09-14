@@ -32,6 +32,16 @@ export interface Product {
   readonly currency: Currency;
 
   /**
+   * The picture's path exactly as the catalogue holds it — `assets/cs2.png`:
+   * relative, no leading slash — or `null`, because the column is nullable and
+   * a row without artwork is still listed. The parser keeps the wire value;
+   * turning it into something an `<img>` can load (resolution against the
+   * page's origin, so it works from `/order/…` as well as from `/`) is the
+   * card's job in `../ui/product-card.ts`, not the parser's.
+   */
+  readonly image: string | null;
+
+  /**
    * Whether this item offers the buy path — true for the three products of type
    * `key`, false for the other nine. The card renders its «Купить» control from
    * this and nothing else (functional spec §2.1).
