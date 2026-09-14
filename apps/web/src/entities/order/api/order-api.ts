@@ -1,24 +1,29 @@
 /**
- * The storefront's half of the two order endpoints: creating one with
- * `POST /api/orders`, and reading one back from `GET /api/orders/:id`.
+ * The storefront's half of the three order endpoints: creating one with
+ * `POST /api/orders`, reading one back from `GET /api/orders/:id`, and — since
+ * spec 005 — putting a promo code on one with `POST /api/orders/:id/promo`.
  *
  * `GET` answers a single JSON object with snake_case wire fields, or a `404`
- * for an id that identifies nothing. `POST` takes `{ sku }` and an
+ * for an id that identifies nothing. `POST /api/orders` takes `{ sku }` and an
  * `Idempotency-Key` header, and answers `201` with the order it created, `200`
  * with the order that key had already created, or `422` for a SKU the shop will
- * not sell (technical-considerations §2.1 and §2.3). This file is the only place
- * that knows any of that, and the only place where an untyped `unknown` becomes
- * an {@link Order}.
+ * not sell (technical-considerations §2.1 and §2.3). `POST
+ * …/promo` takes `{ code }` and answers `200` with the **same** order shape
+ * `GET` sends — repriced, `promo` filled — or a refusal whose body is
+ * `{ reason }` (spec 005, technical-considerations §2.3; R9 on why the field is
+ * not `error`). This file is the only place that knows any of that, and the
+ * only place where an untyped `unknown` becomes an {@link Order}.
  *
- * **Why creation lives here rather than in the feature that calls it.**
- * `features/buy-product` owns the *behaviour* — disable the control, navigate,
- * word the failure in Russian — and this segment owns the *endpoint*. The two
- * requests speak the same resource, share the parsing helpers below and share
- * the `HttpError`-to-named-error mapping; moving one of them up a layer would
- * mean either duplicating those or a feature reaching into an entity's
- * internals. The rule, stated once: an entity's `api` segment holds the requests
- * that read and write that entity; a feature holds what a shopper's click does
- * with them.
+ * **Why creation and the promo write live here rather than in the features
+ * that call them.** `features/buy-product` and `features/apply-promo` own the
+ * *behaviour* — disable the control, navigate or refresh, word the failure in
+ * Russian — and this segment owns the *endpoint*. The three requests speak the
+ * same resource, share the parsing helpers below and share the
+ * `HttpError`-to-named-error mapping; moving one of them up a layer would mean
+ * either duplicating those or a feature reaching into an entity's internals for
+ * the private `toOrder`. The rule, stated once: an entity's `api` segment holds
+ * the requests that read and write that entity; a feature holds what a
+ * shopper's click does with them.
  *
  * **Why parse rather than assert**, in short — the long version is in
  * `entities/product/api/products-api.ts`: `body as Order` compiles against an
@@ -41,13 +46,25 @@
  * body. The rule is re-armed at the point where two slices want the same reader
  * with the same error.
  */
-import { Currency, isOrderStatus, minorUnits, OrderStatus } from "@game-shop/contracts";
+import { Currency, isOrderStatus, type MinorUnits, minorUnits, OrderStatus } from "@game-shop/contracts";
 
 import { getJson, HttpError, postJson } from "../../../shared/api/http.js";
-import type { Order } from "../model/order.js";
+import type { AppliedPromo, Order } from "../model/order.js";
 
 const notFoundStatus = 404;
+const conflictStatus = 409;
 const unprocessableStatus = 422;
+
+/**
+ * The one `409` reason that has its own sentence on the page — «Промокод больше
+ * не действует». The other two `409` reasons (`not_awaiting_payment`,
+ * `another_code_applied`) both mean *the order moved under this tab* and are
+ * carried as a {@link PromoNotApplicableError} for the feature to answer with a
+ * refresh rather than a message. Spelled here rather than imported: the string
+ * is the API's (`apps/api/src/promo/promo.types.ts`, `PromoRedemptionOutcome`),
+ * and `apps/web` is not a dependent of `apps/api`.
+ */
+const exhaustedReason = "exhausted";
 
 /** The response did not have the shape `GET /api/orders/:id` promises. */
 export class OrderResponseError extends Error {
@@ -112,6 +129,65 @@ export class ProductNotPurchasableError extends Error {
   }
 }
 
+/**
+ * The API answered `422` to `POST …/promo`: there is no promo code by that
+ * name for this order's currency.
+ *
+ * A separate class for the reason {@link ProductNotPurchasableError} is one —
+ * it is the refusal a shopper can act on by typing something else, so the
+ * feature says «Такого промокода нет» and leaves the field editable. `code` is
+ * what the shopper typed, untrimmed and in their own case; the API normalises
+ * before it looks (`promo-code.ts`), and this class does not second-guess it.
+ */
+export class PromoCodeUnknownError extends Error {
+  constructor(readonly code: string) {
+    super(`no promo code "${code}"`);
+    this.name = "PromoCodeUnknownError";
+  }
+}
+
+/**
+ * The API answered `409 { reason: "exhausted" }`: the code exists and the
+ * order could take it, but its `max_uses` are spent.
+ *
+ * The one `409` with its own sentence («Промокод больше не действует»), because
+ * it is the one a shopper can understand without knowing anything about the
+ * order: the code is finished, not the order. It is also the refusal spec 005
+ * exists to prove — the counter that holds under parallel requests — so it is
+ * named rather than folded into {@link PromoNotApplicableError}, where a check
+ * reading «the second order got a generic conflict» would prove less.
+ */
+export class PromoCodeExhaustedError extends Error {
+  constructor(readonly code: string) {
+    super(`promo code "${code}" has no uses left`);
+    this.name = "PromoCodeExhaustedError";
+  }
+}
+
+/**
+ * The API answered `409` with any reason but `exhausted` — or with no readable
+ * reason at all.
+ *
+ * `not_awaiting_payment` (the order is no longer `created`) and
+ * `another_code_applied` (it already carries a different code) are both *the
+ * order changed under this tab*, and technical-considerations §2.4 gives the
+ * feature one truthful answer to that: refresh, do not explain. So the two
+ * share a class, and `reason` carries which it was for a log or a check
+ * without the page having to branch on it.
+ *
+ * `"unknown"` is the reason when the `409` had no `{ reason }` to read — a
+ * proxy's HTML page, an empty body. That is still a `409` from the promo route,
+ * still *not applicable*, and still answered by a refresh; what it must never
+ * become is the generic «Не удалось применить промокод», which invites a retry
+ * of something the server has already refused.
+ */
+export class PromoNotApplicableError extends Error {
+  constructor(readonly reason: string) {
+    super(`promo code not applicable: ${reason}`);
+    this.name = "PromoNotApplicableError";
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new OrderResponseError(`order: expected an object, got ${typeof value}`);
@@ -152,20 +228,97 @@ function readProductName(row: Record<string, unknown>): string | null {
 }
 
 /**
- * The one place a raw JSON number becomes a branded amount.
+ * The one place a raw JSON number becomes a branded amount — the order's own
+ * `amount_minor`, and the two figures inside `promo`, all through this.
  *
  * The finiteness check is not ceremony: `JSON.parse` cannot produce `NaN`, but
  * it happily produces `null`, and `minorUnits(null as never)` would sail through
- * to `formatPrice` and render «null ₽» where the amount to pay belongs.
+ * to `formatPrice` and render «null ₽» where the amount to pay belongs. The
+ * non-negativity check restates what the database already holds
+ * (`orders_amount_minor_nonnegative`, `promo_redemptions_discount_range`): a
+ * negative amount is not a value this page could have been sent by the shop,
+ * so it is a body that is not the one the endpoint promises.
+ *
+ * `at` is the record's path in the error message — `order` for the row itself,
+ * `order.promo` for the nested object — so a bad figure is named by where it
+ * is, not only by what it is called.
  */
-function readAmountMinor(row: Record<string, unknown>): Order["amountMinor"] {
-  const value = row["amount_minor"];
+function readMinor(row: Record<string, unknown>, field: string, at = "order"): MinorUnits {
+  const value = row[field];
 
-  if (typeof value !== "number" || !Number.isFinite(value)) {
-    throw new OrderResponseError(`order.amount_minor: expected a finite number, got ${typeof value}`);
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
+    throw new OrderResponseError(
+      `${at}.${field}: expected a finite non-negative number, got ${JSON.stringify(value) ?? typeof value}`,
+    );
   }
 
   return minorUnits(value);
+}
+
+/**
+ * The applied promo code, or `null`.
+ *
+ * The wire carries `promo` on every order — `null` until a code is applied —
+ * and this reader folds **absence** into `null` as well, for the reason
+ * {@link readProductName} does: both mean the page has nothing to say about a
+ * promo. This is the opposite call from the product parser's `image` (a missing
+ * key there is a different payload), and the asymmetry is deliberate: an order
+ * body is read by a page that must render something whether or not the shop
+ * that sent it knows about promo codes yet, and «no promo» is the truthful
+ * rendering of an order from a shop that never had one.
+ *
+ * Everything *inside* the object is strict. A code that is empty, a discount
+ * that is missing or negative, a list amount that is a string — each is a
+ * redemption row that contradicts itself, and each is refused here with the
+ * field's full path (`order.promo.discount_minor`) rather than reaching
+ * `renderOrderDetails` as «LIMIT3 — скидка undefined».
+ */
+function readPromo(row: Record<string, unknown>): AppliedPromo | null {
+  const value = row["promo"];
+
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value !== "object" || Array.isArray(value)) {
+    throw new OrderResponseError(`order.promo: expected an object or null, got ${typeof value}`);
+  }
+
+  // Safe after the check above, as in `asRecord`.
+  const promo = value as Record<string, unknown>;
+  const code = promo["code"];
+
+  if (typeof code !== "string" || code === "") {
+    throw new OrderResponseError(`order.promo.code: expected a non-empty string, got ${JSON.stringify(code)}`);
+  }
+
+  return {
+    code,
+    discountMinor: readMinor(promo, "discount_minor", "order.promo"),
+    listAmountMinor: readMinor(promo, "list_amount_minor", "order.promo"),
+  };
+}
+
+/**
+ * The `reason` out of a promo refusal's body, or `null` when there is none.
+ *
+ * This is the narrowing `shared/api/http.ts` declines to do: `HttpError.body`
+ * is `unknown` because the transport does not know which endpoint answered,
+ * and this file does — `{ reason }` is the shape `POST …/promo` promises for
+ * its `409`s and `422`s (`apps/api/src/promo/promo.types.ts`). Anything else —
+ * Nest's default `{ statusCode, message, error }`, the `null` `readBody`
+ * answers for a non-JSON page — reads as `null`, and the caller decides what a
+ * `409` with no reason means. It is not a throw: a refusal with an unreadable
+ * body is still a refusal, and the status is the fact that matters first.
+ */
+function readReason(body: unknown): string | null {
+  if (typeof body !== "object" || body === null || Array.isArray(body)) {
+    return null;
+  }
+
+  const reason = (body as { reason?: unknown }).reason;
+
+  return typeof reason === "string" && reason !== "" ? reason : null;
 }
 
 function readCurrency(row: Record<string, unknown>): Currency {
@@ -204,7 +357,7 @@ function readStatus(row: Record<string, unknown>): OrderStatus {
  *     order that says it is delivered and hands over no key is a body that
  *     contradicts its own contract, and it is caught here rather than rendering
  *     «Ключ» with nothing after it. The API treats the same impossibility as a
- *     `500` on its side (`OrdersService.findOrder`).
+ *     `500` on its side (`OrderViewService.findOrder`).
  *   - **anything else:** `null`, whatever arrived. Postgres already refuses to
  *     emit a key for an undelivered order (the `CASE WHEN orders.status =
  *     'delivered'` in the SELECT), and pinning it again here means a server that
@@ -218,8 +371,9 @@ function toOrder(value: unknown): Order {
     id: readString(row, "id"),
     sku: readString(row, "sku"),
     productName: readProductName(row),
-    amountMinor: readAmountMinor(row),
+    amountMinor: readMinor(row, "amount_minor"),
     currency: readCurrency(row),
+    promo: readPromo(row),
   };
 
   const status = readStatus(row);
@@ -336,6 +490,75 @@ export async function createOrder(sku: string, idempotencyKey: string): Promise<
   } catch (error: unknown) {
     if (error instanceof HttpError && error.status === unprocessableStatus) {
       throw new ProductNotPurchasableError(sku);
+    }
+
+    throw error;
+  }
+}
+
+/**
+ * Put a promo code on an order, and answer the order as the shop now holds it.
+ *
+ * `POST /api/orders/:id/promo` with `{ code }` — the code **as typed**; the
+ * API trims and upper-cases it (`promo-code.ts`), and nothing here pre-empts
+ * that, so the value the server normalises is the one the shopper actually
+ * entered. There is no amount in the request and no way to put one there: the
+ * request type on the API side is *a code and nothing else*, and the whole
+ * argument of functional spec §2.3 is that the page never sends a number.
+ *
+ * **The `200` body is parsed by `toOrder`, and that is why this function lives
+ * in the entity.** The answer is the same `OrderView` `GET` sends — repriced,
+ * `promo` filled — and parsing it is the success check: a `200` whose body is
+ * not an order is a failure whatever the status said. `toOrder` is private to
+ * this file on purpose (no page builds an `Order` from a body the parser never
+ * saw), so the request that needs it lives beside it rather than a feature
+ * reaching in. The feature that calls this does not paint from the returned
+ * order — it asks the poll to refresh, one writer of the page's content region
+ * (technical-considerations §2.4) — but it still gets the `Order` back, because
+ * "the server said 200 and meant it" is a fact the caller should not have to
+ * take on trust.
+ *
+ * Rejects with, in the order they are told apart:
+ *
+ *   - {@link OrderNotFoundError} on `404` — the same class `fetchOrder` throws,
+ *     one fact whichever endpoint reports it;
+ *   - {@link PromoCodeUnknownError} on `422` — no such code;
+ *   - {@link PromoCodeExhaustedError} on `409 { reason: "exhausted" }`;
+ *   - {@link PromoNotApplicableError} on any other `409`, carrying the reason
+ *     when the body had one and `"unknown"` when it did not — the case
+ *     `readBody`'s never-throw guarantee exists for (R11): an HTML `409` from a
+ *     proxy is still a `409` from the promo route;
+ *   - and whatever went wrong otherwise — {@link OrderResponseError} for a
+ *     `200` that is not an order, `HttpError` for any other status, a
+ *     `TypeError` from `fetch` when the API cannot be reached at all.
+ *
+ * A `409` is read as *some* promo refusal before its reason is read, not after:
+ * the status is the fact the server committed to, and a `409` whose body was
+ * lost in transit must not fall through to the generic path, where the feature
+ * would invite a retry of something the server has already refused.
+ */
+export async function applyPromo(orderId: string, code: string): Promise<Order> {
+  try {
+    return toOrder(await postJson(`/api/orders/${encodeURIComponent(orderId)}/promo`, { code }));
+  } catch (error: unknown) {
+    if (error instanceof HttpError) {
+      if (error.status === notFoundStatus) {
+        throw new OrderNotFoundError(orderId);
+      }
+
+      if (error.status === unprocessableStatus) {
+        throw new PromoCodeUnknownError(code);
+      }
+
+      if (error.status === conflictStatus) {
+        const reason = readReason(error.body) ?? "unknown";
+
+        if (reason === exhaustedReason) {
+          throw new PromoCodeExhaustedError(code);
+        }
+
+        throw new PromoNotApplicableError(reason);
+      }
     }
 
     throw error;

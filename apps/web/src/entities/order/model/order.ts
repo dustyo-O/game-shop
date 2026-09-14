@@ -16,6 +16,33 @@
 import type { Currency, MinorUnits, OrderStatus } from "@game-shop/contracts";
 
 /**
+ * A promo code as it stands on one order — the storefront's half of
+ * `AppliedPromoView` in `apps/api/src/orders/orders.types.ts`.
+ *
+ * Three fields and an identity between them that the database enforces
+ * (`promo_redemptions_discount_range`): `discountMinor` is what actually came
+ * off, `listAmountMinor` is what the order cost before, and the order's own
+ * `amountMinor` is their difference. The page never computes any of the three;
+ * it prints what it was given (functional spec §2.3, *"the page only displays
+ * it"*). That is why `discountMinor` is here at all rather than
+ * being derived on the page from the other two: a derived figure would be the
+ * first number in this storefront that the server did not decide.
+ *
+ * `discountMinor` may be `0` — an amount-typed code clamped against a price it
+ * exceeds — and the render treats that as "a code, but nothing to strike out".
+ */
+export interface AppliedPromo {
+  /** The code as the shop stores it — trimmed, upper-case — e.g. «LIMIT3». Not what the shopper typed. */
+  readonly code: string;
+
+  /** **Kopecks.** The discount taken off, already clamped to the list price. `promo_redemptions.discount_minor`. */
+  readonly discountMinor: MinorUnits;
+
+  /** **Kopecks.** The order's `amount_minor` as it stood before the code. `promo_redemptions.list_amount_minor`. */
+  readonly listAmountMinor: MinorUnits;
+}
+
+/**
  * The fields an order carries in **every** state, delivered or not.
  *
  * Split out only so {@link Order} can pair them with the two `status`/`code`
@@ -43,10 +70,15 @@ interface OrderCore {
   readonly productName: string | null;
 
   /**
-   * **Kopecks.** `129000` is «1290 ₽». `orders.amount_minor` as it was recorded
-   * at creation time; the API reads the column and never recomputes it, so this
-   * is the amount the order was created with whatever the catalogue has since
-   * done.
+   * **Kopecks.** `129000` is «1290 ₽». `orders.amount_minor` — **the amount to
+   * pay**, as the column holds it now. Recorded from the catalogue at creation
+   * and, since spec 005, changed exactly once if a promo code is applied while
+   * the order is still `created`: the API reprices the column under the order
+   * lock and the payment path reads it back without recomputing anything
+   * (technical-considerations §2.2). So this is the discounted amount whenever
+   * {@link OrderCore.promo} is set, and the list price is then only reachable
+   * through `promo.listAmountMinor`; whatever the catalogue has since done to
+   * the product's price changes neither.
    *
    * Named `amountMinor` where the wire calls it `amount_minor`: the snake_case
    * belongs to the JSON, and it stops at the parser.
@@ -54,6 +86,23 @@ interface OrderCore {
   readonly amountMinor: MinorUnits;
 
   readonly currency: Currency;
+
+  /**
+   * The promo code applied to this order, or `null` — which is what every order
+   * carries until a code is applied, and what most carry forever.
+   *
+   * **On `OrderCore`, not on a status branch, deliberately.** A redemption is a
+   * fact about the order from the moment it lands until the row is gone: it is
+   * `created` when the code goes on, it is still there when the order is
+   * `paid`, `delivered`, even `payment_failed`. Typing it on the core is what
+   * makes `renderOrderDetails`'s «Промокод» row a check on `order.promo`, never
+   * on `order.status` — the row survives `paid → delivered` because nothing
+   * about it ever depended on the status (technical-considerations §2.4).
+   *
+   * `null` here is the wire's `null` and *also* the wire's absence: the parser
+   * folds the two so the page has one shape to render, not two to ask about.
+   */
+  readonly promo: AppliedPromo | null;
 }
 
 /**

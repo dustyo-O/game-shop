@@ -36,7 +36,7 @@ _Every choice below is justified against one requirement: the system must stay c
 | `issuance_attempts` | One row per supplier call | `request_id` UNIQUE; FK to `orders` |
 | `deliveries` | The issued key bound to an order | `order_id` UNIQUE, `request_id` UNIQUE; FK to `orders` |
 | `promo_codes` | Supplied promo definitions | `code` UNIQUE, `used_count <= max_uses` CHECK |
-| `promo_redemptions` | Which order used which promo | UNIQUE (`promo_id`, `order_id`) |
+| `promo_redemptions` | Which order used which promo | PRIMARY KEY (`order_id`); FK to `orders` and `promo_codes`. _Amended in Phase 5 (spec 005): was UNIQUE (`promo_id`, `order_id`); strengthened because the functional spec allows one code per order, and the stronger key implies the weaker._ |
 | `supplier_keys` | The fifty keys — **supplier-side** inventory | `code` UNIQUE, `claimed_by_request_id` UNIQUE |
 | `supplier_requests` | Supplier's own idempotency ledger | `request_id` UNIQUE |
 
@@ -61,7 +61,7 @@ The centre of the system. Each invariant names the mechanism that enforces it an
 | I5 | One supplier request → one code | Supplier stores `request_id → code`; a repeat returns the stored code | A retry after timeout issues a second key |
 | I6 | One key → at most one request | `supplier_keys.claimed_by_request_id` UNIQUE; claim by conditional `UPDATE … RETURNING` | The same key is sold twice |
 | I7 | A promo is used at most N times | `UPDATE … SET used_count = used_count + 1 WHERE used_count < max_uses RETURNING` | Parallel redemptions overshoot the limit |
-| I8 | One promo redemption per order | UNIQUE (`promo_id`, `order_id`) | A retried order double-counts against the limit |
+| I8 | One promo redemption per order | PRIMARY KEY (`order_id`); `INSERT … ON CONFLICT (order_id) DO NOTHING`, written only under I4's order lock. _Amended in Phase 5 (spec 005) from UNIQUE (`promo_id`, `order_id`) — see §3.1_ | A retried order double-counts against the limit, or a second code stacks on an already-discounted price |
 | I9 | Final states are terminal | Status-guarded transitions; `delivered` and `payment_failed` accept no further transitions | A late webhook resurrects a completed order |
 
 ### 3.1 The SQL underneath
@@ -182,12 +182,16 @@ RETURNING *;
 -- 0 rows => exhausted; reject the redemption
 ```
 
-**I8 — one redemption per order.** Keeps a retried order from consuming a second use of the same code.
+**I8 — one redemption per order.** Keeps a retried order from consuming a second use of the same code — and, since Phase 5, from taking a second code at all. _Amended in Phase 5 (spec 005): the key was `UNIQUE (promo_id, order_id)` and is now `PRIMARY KEY (order_id)`, strengthened because the functional spec allows one code per order; the stronger key implies the weaker — a table with at most one row per `order_id` has at most one row per `(promo_id, order_id)` — so every guarantee the original was written to give still holds._
 
 ```sql
-INSERT INTO promo_redemptions (promo_id, order_id)
-VALUES ($1, $2)
-ON CONFLICT (promo_id, order_id) DO NOTHING;
+INSERT INTO promo_redemptions (order_id, promo_id, list_amount_minor, discount_minor)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (order_id) DO NOTHING
+RETURNING order_id;
+-- 0 rows => a second code on this order. Impossible under I4's order lock, which the
+--           redemption holds and has already read this table under — so a thrown
+--           error that rolls back the I7 increment, not an outcome
 ```
 
 **I9 — final states are terminal.** Every transition names the states it is allowed to leave from, so a late webhook cannot resurrect a completed order.
@@ -287,8 +291,8 @@ RETURNING *;
 
   | Layer | What it proves | RED method | Command |
   | --- | --- | --- | --- |
-  | Vitest in `apps/web` — `environment: "node"`, no jsdom, colocated `src/**/*.test.ts` | The pure models the DOM calls. At the phase's close: `pages/storefront/model/{carousel,countdown,menu,select-popular-products}.test.ts` and `entities/product/api/products-api.test.ts` — 5 files / 56 tests, ~200 ms | As the API suites practise it — a mutation of the one line the test guards. `wrapIndex` without the `+ count` normalisation fails only *first→last* and leaves *last→first* green (the quiet half-failure); `restart` without `clearTimeout` fails "restart twice → fires once" with two calls | `pnpm test:web`, chained after the API suites in `pnpm test` |
-  | Playwright under `apps/web/e2e/` — one Chromium project, `workers: 1`, `retries: 0` | The five graded interactions, the inert controls and the buy-through in a real browser a reviewer can run, arriving with the slices that own them; at the phase's close nine spec files — eight behaviour-level guards and one acceptance walk — 58 tests in ~45 s. The carousel's 5-second policy runs under `page.clock`; the buy-through spec must not install it, or the order page's poll freezes | Weakening nothing in `src/`. Every "nothing happened" assertion is pointed, identical, at Купить — it failed on three lines (a `document` request to `/order/ord_…`, a `POST /api/orders`, the URL changed). Every "state changed" assertion pushes the clock past the boundary | `pnpm test:e2e` — **not** chained into `pnpm test`: it needs a browser and starts servers. Install once: `pnpm exec playwright install chromium` (one browser, revision 1243, a ~276 MB download) |
+  | Vitest in `apps/web` — `environment: "node"`, no jsdom, colocated `src/**/*.test.ts` | The pure models the DOM calls. At the phase's close: `pages/storefront/model/{carousel,countdown,menu,select-popular-products}.test.ts` and `entities/product/api/products-api.test.ts` — 5 files / 56 tests, ~200 ms; Phase 5 (spec 005) added `entities/order/api/order-api.test.ts` — 6 files / 69 tests | As the API suites practise it — a mutation of the one line the test guards. `wrapIndex` without the `+ count` normalisation fails only *first→last* and leaves *last→first* green (the quiet half-failure); `restart` without `clearTimeout` fails "restart twice → fires once" with two calls | `pnpm test:web`, chained after the API suites in `pnpm test` |
+  | Playwright under `apps/web/e2e/` — one Chromium project, `workers: 1`, `retries: 0` | The five graded interactions, the inert controls and the buy-through in a real browser a reviewer can run, arriving with the slices that own them; at the phase's close nine spec files — eight behaviour-level guards and one acceptance walk — 58 tests in ~45 s; Phase 5 (spec 005) added `promo.spec.ts` — ten files, 65 tests in ~58 s. The carousel's 5-second policy runs under `page.clock`; the buy-through spec must not install it, or the order page's poll freezes | Weakening nothing in `src/`. Every "nothing happened" assertion is pointed, identical, at Купить — it failed on three lines (a `document` request to `/order/ord_…`, a `POST /api/orders`, the URL changed). Every "state changed" assertion pushes the clock past the boundary | `pnpm test:e2e` — **not** chained into `pnpm test`: it needs a browser and starts servers. Install once: `pnpm exec playwright install chromium` (one browser, revision 1243, a ~276 MB download) |
 
   `retries: 0` for the reason the race tests record their RED output: a test that passes on the second try is a false statement, not a pass.
 
@@ -325,4 +329,6 @@ Stated plainly here so they carry into the README rather than being discovered b
 - **Serverless costs cold starts.** The fifty-webhook scenario may run slower than it would against a long-lived process. That is a fair price for proving the guarantees are not process-local, and the scripts also run locally.
 - **No signature verification on webhooks.** Waived by the assignment; in production this endpoint is unauthenticated and would need HMAC verification.
 - **A test affordance on order creation.** The API accepts an explicit order id behind a configuration flag, used only by seeds and the "webhook before order" script. Without it that scenario cannot be staged deterministically, since order ids are otherwise server-generated.
+- **A demo affordance on promo counters.** `POST /api/admin/promo-codes/reset`, behind the admin bearer token, runs `UPDATE promo_codes SET used_count = 0` and returns the four codes with their counters. It exists so that `pnpm race promo` can run twice against a deployed shop whose database the check cannot reach — race scripts take a base URL and nothing else. It zeroes the counter and leaves `promo_redemptions` untouched, so after it the counter and the ledger disagree *by design*: the ledger keeps the true history — a paid order's `promo` row, its list price and its discount all survive — and the counter becomes "uses since the last reset". It is deliberately not `DELETE FROM promo_redemptions`, which would keep the two in agreement at zero by erasing what paid orders paid, leaving `orders.amount_minor` showing a discount with no code beside it. Local checks never call it: they clean up through the harness's CTE, which deletes their own redemptions and decrements each counter by exactly that count, so the baseline's `sum(used_count) = 0` and `promo_redemptions = 0` both hold afterwards. The shop itself never calls it. _Added in Phase 5 (spec 005), beside the test affordance above; technical-considerations §2.3, R5, R15._
+- **The apply-vs-pay window.** The payment simulator reads `orders.amount_minor` without a lock and then delivers the webhook; a code applied to a `created` order in the milliseconds between that read and `markPaid` is applied to a list-price payment, and the processor never compares amounts (a Phase 1 decision: "settlement belongs to processing"). The status guard closes every other ordering — a code cannot land on an order that is already `paid` — and the window is one simulated-provider round trip. The honest fix — compare `payment_events.amount_minor` to `orders.amount_minor` under the order lock in the processor and route a mismatch to `payment_failed` — changes the payment path and the fifty-webhook race's staged amounts, and is out of Phase 5's scope. Documented, not closed. _Added in Phase 5 (spec 005), R6._
 - **`READ COMMITTED` plus explicit locks, not `SERIALIZABLE`.** The chosen path is more verbose but visible; the alternative hides the guarantee in retry logic.

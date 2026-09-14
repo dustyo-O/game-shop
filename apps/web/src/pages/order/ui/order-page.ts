@@ -1,8 +1,9 @@
 /**
  * The order page at `/order/:id` — what was bought, what it costs, where the
- * order is, the key once the shop has handed it over, and the controls that pay
- * for it (functional spec §2.2, §2.3, §2.4 and §2.6,
- * technical-considerations §2.6).
+ * order is, the key once the shop has handed it over, the promo-code field
+ * while it still awaits payment, and the controls that pay for it (functional
+ * spec §2.2, §2.3, §2.4 and §2.6, technical-considerations §2.6; spec 005 §2.2
+ * for the field).
  *
  * Built like the catalogue page and for the same reason: the element is returned
  * **synchronously** and filled in when the request lands. An `async` factory the
@@ -65,6 +66,7 @@ import {
   renderOrderRecoveryNotice,
   type Order,
 } from "../../../entities/order/index.js";
+import { createPromoForm, type PromoForm } from "../../../features/apply-promo/index.js";
 import { createPaymentControls, type PaymentControls } from "../../../features/simulate-payment/index.js";
 import { createElement } from "../../../shared/lib/dom.js";
 import { createPoll, PollDecision, type Poll } from "../model/poll.js";
@@ -159,15 +161,35 @@ function renderNotice(message: string, kind: NoticeKind): HTMLParagraphElement {
 }
 
 /**
- * The parts of an order that can change while a shopper is looking at it.
+ * The parts of an order that can change while a shopper is looking at it —
+ * the memo `showOrder` compares before it repaints anything.
  *
- * Everything else — the product, the amount, the id — is fixed at creation, so
- * these two are the whole of "has anything happened?". See
- * {@link createOrderPage}'s `showOrder` for why that question is asked at all.
+ * Everything else — the product, the id — is fixed at creation, and the amount
+ * moves only when the promo does, so these three are the whole of "has
+ * anything happened?". See {@link createOrderPage}'s
+ * `showOrder` for why that question is asked at all.
+ *
+ * **`promoCode` is load-bearing, and forgetting it fails silently.** Since spec
+ * 005 an order awaiting payment can gain a promo code — and with it a new
+ * amount — without its status moving: `created` before, `created` after, no
+ * key either way. The promo form does not paint the applied code itself; it
+ * asks the poll to re-read the order and relies on *this* comparison to notice
+ * the difference (spec 005 technical-considerations §2.4, "the repaint rule";
+ * R12). Without `promoCode` here, the sequence is: the `POST` succeeds, the
+ * refresh returns the promo, the memo sees `created === created` and
+ * `null === null`, and returns early. The form stays disabled forever, the
+ * amount stays at the list price, no «Промокод» row appears — until a reload
+ * builds the page from nothing, at which point everything looks right, so a
+ * manual check that reloads "proves" it works. The amount is deliberately
+ * *not* a fourth field: it changes only when the promo does, and one witness
+ * is enough. The e2e's first test (apply by Enter, row appears, URL unchanged)
+ * is the guard, and dropping this field is its RED.
  */
 interface RenderedOrder {
   readonly status: OrderStatus;
   readonly code: string | null;
+  /** The applied promo code, or `null` — `order.promo?.code`, the one field of the promo that identifies it. */
+  readonly promoCode: string | null;
 }
 
 /** Build the order page for `orderId`, start reading the order, and keep it current. */
@@ -189,18 +211,28 @@ export function createOrderPage(orderId: string): HTMLElement {
    * Russian failure sentence under it, and the focus ring of whoever was
    * navigating by keyboard, once a second, forever.
    *
-   * Comparing the two mutable fields costs nothing and makes the poll invisible
-   * until something actually happens, at which point the whole region is
-   * replaced at once.
+   * Comparing the three mutable fields costs nothing and makes the poll
+   * invisible until something actually happens, at which point the whole region
+   * is replaced at once. The same memo is what keeps a shopper's half-typed
+   * promo code in its field while the order is read once a second under it —
+   * and, through `promoCode`, what notices the moment that code has been
+   * applied (see {@link RenderedOrder}).
    */
   function showOrder(order: Order): void {
     content.querySelector(`.${noticeClass}`)?.remove();
 
-    if (rendered !== null && rendered.status === order.status && rendered.code === order.code) {
+    const promoCode = order.promo?.code ?? null;
+
+    if (
+      rendered !== null &&
+      rendered.status === order.status &&
+      rendered.code === order.code &&
+      rendered.promoCode === promoCode
+    ) {
       return;
     }
 
-    rendered = { status: order.status, code: order.code };
+    rendered = { status: order.status, code: order.code, promoCode };
 
     /**
      * The page does not decide whether payment controls are offered — it asks
@@ -211,6 +243,14 @@ export function createOrderPage(orderId: string): HTMLElement {
      * cosmetic.
      */
     const paymentArea = payment.render(order);
+
+    /**
+     * Likewise the promo field: the feature answers from the order — a field
+     * only while it is `created` with no code on it, `null` otherwise — and the
+     * page only asks. Once a code is applied, the entity's «Промокод» row in
+     * the details above is what stands in the field's place (spec 005 §2.2).
+     */
+    const promoArea = promo.render(order);
 
     /**
      * What the shop is doing about an order it could not deliver (functional
@@ -234,8 +274,12 @@ export function createOrderPage(orderId: string): HTMLElement {
      */
     const recoveryNotice = renderOrderRecoveryNotice(order);
 
+    // Details, recovery notice, promo form, then payment controls — the field
+    // sits above the buttons (spec 005 §2.2's first criterion), and the form
+    // and the buttons are siblings here, never nested, so Enter in the field
+    // can reach only the form's own submit button.
     content.replaceChildren(
-      ...[renderOrderDetails(order), recoveryNotice, paymentArea].filter(
+      ...[renderOrderDetails(order), recoveryNotice, promoArea, paymentArea].filter(
         (part): part is HTMLElement => part !== null,
       ),
     );
@@ -431,6 +475,27 @@ export function createOrderPage(orderId: string): HTMLElement {
    * three runs with it restored, an intermediate state in all three.
    */
   const payment: PaymentControls = createPaymentControls({
+    orderId,
+    onOrderMayHaveChanged: () => {
+      poll.refreshNow();
+    },
+  });
+
+  /**
+   * The promo field, built once and re-rendered from every order this page
+   * reads — the same shape and the same circular closure as `payment` above,
+   * hence the same load-bearing annotation.
+   *
+   * Its callback is the same `refreshNow`, and here it is not about catching
+   * a short-lived state but about **who paints the applied code**: the feature
+   * does not, on purpose (its header says why), so this read is the only way
+   * the row, the new amount and the field's disappearance reach the screen —
+   * through `showOrder`'s memo, which is why {@link RenderedOrder} carries
+   * `promoCode`. `refreshNow` queues behind an in-flight read rather than
+   * overlapping it, so a scheduled read that left before the promo committed
+   * lands first, is suppressed, and the refresh paints the row without flicker.
+   */
+  const promo: PromoForm = createPromoForm({
     orderId,
     onOrderMayHaveChanged: () => {
       poll.refreshNow();

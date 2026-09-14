@@ -38,7 +38,7 @@
  * ---------------------------------------------------------------------------
  * WHAT THE PUBLISHER KNOWS, AND WHY IT KNOWS IT WITHOUT A SECOND QUERY
  * ---------------------------------------------------------------------------
- * {@link OrdersService.findOrder} is the polled statement, and it now selects
+ * {@link OrderViewService.findOrder} is the polled statement, and it now selects
  * one more expression: a `CASE` over an `EXISTS` against
  * `payment_events_unprocessed_order_idx`. So "is there pending work here?" is
  * answered inside the round trip the poll was making anyway, and this notifier
@@ -124,7 +124,7 @@ export class OrderPendingEventsNotifier {
    * never throwing.**
    *
    * Both properties are for the benefit of the caller,
-   * {@link OrdersService.findOrder}, which is on the response path of the
+   * {@link OrderViewService.findOrder}, which is on the response path of the
    * endpoint `apps/web` polls once a second per open order page:
    *
    *   - **Synchronous and `void`.** There is no promise for the poll to wait on,

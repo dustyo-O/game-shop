@@ -43,6 +43,13 @@
       "when": 1789127576577,
       "tag": "0005_recovery_list_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1789397306038,
+      "tag": "0006_promo_codes",
+      "breakpoints": true
     }
   ]
 }

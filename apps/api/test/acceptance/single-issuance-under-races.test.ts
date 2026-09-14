@@ -250,7 +250,7 @@ const SETTLE_TIMEOUT_MS = 10_000;
  * the exact mechanism `apps/web/src/pages/order/model/poll.ts` uses, run here
  * directly rather than through a browser. This is also processing trigger 3:
  * every call this makes is itself an opportunistic drain of that order's
- * pending events (`OrdersService.findOrder`), which is why §2.3's test below
+ * pending events (`OrderViewService.findOrder`), which is why §2.3's test below
  * needs no admin sweep to settle.
  */
 async function waitUntilSettled(baseUrl: string, orderId: string): Promise<OrderView> {

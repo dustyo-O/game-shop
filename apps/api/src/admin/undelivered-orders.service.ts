@@ -101,7 +101,7 @@
  *
  * Everywhere else in `apps/api` a status list is bound as one parameter —
  * `WHERE status = ANY($3)` in `OrderTransitionService`, `= ANY($2)` in
- * `OrdersService.findOrder` — so that a statement's text stays stable across
+ * `OrderViewService.findOrder` — so that a statement's text stays stable across
  * `from`-lists of different lengths. Here it would cost the index.
  *
  * Measured when this file was written, this project's Postgres 16.11 container,
@@ -331,7 +331,7 @@ export class UndeliveredOrdersService {
    * never sent from Postgres to this process cannot reach a log line, a stack
    * trace, an error reporter or a response by any route at all. `deliveries`
    * appears in this statement only inside `NOT EXISTS (SELECT 1 …)`, which reads
-   * no column of it. Same gating-in-SQL `OrdersService.findOrder` does with its
+   * no column of it. Same gating-in-SQL `OrderViewService.findOrder` does with its
    * `CASE WHEN status = 'delivered'`, and for the same reason: filtering after
    * the fact leaves the key in a local variable that something downstream might
    * one day serialise.

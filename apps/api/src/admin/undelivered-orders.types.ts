@@ -43,7 +43,7 @@
  *
  *   1. the statement never selects one, so no key is sent from Postgres to this
  *      process at all (`./undelivered-orders.service.ts`, and the `CASE` in
- *      `OrdersService.findOrder` that establishes the pattern); and
+ *      `OrderViewService.findOrder` that establishes the pattern); and
  *   2. these types have nowhere to put one, so a statement that one day forgot
  *      still could not publish it.
  */

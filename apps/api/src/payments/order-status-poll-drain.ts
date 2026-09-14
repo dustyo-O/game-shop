@@ -57,7 +57,7 @@
  *
  * ### So the trigger is gated, and the gate costs nothing
  *
- * `OrdersService.findOrder` — the statement the poll was already running —
+ * `OrderViewService.findOrder` — the statement the poll was already running —
  * carries one extra selected expression: a `CASE` over an `EXISTS` against the
  * partial index `payment_events_unprocessed_order_idx`, evaluated only for an
  * order that is still in flight. It publishes through
@@ -122,7 +122,7 @@
  * per instance and a drain opens transactions of its own, so a caller holding
  * the connection would wait `CONNECTION_TIMEOUT_MS` for a connection it is
  * itself holding. Two independent things make that unreachable here.
- * `OrdersService.findOrder` opens no transaction — it is one `SELECT` — and
+ * `OrderViewService.findOrder` opens no transaction — it is one `SELECT` — and
  * this drain starts from a scheduled continuation after that statement has
  * resolved, not from inside the call.
  *

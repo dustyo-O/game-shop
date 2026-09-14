@@ -12,7 +12,7 @@
  * Field names are snake_case because they are wire fields, matching §2.3 and
  * `GET /api/products` before it. The database row they come from is camelCase on
  * the TypeScript side, and each shape is built in exactly one place —
- * `OrdersService.createOrder` and `OrdersService.findOrder`.
+ * `OrdersService.createOrder` and `OrderViewService.findOrder`.
  */
 import type { Currency, MinorUnits, OrderStatus } from "@game-shop/contracts";
 
@@ -161,6 +161,41 @@ export interface ExistingOrder extends Omit<CreatedOrder, "status"> {
 export type CreateOrderResponse = CreatedOrder | ExistingOrder;
 
 /**
+ * The promo code an order carries, as the ledger recorded it (spec 005,
+ * technical-considerations §2.3 "The order view"; `promo_redemptions` in
+ * `packages/db/src/schema/promo.ts`).
+ *
+ * Three fields and no fourth. What is **not** here is as deliberate as what
+ * is: no `kind`, no `value`, no percentage. The wire carries the applied
+ * kopecks and nothing the page could recompute a price from, because the page
+ * has no business recomputing a price — the server priced the code once, under
+ * the order lock, and wrote the result to two columns that never change again.
+ * A percentage on the wire would be an invitation to multiply it by something
+ * on the client and show a number the shop never agreed to.
+ *
+ * The arithmetic the three fields satisfy, always:
+ *
+ *   list_amount_minor = amount_minor + discount_minor
+ *
+ * `amount_minor` (on {@link OrderViewCore}) is what is owed; `list_amount_minor`
+ * is what the catalogue said before the code; `discount_minor` is the applied,
+ * *clamped* discount — so the identity holds even for an `amount` code larger
+ * than the price, where the order costs 0 and the discount is the whole list
+ * price rather than the code's face value. `promo_redemptions_discount_range`
+ * refuses any row for which it would not.
+ */
+export interface AppliedPromoView {
+  /** The code as stored — upper-case, trimmed — e.g. `LIMIT3`. `promo_codes.code`. */
+  readonly code: string;
+
+  /** **Kopecks.** The discount actually taken off, clamped to the list price. `promo_redemptions.discount_minor`. */
+  readonly discount_minor: MinorUnits;
+
+  /** **Kopecks.** `orders.amount_minor` as it stood before the code. `promo_redemptions.list_amount_minor`. */
+  readonly list_amount_minor: MinorUnits;
+}
+
+/**
  * The fields an order view carries in **every** state, delivered or not.
  *
  * Split out only so {@link OrderView} can pair them with the two `status`/`code`
@@ -186,7 +221,7 @@ interface OrderViewCore {
    * It is here so the order page can render itself from **one** request. The
    * order row does not carry a name (a copied name would go stale the moment the
    * catalogue was corrected), so the read joins `products` on the SKU — see
-   * `OrdersService.findOrder`.
+   * `OrderViewService.findOrder`.
    *
    * **Nullable, and deliberately so.** The join is a LEFT JOIN because an order
    * is a historical record that must outlive its catalogue row
@@ -204,10 +239,13 @@ interface OrderViewCore {
   readonly product_name: string | null;
 
   /**
-   * **Kopecks, not roubles** — `129000` is «1 290 ₽». `orders.amount_minor`,
-   * computed by the server at creation time and never recomputed here: this
-   * endpoint reads the column, so the amount the page shows is the amount the
-   * order was created with, whatever the catalogue has since done.
+   * **Kopecks, not roubles** — `129000` is «1 290 ₽». `orders.amount_minor`:
+   * the amount to pay. Copied from the catalogue at creation and changed at
+   * most once — by a promo code, under the order lock, while the order is
+   * still `created` (spec 005, `OrderRepricingService`) — never by anything
+   * the client sends. This endpoint reads the column, so the amount the page
+   * shows is the amount the shop will charge, whatever the catalogue has since
+   * done and whatever the request body said.
    *
    * Formatting is the frontend's job, as it is for `GET /api/products` — see
    * `CatalogProduct.price_minor` and `packages/contracts/src/money.ts`.
@@ -216,6 +254,29 @@ interface OrderViewCore {
 
   /** ISO 4217, from `orders.currency`. `RUB` throughout. */
   readonly currency: Currency;
+
+  /**
+   * The promo code applied to this order, or `null` if none has been.
+   *
+   * **Always present** — the same stable-field rule as `code` below: a client
+   * that reads `order.promo` never has to ask whether the field exists yet, and
+   * `null` is the answer for an order no code has touched, not an absent key.
+   * It is on the core rather than on one union member because it is **not a
+   * function of status**: a code is applied while the order is `created`, and
+   * the row that records it (`promo_redemptions`, one per order — its PRIMARY
+   * KEY) is never deleted by the application, so the field survives
+   * `created → paid → delivering → delivered` unchanged. The status page's promo
+   * row is gated on this field being non-`null`, never on status
+   * (technical-considerations §2.4).
+   *
+   * Filled by `OrderViewService.findOrder` from a `LEFT JOIN` to the ledger,
+   * in the same single statement as everything else here — 1:0..1, no row
+   * multiplication. When it is set, {@link OrderViewCore.amount_minor} is
+   * already the discounted amount; the list price is only reachable through
+   * `promo.list_amount_minor` (see {@link AppliedPromoView} for the identity
+   * the three amounts satisfy).
+   */
+  readonly promo: AppliedPromoView | null;
 }
 
 /**
@@ -232,7 +293,7 @@ interface OrderViewCore {
  *
  *   - **Producing one:** there is no way to build a `delivered` view without a
  *     `code`, and no way to attach a `code` to any other status. The literal
- *     `null` in `OrdersService.findOrder`'s non-delivered branch is the only
+ *     `null` in `OrderViewService.findOrder`'s non-delivered branch is the only
  *     value that branch can return.
  *   - **Consuming one:** `apps/web` cannot read `order.code` as a string until
  *     it has narrowed on `order.status === "delivered"`, so the key markup
@@ -276,7 +337,7 @@ export type OrderView =
        * `deliveries` insert commit in one transaction (technical-considerations
        * §2.5 steps 5-6), so a single `SELECT` sees both or neither. An order
        * that reads `delivered` therefore has a delivery row, and
-       * `OrdersService.findOrder` treats the impossible case as a `500` rather
+       * `OrderViewService.findOrder` treats the impossible case as a `500` rather
        * than answering with a body that contradicts its own type.
        */
       readonly code: string;

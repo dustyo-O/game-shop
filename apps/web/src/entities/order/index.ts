@@ -16,12 +16,16 @@
  * what the slice offers.
  */
 export {
+  applyPromo,
   createOrder,
   fetchOrder,
   OrderNotFoundError,
   OrderResponseError,
   ProductNotPurchasableError,
+  PromoCodeExhaustedError,
+  PromoCodeUnknownError,
+  PromoNotApplicableError,
 } from "./api/order-api.js";
-export type { Order } from "./model/order.js";
+export type { AppliedPromo, Order } from "./model/order.js";
 export { renderOrderDetails } from "./ui/order-details.js";
 export { renderOrderRecoveryNotice } from "./ui/order-recovery-notice.js";

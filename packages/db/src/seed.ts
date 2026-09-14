@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * Loads the assignment's fixed inputs — the twelve supplied products and the
- * fifty supplied supplier keys — plus one all-zero `supplier_behaviour` row per
- * supplier, then exits.
+ * Loads the assignment's fixed inputs — the twelve supplied products, the four
+ * supplied promo codes and the fifty supplied supplier keys — plus one all-zero
+ * `supplier_behaviour` row per supplier, then exits.
  *
  * Contract (relied on by the root `pnpm db:seed`, `db:setup` and `db:reset`),
  * matching `./migrate.ts`:
@@ -18,10 +18,13 @@
  *   - reports what it did, so a developer sees whether anything changed.
  *
  * ---------------------------------------------------------------------------
- * IDEMPOTENCE — TWO DIFFERENT ON CONFLICT CLAUSES, ON PURPOSE
+ * IDEMPOTENCE — THREE DIFFERENT ON CONFLICT SHAPES, ON PURPOSE
  * ---------------------------------------------------------------------------
- * The three tables want different things, and the difference is the whole of
- * this script's correctness:
+ * The four tables want different things, and the difference is the whole of
+ * this script's correctness. Each table's rows are either pure *definition*
+ * (the fixture is authoritative and a re-seed rewrites them), pure *state*
+ * (the shop or the supplier wrote them and a re-seed must not), or — the third
+ * shape — a definition with one column of state riding on it:
  *
  *   - `products` uses **ON CONFLICT (sku) DO UPDATE**. The catalogue is a
  *     transcription of the brief, so the fixture is authoritative: correcting a
@@ -30,6 +33,19 @@
  *     creation time and never reads them back through `products`
  *     (`./schema/shop.ts`, `orders.sku`) — so re-pricing the catalogue cannot
  *     rewrite the history of what someone was charged.
+ *
+ *   - `promo_codes` uses **ON CONFLICT (code) DO UPDATE on the definition
+ *     columns only** — `kind`, `value`, `currency`, `max_uses` — and never
+ *     `used_count`. The four codes are a transcription of the brief like the
+ *     catalogue, so their definition is authoritative; but the same row carries
+ *     the counter I7 guards (`context/product/architecture.md` §3), which is
+ *     state the shop wrote as codes were redeemed, and a re-seed must not reset
+ *     it for the same reason it does not reset a supplier knob. So the SET list
+ *     names the definition columns and stops. The one way a re-seed can still
+ *     collide with that state is by lowering `max_uses` below a live
+ *     `used_count`, and that trips `promo_codes_used_count_range` and aborts
+ *     this whole transaction — loud and correct, since silently accepting it
+ *     would leave a code that reads as over-spent.
  *
  *   - `supplier_behaviour` uses **ON CONFLICT (provider) DO NOTHING**, for the
  *     same reason as `supplier_keys` in a milder form: the row carries a knob a
@@ -45,8 +61,8 @@
  *     a way for a routine `pnpm dev:stack` to resell a key that a delivered
  *     order is already holding. DO NOTHING makes an existing row untouchable.
  *
- * All three statements are single multi-row INSERTs (one round trip each, per
- * the `data-batch-inserts` rule) and all three are atomic
+ * All four statements are single multi-row INSERTs (one round trip each, per
+ * the `data-batch-inserts` rule) and all four are atomic
  * insert-or-ignore/update rather than SELECT-then-INSERT (`data-upsert`):
  * nothing here reads a row to decide whether to write it, so two seeds racing
  * each other cannot both insert.
@@ -84,11 +100,13 @@ import {
   productCatalog,
   purchasableProductType,
 } from "./fixtures/catalog.js";
+import { promoCodeDefinitions, type PromoCodeDefinition } from "./fixtures/promo-codes.js";
 import {
   supplierBehaviourBaseline,
   supplierBehaviourProviders,
 } from "./fixtures/supplier-behaviour.js";
 import { supplierKeyPool } from "./fixtures/supplier-key-pool.js";
+import { promoCodes, type NewPromoCode } from "./schema/promo.js";
 import { products, type NewProduct } from "./schema/shop.js";
 import {
   supplierBehaviour,
@@ -103,6 +121,11 @@ interface SeedSummary {
   readonly productsInserted: number;
   readonly productsUpdated: number;
   readonly productsTotal: number;
+  readonly promoCodesInserted: number;
+  readonly promoCodesUpdated: number;
+  readonly promoCodesTotal: number;
+  /** `sum(used_count)` after the run — reported so a re-seed visibly leaves it alone. */
+  readonly promoUsesSpent: number;
   readonly keysInserted: number;
   readonly keysTotal: number;
   readonly keysClaimed: number;
@@ -138,6 +161,63 @@ function catalogRows(): NewProduct[] {
   }));
 }
 
+function assertNever(value: never): never {
+  throw new Error(`seed: unexpected promo definition ${JSON.stringify(value)}`);
+}
+
+/**
+ * The promo definitions as the database wants them.
+ *
+ * Two renamings happen here and nowhere else, which is why this is a named
+ * function rather than an inline `.map()`:
+ *
+ *  1. **The brief's `type` → the column `kind`.** The fixture keeps the brief's
+ *     word so it stays diffable; the schema uses `kind` because `type` is
+ *     already a product's category. `kind: item.type` is typed against
+ *     `NewPromoCode`, so if `promoKinds` in `./schema/promo.ts` ever stopped
+ *     matching the brief's `percent` / `amount` this line would not compile.
+ *  2. **Roubles → minor units, for `amount` only.** The brief prints `GG500`
+ *     as `500` with `"currency": "RUB"`; `promo_codes.value` must hold `50000`.
+ *     The same one constant as `catalogRows()`, for the same reason: a
+ *     factor-of-100 error here would fail nothing at seed time and would
+ *     surface as a 5 ₽ discount on the order page. A `percent` value is
+ *     percent points and is stored as printed.
+ *
+ * `currency` is written explicitly as `null` for `percent` rather than left to
+ * the column default, so that `excluded.currency` in the upsert is unambiguously
+ * NULL — `promo_codes_currency_iff_amount` refuses a `percent` row carrying a
+ * currency, and a re-seed that changed a code's kind must clear it.
+ *
+ * `used_count` is absent, and must stay absent — it is the one column of
+ * state on this table. Omitting it here makes Drizzle write `DEFAULT` for it
+ * (a fresh row takes `0`), and the upsert's SET list below never names it, so
+ * an existing row's counter is never touched; see the statement.
+ */
+function promoCodeRows(): NewPromoCode[] {
+  return promoCodeDefinitions.map((item: PromoCodeDefinition): NewPromoCode => {
+    switch (item.type) {
+      case "percent":
+        return {
+          code: item.code,
+          kind: item.type,
+          value: item.value,
+          currency: null,
+          maxUses: item.maxUses,
+        };
+      case "amount":
+        return {
+          code: item.code,
+          kind: item.type,
+          value: item.valueRub * MINOR_UNITS_PER_ROUBLE,
+          currency: item.currency,
+          maxUses: item.maxUses,
+        };
+      default:
+        return assertNever(item);
+    }
+  });
+}
+
 /** The pool as the database wants it: every code unclaimed. */
 function keyPoolRows(): NewSupplierKey[] {
   // `claimed_by_request_id` and `claimed_at` are left to their column defaults
@@ -171,6 +251,23 @@ function behaviourRows(): NewSupplierBehaviourRow[] {
 async function countProducts(tx: Transaction): Promise<number> {
   const rows = await tx.select({ n: sql<number>`count(*)::int` }).from(products);
   return rows[0]?.n ?? 0;
+}
+
+/**
+ *   SELECT count(*)::int AS n, coalesce(sum(used_count), 0)::int AS spent
+ *   FROM promo_codes;
+ *
+ * Both casts for the reason `countProducts` gives; `coalesce` because `sum()`
+ * over zero rows is NULL, and a fresh database has zero rows.
+ */
+async function countPromoCodes(tx: Transaction): Promise<{ n: number; spent: number }> {
+  const rows = await tx
+    .select({
+      n: sql<number>`count(*)::int`,
+      spent: sql<number>`coalesce(sum("used_count"), 0)::int`,
+    })
+    .from(promoCodes);
+  return rows[0] ?? { n: 0, spent: 0 };
 }
 
 async function seed(tx: Transaction): Promise<SeedSummary> {
@@ -217,6 +314,67 @@ async function seed(tx: Transaction): Promise<SeedSummary> {
 
   const productsAfter = await countProducts(tx);
   const productsInserted = productsAfter - productsBefore;
+
+  const promoBefore = await countPromoCodes(tx);
+
+  // ---------------------------------------------------------------------
+  //   INSERT INTO promo_codes (id, code, kind, value, currency, max_uses, used_count)
+  //   VALUES (DEFAULT, $1, $2, $3, $4, $5, DEFAULT), ...   -- all four codes, one statement
+  //   ON CONFLICT (code) DO UPDATE SET
+  //     kind     = excluded.kind,
+  //     value    = excluded.value,
+  //     currency = excluded.currency,
+  //     max_uses = excluded.max_uses
+  //   RETURNING code;
+  //   -- 4 rows, always: DO UPDATE returns the row whether it was inserted or
+  //   --                 updated, so the count says nothing about which. How
+  //   --                 many were new is the before/after difference below.
+  //   -- Fewer than 4 is impossible, as with `products`: a duplicate code in the
+  //   --   fixture makes Postgres raise "ON CONFLICT DO UPDATE command cannot
+  //   --   affect row a second time" rather than quietly drop one.
+  //
+  // `used_count` IS NEVER WRITTEN BY THIS STATEMENT. Two things, read together:
+  //
+  //   - Drizzle names every column of the table and puts the `DEFAULT` keyword
+  //     where it was handed no value — `id` and `used_count` (quoted from
+  //     `.toSQL()`, not assumed). So a *fresh* row takes the column default,
+  //     `0`, and `excluded.used_count` on a conflict is that same `0`.
+  //   - The SET list names `kind`, `value`, `currency`, `max_uses` and stops.
+  //     An *existing* row therefore keeps whatever the shop has counted; the
+  //     `0` in `excluded` is never copied across.
+  //
+  // It is state, not definition: the third pattern in this file, after
+  // `products` (pure definition, DO UPDATE on everything) and `supplier_*`
+  // (pure state, DO NOTHING). The conflict target is `promo_codes_code_key`
+  // (./schema/promo.ts).
+  //
+  // The loud failure, and why it is correct: if the fixture lowers a code's
+  // `max_uses` below what the shop has already counted — say `LIMIT3` at
+  // `used_count = 2` re-seeded with `max_uses = 1` — the updated row violates
+  // `promo_codes_used_count_range` (`used_count <= max_uses`), Postgres raises
+  // `23514 check_violation` naming that constraint, and this WHOLE transaction
+  // rolls back: the products upsert above included, and nothing below runs.
+  // That is the right outcome. The alternative — a SET that also wrote
+  // `used_count = least(used_count, excluded.max_uses)` — would silently forget
+  // redemptions the ledger still records, and the counter/ledger agreement the
+  // test harnesses assert would be broken by the seed itself.
+  // ---------------------------------------------------------------------
+  const upsertedPromoCodes = await tx
+    .insert(promoCodes)
+    .values(promoCodeRows())
+    .onConflictDoUpdate({
+      target: promoCodes.code,
+      set: {
+        kind: sql`excluded.kind`,
+        value: sql`excluded.value`,
+        currency: sql`excluded.currency`,
+        maxUses: sql`excluded.max_uses`,
+      },
+    })
+    .returning({ code: promoCodes.code });
+
+  const promoAfter = await countPromoCodes(tx);
+  const promoCodesInserted = promoAfter.n - promoBefore.n;
 
   // ---------------------------------------------------------------------
   //   INSERT INTO supplier_keys (code)
@@ -301,6 +459,10 @@ async function seed(tx: Transaction): Promise<SeedSummary> {
     productsInserted,
     productsUpdated: upserted.length - productsInserted,
     productsTotal: productsAfter,
+    promoCodesInserted,
+    promoCodesUpdated: upsertedPromoCodes.length - promoCodesInserted,
+    promoCodesTotal: promoAfter.n,
+    promoUsesSpent: promoAfter.spent,
     keysInserted: insertedKeys.length,
     keysTotal: pool.total,
     keysClaimed: pool.claimed,
@@ -315,6 +477,11 @@ function report(summary: SeedSummary): void {
       `${summary.productsUpdated} updated; ${summary.productsTotal} in the catalogue`,
   );
   console.log(
+    `seed: promo_codes — ${summary.promoCodesInserted} inserted, ` +
+      `${summary.promoCodesUpdated} updated; ${summary.promoCodesTotal} defined, ` +
+      `${summary.promoUsesSpent} uses spent (never written by this script)`,
+  );
+  console.log(
     `seed: supplier_keys — ${summary.keysInserted} inserted, ` +
       `${summary.keysTotal - summary.keysInserted} already present; ` +
       `${summary.keysTotal} in the pool, ${summary.keysClaimed} claimed`,
@@ -326,12 +493,15 @@ function report(summary: SeedSummary): void {
   );
   if (
     summary.productsInserted === 0 &&
+    summary.promoCodesInserted === 0 &&
     summary.keysInserted === 0 &&
     summary.behaviourInserted === 0
   ) {
-    // "no new rows", not "nothing changed": the catalogue upsert rewrites all
-    // twelve rows from the fixture on every run, which is how a drifted price
-    // gets corrected. Only `supplier_keys` is genuinely untouched.
+    // "no new rows", not "nothing changed": the catalogue and promo upserts
+    // rewrite their rows from the fixtures on every run, which is how a drifted
+    // price or limit gets corrected. Only the state columns — every column of
+    // `supplier_keys` and `supplier_behaviour`, and `promo_codes.used_count` —
+    // are genuinely untouched.
     console.log("seed: no new rows — the database was already seeded");
   }
 }
@@ -366,9 +536,48 @@ async function main(): Promise<void> {
   }
 }
 
+/**
+ * The failure with its cause chain, because the message that names the
+ * constraint is never the outermost one. Drizzle wraps a failed statement in a
+ * `DrizzleQueryError` whose own message is the query and its parameters; the
+ * Postgres error underneath it (`cause`) is the one that says
+ *
+ *   new row for relation "promo_codes" violates check constraint "promo_codes_used_count_range"
+ *
+ * and carries `code` (`23514`, check_violation), `constraint` and `detail` (the
+ * failing row) as fields. Printing only the outer message makes the seed fail
+ * but not *loudly* — it would not say which invariant refused, which is the
+ * whole reason every constraint in `./schema` has a name.
+ */
+function describeFailure(error: unknown): string {
+  const lines: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current !== undefined && current !== null && depth < 5; depth += 1) {
+    const message = current instanceof Error ? current.message : String(current);
+    lines.push(depth === 0 ? message : `  caused by: ${message}`);
+    if (typeof current === "object") {
+      const { code, constraint, detail } = current as {
+        code?: unknown;
+        constraint?: unknown;
+        detail?: unknown;
+      };
+      const fields = [
+        typeof code === "string" ? `code ${code}` : undefined,
+        typeof constraint === "string" ? `constraint ${constraint}` : undefined,
+        typeof detail === "string" ? `detail: ${detail}` : undefined,
+      ].filter((field): field is string => field !== undefined);
+      if (fields.length > 0) {
+        lines.push(`    ${fields.join("; ")}`);
+      }
+    }
+    current = current instanceof Error ? current.cause : undefined;
+  }
+  return lines.join("\n");
+}
+
 try {
   await main();
 } catch (error: unknown) {
-  console.error(`seed: failed — ${error instanceof Error ? error.message : String(error)}`);
+  console.error(`seed: failed — ${describeFailure(error)}`);
   process.exitCode = 1;
 }

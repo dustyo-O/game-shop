@@ -13,16 +13,64 @@
  *     nothing has checked. Handing back `unknown` pushes the narrowing into the
  *     slice that actually knows what the endpoint promised — which is where the
  *     `entities/product` parser lives.
+ *
+ * A third, from spec 005, about the *failed* response:
+ *
+ *   - **`HttpError.body` is `unknown` too, and reading it never throws.** A
+ *     refusal may carry a JSON body worth branching on — `POST
+ *     /api/orders/:id/promo` answers `409 { reason: "exhausted" }` — so the
+ *     error carries whatever the body parsed to, and the slice that knows the
+ *     endpoint narrows `reason` out of it (`entities/order/api`), for exactly
+ *     the reason `getJson` does not narrow its own success body. What the body
+ *     parses to is decided by {@link readBody}, and `readBody` is **total**: a
+ *     Nest default envelope, an HTML error page from a proxy, a read that was
+ *     aborted mid-stream all become `null`, and the error still surfaces as an
+ *     `HttpError` carrying its status. The alternative is not hypothetical
+ *     (technical-considerations R11): every failed read of the order page's
+ *     poll passes through here, and if a non-JSON `404` made `readBody` throw,
+ *     the `HttpError` would never be constructed, `fetchOrder`'s `instanceof`
+ *     would be skipped, and «Заказ не найден» would become «Не удалось
+ *     загрузить заказ». Four consumers branch on `instanceof HttpError` and
+ *     `.status`; one exception leaking from this function would change the
+ *     class of every one of their refusals at once.
  */
 
-/** A response that arrived but said no. Carries the status so callers can branch on it. */
+/**
+ * A response that arrived but said no. Carries the status so callers can branch
+ * on it, and the body — `unknown`, `null` when there was none worth having —
+ * so a caller that knows its endpoint can branch on a reason as well.
+ *
+ * `body` defaults to `null` rather than being required, so the two throw sites
+ * below and a test constructing one by hand read the same way; nothing else
+ * constructs an `HttpError` (the header's grep-able claim: `new HttpError`
+ * occurs in this file and nowhere else).
+ */
 export class HttpError extends Error {
   constructor(
     message: string,
     readonly status: number,
+    readonly body: unknown = null,
   ) {
     super(message);
     this.name = "HttpError";
+  }
+}
+
+/**
+ * The failed response's body, or `null`.
+ *
+ * **Never throws** — see the header. `response.json()` rejects on a body that
+ * is not JSON, on an empty body, and on a stream that was aborted before it
+ * finished; each of those is folded into `null` here because none of them
+ * changes what the caller needs to know first, which is the status. The
+ * `catch` binds nothing on purpose: there is no error class to tell apart, and
+ * no branch in which this function should do anything but answer `null`.
+ */
+async function readBody(response: Response): Promise<unknown> {
+  try {
+    return (await response.json()) as unknown;
+  } catch {
+    return null;
   }
 }
 
@@ -52,10 +100,12 @@ export interface GetOptions {
 /**
  * `GET` a JSON document.
  *
- * Throws on a non-2xx response ({@link HttpError}), on an unreachable API
- * (`fetch` rejects with a `TypeError`), and on a body that is not JSON. All
+ * Throws on a non-2xx response ({@link HttpError}, carrying the status and
+ * whatever the refusal's body parsed to), on an unreachable API (`fetch`
+ * rejects with a `TypeError`), and on a **success** body that is not JSON. All
  * three are the same thing to a caller: the data did not arrive, show the
- * failure state.
+ * failure state. A *failed* response's unparseable body is not a fourth case —
+ * {@link readBody} folds it into `null` and the `HttpError` is thrown anyway.
  *
  * **`options.signal` cancels a read that is no longer wanted.** The order
  * page's poll passes one so that a request still in flight when the page goes
@@ -76,7 +126,11 @@ export async function getJson(path: string, options: GetOptions = {}): Promise<u
   });
 
   if (!response.ok) {
-    throw new HttpError(`GET ${path} responded ${String(response.status)}`, response.status);
+    throw new HttpError(
+      `GET ${path} responded ${String(response.status)}`,
+      response.status,
+      await readBody(response),
+    );
   }
 
   return (await response.json()) as unknown;
@@ -87,8 +141,9 @@ export async function getJson(path: string, options: GetOptions = {}): Promise<u
  *
  * Throws on exactly the same three things `getJson` does — a non-2xx response
  * ({@link HttpError}, carrying the status so a caller can tell a `422` from a
- * `500`), an unreachable API (`fetch` rejects with a `TypeError`), and a body
- * that is not JSON.
+ * `500`, and the body so it can tell one `409` from another), an unreachable
+ * API (`fetch` rejects with a `TypeError`), and a success body that is not
+ * JSON.
  *
  * **The body is `unknown` going in as well as coming out.** The caller has
  * already decided what the endpoint accepts; this function's job is the wire
@@ -122,7 +177,11 @@ export async function postJson(
   });
 
   if (!response.ok) {
-    throw new HttpError(`POST ${path} responded ${String(response.status)}`, response.status);
+    throw new HttpError(
+      `POST ${path} responded ${String(response.status)}`,
+      response.status,
+      await readBody(response),
+    );
   }
 
   return (await response.json()) as unknown;

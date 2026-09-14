@@ -6,6 +6,7 @@ import { ConfigModule } from "./config/config.module.js";
 import { HealthController } from "./health.controller.js";
 import { OrdersModule } from "./orders/orders.module.js";
 import { PaymentsModule } from "./payments/payments.module.js";
+import { PromoModule } from "./promo/promo.module.js";
 import { SchedulingModule } from "./scheduling/scheduling.module.js";
 import { SupplierAModule } from "./suppliers/a/supplier-a.module.js";
 import { SupplierBModule } from "./suppliers/b/supplier-b.module.js";
@@ -53,6 +54,18 @@ import { SupplierBehaviourModule } from "./suppliers/supplier-behaviour.module.j
   // `PaymentsModule`, both already at 2) are not re-parented, so
   // `SchedulingModule` stays at 2 and the destroy order above is untouched.
   //
+  // `PromoModule` carries `POST /api/orders/:orderId/promo` — spec 005's one
+  // route, mounted under the orders path but deliberately its own module: it
+  // writes `promo_codes` and `promo_redemptions` itself and reaches `orders`
+  // only through `OrdersModule`'s exported guarded writer, which is what keeps
+  // that module's "no write without a source-state guard" promise a property
+  // of the type system rather than of proximity (`./promo/promo.module.ts`).
+  // It exports nothing. At distance 2 its imports (`DatabaseModule` at 3,
+  // `OrdersModule` at 4 — re-parented long ago by `IssuanceModule`) are each
+  // offered 3, which is not strictly deeper than where either sits, so
+  // neither moves, `SchedulingModule` stays at 2 and the destroy order above
+  // is untouched.
+  //
   // `SupplierAModule` and `SupplierBModule` are the odd ones out and should stay
   // that way: they are not part of the shop, they are the two simulated
   // suppliers hosted in the same function (architecture.md §6). They answer at
@@ -90,6 +103,7 @@ import { SupplierBehaviourModule } from "./suppliers/supplier-behaviour.module.j
     OrdersModule,
     PaymentsModule,
     AdminModule,
+    PromoModule,
     SupplierAModule,
     SupplierBModule,
     SupplierBehaviourModule,

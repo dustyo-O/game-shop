@@ -97,6 +97,16 @@ body {
   user-select: all;
 }
 
+/* «(было 1290 ₽)» after the discounted amount, once a promo code is on the
+   order (spec 005; entities/order/ui/order-details.ts). Muted and slightly
+   smaller so the amount to pay stays the number a shopper reads first — the
+   list price is context, not a second price. */
+.order-details__list-amount {
+  margin-left: 0.375rem;
+  color: #555;
+  font-size: 0.875rem;
+}
+
 /* The connection notice, shown under an order that is already on screen while
    the page keeps retrying. Grey rather than red: nothing was lost, and the page
    recovers by itself. */
@@ -123,6 +133,39 @@ body {
   max-width: 34rem;
 }
 
+/* The promo-code field, offered only while the order awaits payment and carries
+   no code yet (spec 005 §2.2; features/apply-promo). One row — field, button —
+   with the same spacing as the payment controls beneath it, so the two read as
+   one block of "things to do before paying". `flex-wrap` lets the error line
+   drop under both on its own line, as the payment controls' does. */
+.promo-form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  margin: 1.5rem 0 0;
+}
+
+.promo-form__input {
+  font: inherit;
+  padding: 0.4rem 0.75rem;
+  min-width: 12rem;
+}
+
+.promo-form__button {
+  font: inherit;
+  padding: 0.4rem 1rem;
+  cursor: pointer;
+}
+
+/* Disabled for the length of the request, and the only sign a shopper would
+   otherwise get that pressing «Применить» did something. The field is
+   `readOnly` rather than disabled during that time and is left as it is: it
+   keeps focus, and it keeps its text. */
+.promo-form__button:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
 /* The two payment controls, offered only while the order awaits payment
    (features/simulate-payment). Laid out like the catalogue's «Купить» control
    because they are the same kind of thing: a plain button a shopper presses. */
@@ -146,9 +189,12 @@ body {
   opacity: 0.6;
 }
 
-/* A payment that could not be sent, under the controls that failed. Red, and on
-   its own line: `flex-basis: 100%` makes it wrap below both buttons rather than
-   squeezing in beside them. */
+/* A promo code that was refused, or a payment that could not be sent, under the
+   control that failed. Red, and on its own line: `flex-basis: 100%` makes it
+   wrap below the controls rather than squeezing in beside them. One rule for
+   both features because it is the same kind of sentence in the same place;
+   each feature still owns its own class. */
+.promo-form__error,
 .payment-controls__error {
   flex-basis: 100%;
   margin: 0.5rem 0 0;

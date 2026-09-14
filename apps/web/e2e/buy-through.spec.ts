@@ -68,7 +68,7 @@
  * and `unclaimed = 50` before they run, so the fixture's cleanup below is not
  * optional housekeeping — it is the one thing standing between this file and
  * every suite that runs after it in `pnpm test`. See `./support/db.ts` for
- * the six statements duplicated from the API harness's `cleanupTestOrders`.
+ * the seven statements duplicated from the API harness's `cleanupTestOrders`.
  *
  * ---------------------------------------------------------------------------
  * WHY THE FIRST TWO CRITERIA SHARE ONE TEST, AND THE OTHER TWO DO NOT

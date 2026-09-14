@@ -457,7 +457,7 @@ describe("architecture.md §3 I4 — only one worker advances an order (the orde
         const drainEventId = `evt_test_${order.id}_drain`;
 
         // event 2: pending, so GET .../orders/:id's own EXISTS gate
-        // (OrdersService.findOrder) sees it and schedules a drain.
+        // (OrderViewService.findOrder) sees it and schedules a drain.
         await insertPendingPaidEvent(assertionClient, drainEventId, order.id);
 
         const unclaimedBefore = await countUnclaimedKeys(assertionClient);

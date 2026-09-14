@@ -1,7 +1,7 @@
 # Functional Specification: Promo Codes with Enforced Limits
 
 - **Roadmap Item:** Phase 5 — Promo Codes with Enforced Limits
-- **Status:** Draft
+- **Status:** Completed
 - **Author:** Alexander Shleyko
 
 ---

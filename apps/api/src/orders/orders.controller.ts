@@ -6,8 +6,9 @@
  * The controller does two things and nothing else: turn an unvalidated JSON body
  * and an optional `Idempotency-Key` header into a SKU and a key, and turn a
  * service result into an HTTP status. The decisions live in
- * {@link OrdersService}; the mapping lives here, so the service stays callable
- * from the race scripts without an HTTP layer's opinions attached.
+ * {@link OrdersService} (the create) and {@link OrderViewService} (the read);
+ * the mapping lives here, so both services stay callable from the race scripts
+ * without an HTTP layer's opinions attached.
  *
  * The header is I1's half of this file (`architecture.md` §3): it names the
  * shopper's purchase *intent*, and what makes one intent produce one order is
@@ -40,7 +41,8 @@ import {
   CLIENT_SUPPLIED_ORDER_ID_CONFIG,
   type ClientSuppliedOrderIdConfig,
 } from "../config/client-supplied-order-id.js";
-import { CreateOrderOutcome, FindOrderOutcome, OrdersService } from "./orders.service.js";
+import { FindOrderOutcome, OrderViewService } from "./order-view.service.js";
+import { CreateOrderOutcome, OrdersService } from "./orders.service.js";
 import type { CreateOrderRequest, CreateOrderResponse, OrderView } from "./orders.types.js";
 
 /**
@@ -283,6 +285,13 @@ export class OrdersController {
   constructor(
     private readonly orders: OrdersService,
     /**
+     * The read behind `GET /api/orders/:id`. A separate service from the
+     * create on purpose — it is the one `orders` reader exported to other
+     * modules, and `./order-view.service.ts` says why it runs on the pooled
+     * handle and never inside a transaction.
+     */
+    private readonly views: OrderViewService,
+    /**
      * Whether `id` in the request body is honoured — see
      * `../config/client-supplied-order-id.ts`. Injected here rather than read
      * per request: the value was already proven safe (a boolean, never a
@@ -462,7 +471,7 @@ export class OrdersController {
    */
   @Get(":id")
   async getOrder(@Param("id") id: string): Promise<OrderView> {
-    const result = await this.orders.findOrder(id);
+    const result = await this.views.findOrder(id);
 
     switch (result.outcome) {
       case FindOrderOutcome.Found:

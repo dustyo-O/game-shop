@@ -368,13 +368,12 @@ export class PaymentSimulatorService {
    *   -- 0 rows => no such order => 404. There is no amount to invent.
    *
    * Two columns and no join. This is deliberately **not**
-   * `OrdersService.findOrder`, even though that method would answer the
+   * `OrderViewService.findOrder`, even though that method would answer the
    * question: it joins `products` and `deliveries` to build the status page's
-   * view, and the simulator needs neither a product name nor a key. Reusing it
-   * would also mean exporting `OrdersService` from `OrdersModule`, whose export
-   * list is one item long on purpose — `OrderTransitionService`, the only way
-   * any module may write `orders.status` (`../orders/orders.module.ts`). A read
-   * of two columns is not worth widening that door.
+   * view, and the simulator needs neither a product name nor a key. Two
+   * columns are not worth a two-table join on the payment path — and keeping
+   * this read here, beside the send, is what lets one grep prove the simulator
+   * sends exactly `orders.amount_minor` and nothing it computed itself.
    *
    * `status` is deliberately not selected. Nothing here branches on it — see the
    * "No check on the order's status" note on {@link simulate} — and selecting a

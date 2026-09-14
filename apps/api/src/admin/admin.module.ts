@@ -2,14 +2,20 @@
  * `admin` — the operator's surface, behind one shared bearer token
  * (`architecture.md` §6).
  *
- * Three routes:
+ * Four routes:
  *
  *   - `POST /api/admin/payment-events/sweep` — `architecture.md` §4's fourth
  *     processing trigger, the backstop for everything the other three missed;
  *   - `GET /api/admin/orders/undelivered` — spec 003 §2.4's list of every order
  *     that was paid for and is holding no key;
  *   - `POST /api/admin/orders/:orderId/retry` — spec 003 §2.5's manual retry of
- *     one of them.
+ *     one of them;
+ *   - `POST /api/admin/promo-codes/reset` — spec 005 §2.3's demo affordance:
+ *     zero every promo counter and leave the ledger, so `pnpm race promo` can
+ *     run twice against a deployed shop whose database the check cannot reach.
+ *     The one route here that is a knob for a check rather than an operator's
+ *     tool, and the one that is never called locally
+ *     (`./promo-codes-reset.controller.ts`).
  *
  * They want the same guard in front of them, which is the reason this is a
  * module rather than one more controller filed under `payments`.
@@ -62,10 +68,16 @@
  *     `issuance_attempts` to that list would blunt the argument for a query that
  *     has no reason to be in it.
  *
- * What this module gains is `DATABASE_CLIENT`, a **read** handle it uses for one
- * `SELECT`. It still cannot write `orders.status` by any route: that goes
- * through `OrderTransitionService`, which this module does not import and will
- * not.
+ * What this module gains is `DATABASE_CLIENT`, a handle it uses for one
+ * `SELECT` (the recovery list) and — since spec 005 — one `UPDATE`, the promo
+ * reset, which writes `promo_codes.used_count` and nothing else. The previous
+ * version of this sentence called it *"a **read** handle"*; that word has been
+ * removed rather than left to quietly stop being true. It still cannot write
+ * `orders.status` by any route: that goes through `OrderTransitionService`,
+ * which this module does not import and will not. Nor can it write the promo
+ * ledger: `promo_redemptions` is written under the order lock by
+ * `PromoRedemptionService` alone, and the reset's whole argument is that it
+ * leaves that table untouched.
  *
  * ###########################################################################
  * # WHAT THESE FOUR IMPORTS DO TO THE MODULE DISTANCES — RE-CHECKED FOR THE
@@ -124,8 +136,9 @@
  *
  * That is also why this module does **not** import `SchedulingModule`, quite
  * apart from not needing it: the sweep does its work before answering
- * (`./payment-event-sweep.controller.ts`), and the report is a single `SELECT`.
- * Neither has anything to schedule.
+ * (`./payment-event-sweep.controller.ts`), the report is a single `SELECT`,
+ * and the promo reset is a single `UPDATE`. None of them has anything to
+ * schedule.
  *
  * ### And it introduces no cycle
  *
@@ -144,21 +157,25 @@ import { AdminTokenGuard } from "./admin-token.guard.js";
 import { OrderRecoveryController } from "./order-recovery.controller.js";
 import { OrderRetryService } from "./order-retry.service.js";
 import { PaymentEventSweepController } from "./payment-event-sweep.controller.js";
+import { PromoCodesResetController } from "./promo-codes-reset.controller.js";
+import { PromoCodesResetService } from "./promo-codes-reset.service.js";
 import { UndeliveredOrdersService } from "./undelivered-orders.service.js";
 
 @Module({
   imports: [ConfigModule, PaymentsModule, DatabaseModule, IssuanceModule],
-  controllers: [PaymentEventSweepController, OrderRecoveryController],
+  controllers: [PaymentEventSweepController, OrderRecoveryController, PromoCodesResetController],
   // The guard is a provider, not only a decorator argument: `@UseGuards` with a
   // class reference asks the module's injector for an instance, and
   // `AdminTokenGuard` has a constructor dependency (`ADMIN_TOKEN_CONFIG`) that
   // only resolves if it is registered here.
   //
-  // `UndeliveredOrdersService` and `OrderRetryService` are providers and
-  // deliberately **not** exports: both exist to be served by the controller
-  // beside them, and nothing outside this module has a reason to run either.
-  // Exporting the retry would publish a second name for `runForOrder` — the one
-  // thing this module must not become.
-  providers: [AdminTokenGuard, UndeliveredOrdersService, OrderRetryService],
+  // `UndeliveredOrdersService`, `OrderRetryService` and `PromoCodesResetService`
+  // are providers and deliberately **not** exports: each exists to be served by
+  // the controller beside it, and nothing outside this module has a reason to
+  // run any of them. Exporting the retry would publish a second name for
+  // `runForOrder`; exporting the reset would give the shop a path to a write
+  // that only a check may make. Either is the one thing this module must not
+  // become.
+  providers: [AdminTokenGuard, UndeliveredOrdersService, OrderRetryService, PromoCodesResetService],
 })
 export class AdminModule {}

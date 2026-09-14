@@ -88,9 +88,9 @@ _Concepts to walk away able to explain: which interactions were graded and why t
 
 _A new mechanic built from scratch — the assignment's bonus stage, and a second, independent demonstration that the concurrency reasoning generalises beyond the issuance path._
 
-- [ ] **Promo Codes with Enforced Limits** _(~1.5h)_
-  - [ ] **Server-Computed Discounts:** The final price is calculated on the server from the stored promo definition; amounts supplied by the client are never trusted.
-  - [ ] **Limits That Hold Under Parallelism:** A code capped at N uses is applied at most N times even when redemptions arrive simultaneously — proven against the tightest supplied codes, `LIMIT3` and `ONCEONLY`. Settles acceptance criterion 5.
+- [x] **Promo Codes with Enforced Limits** _(~1.5h)_
+  - [x] **Server-Computed Discounts:** The final price is calculated on the server from the stored promo definition; amounts supplied by the client are never trusted.
+  - [x] **Limits That Hold Under Parallelism:** A code capped at N uses is applied at most N times even when redemptions arrive simultaneously — proven against the tightest supplied codes, `LIMIT3` and `ONCEONLY`. Settles acceptance criterion 5.
 
 _Concepts to walk away able to explain: why a read-then-increment is a race, and how a single conditional update replaces it._
 

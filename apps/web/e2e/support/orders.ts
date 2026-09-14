@@ -81,7 +81,7 @@
  * sources are deduped before cleanup, since the normal path produces the same
  * id from both.
  *
- * Teardown runs the same six statements as the API harness's
+ * Teardown runs the same seven statements as the API harness's
  * `cleanupTestOrders` (`./db.ts`, which names that function as its source of
  * truth) against every id this run collected. That is what lets the whole
  * project run with `workers: 1` against the one seeded database and still

@@ -1,9 +1,11 @@
 /**
- * Creating orders and reading them back — the `orders` module's own work
- * ("Create orders; read order state", technical-considerations §2.4). The status
+ * Creating orders — the first half of the `orders` module's own work ("Create
+ * orders; read order state", technical-considerations §2.4). The status
  * transition helper beside it owns every *change* to an order; this file owns
- * the one moment an order comes into existence, in `created`, and the read the
- * status page lives on.
+ * the one moment an order comes into existence, in `created`. The read the
+ * status page lives on was here too until spec 005 moved it to
+ * `./order-view.service.ts`, so that the reader could leave the module without
+ * this class — and its `createOrder` — going with it (see `./orders.module.ts`).
  *
  * ---------------------------------------------------------------------------
  * THE CLIENT SENDS A SKU. IT DOES NOT SEND A PRICE, AND IT COULD NOT.
@@ -44,14 +46,14 @@
 import { Inject, Injectable } from "@nestjs/common";
 import { and, eq, sql } from "drizzle-orm";
 
-import { Currency, OrderStatus, inFlightOrderStatuses, minorUnits } from "@game-shop/contracts";
-import { deliveries, orders, paymentEvents, products, type DatabaseClient } from "@game-shop/db";
+import { OrderStatus, minorUnits } from "@game-shop/contracts";
+import { orders, products, type DatabaseClient } from "@game-shop/db";
 
 import { DATABASE_CLIENT } from "../database/database.module.js";
 import { OrderCreatedNotifier } from "./order-created-notifier.service.js";
-import { OrderPendingEventsNotifier } from "./order-pending-events-notifier.service.js";
+import { toCurrency } from "./order-currency.js";
 import { newOrderId } from "./order-id.js";
-import type { CreatedOrder, CreateOrderResponse, ExistingOrder, OrderView } from "./orders.types.js";
+import type { CreatedOrder, CreateOrderResponse, ExistingOrder } from "./orders.types.js";
 
 /**
  * Which of the two things happened. Named values rather than `CreatedOrder |
@@ -114,37 +116,6 @@ export type CreateOrderResult =
     };
 
 /**
- * Which of the two things happened when an order was looked up. The same
- * named-outcome shape {@link CreateOrderOutcome} and
- * {@link OrderTransitionService} use, for the same reason: the caller's `switch`
- * reads as news, and the compiler has something to be exhaustive about.
- *
- * A missing order is **not** an exception here. `NotFoundException` is an HTTP
- * decision, and it belongs to the controller — leaving the service callable from
- * an integration test, or from the Phase 2 race scripts, without an HTTP layer's
- * opinions attached.
- */
-export const FindOrderOutcome = {
-  /** The order exists; {@link FindOrderResult.order} is the status page's whole view of it. */
-  Found: "found",
-  /** No row with that id. Functional spec §2.6's «не найден» page. */
-  NotFound: "not_found",
-} as const;
-
-export type FindOrderOutcome = (typeof FindOrderOutcome)[keyof typeof FindOrderOutcome];
-
-export type FindOrderResult =
-  | {
-      readonly outcome: typeof FindOrderOutcome.Found;
-      readonly order: OrderView;
-    }
-  | {
-      readonly outcome: typeof FindOrderOutcome.NotFound;
-      /** Echoed back so the caller can name it without re-reading the route parameter. */
-      readonly orderId: string;
-    };
-
-/**
  * The five columns the create path reads back, in the schema's camelCase.
  *
  * One interface for both statements on that path — the `RETURNING` of the
@@ -180,24 +151,6 @@ const orderCreationColumns = {
 } as const;
 
 /**
- * `text` column → {@link Currency}.
- *
- * A narrowing check rather than `row.currency as Currency`, for the reason
- * `catalog.service.ts` gives at its own copy of this function: the assertion
- * would compile and be wrong in the one case that matters, letting a currency
- * the shop cannot price reach the shopper as if it could.
- *
- * The duplication is deliberate rather than overlooked. Hoisting four lines into
- * a shared module would couple `orders` to `catalog` — or invent a third home
- * for it — to save nothing; whoever writes the third copy has earned the
- * refactor.
- */
-function toCurrency(value: string): Currency {
-  if (value === Currency.Rub) return value;
-  throw new Error(`orders: order row has unsupported currency "${value}"`);
-}
-
-/**
  * `unique_violation` — Postgres SQLSTATE 23505.
  *
  * The one constraint {@link OrdersService.createOrder}'s INSERT can raise it
@@ -215,9 +168,10 @@ const MAX_CAUSE_DEPTH = 8;
  *
  * A duplicate of `../suppliers/supplier-key-claim.service.ts`'s function of the
  * same name and body, not a shared import — deliberately, for the reason
- * {@link toCurrency} above gives for its own duplication: hoisting it would
- * couple `orders` to `suppliers`, a module this one has no other reason to
- * import from, to save four lines neither will change independently.
+ * `./order-currency.ts` gives for `toCurrency`'s duplication against
+ * `catalog`: hoisting it would couple `orders` to `suppliers`, a module this
+ * one has no other reason to import from, to save four lines neither will
+ * change independently.
  *
  * **The chain is the whole point, and it is not decoration.** Drizzle wraps
  * every driver error in a `DrizzleQueryError` whose message is the failed SQL
@@ -283,84 +237,6 @@ function toExistingOrder(row: OrderCreationRow): ExistingOrder {
   };
 }
 
-/**
- * One row as {@link OrdersService.findOrder}'s query returns it — three tables
- * flattened into the seven values the status page needs, still in the schema's
- * camelCase and still with the raw column types.
- *
- * Two fields are nullable for two entirely different reasons, and the difference
- * matters when reading the mapper below:
- *
- *   - `productName` — the LEFT JOIN found no catalogue row. Ordinary, and the
- *     page falls back to the SKU (see `OrderViewCore.product_name`).
- *   - `code` — either there is no delivery, or there is one and the order is not
- *     `delivered` so Postgres refused to hand it over. The `CASE` in the query
- *     is what makes those two indistinguishable here, on purpose.
- */
-interface OrderViewRow {
-  readonly id: string;
-  readonly status: OrderStatus;
-  readonly sku: string;
-  readonly productName: string | null;
-  readonly amountMinor: number;
-  readonly currency: string;
-  readonly code: string | null;
-  /**
-   * Processing trigger 3's gate: **this order can still move, and there is at
-   * least one unapplied event naming it.** Both halves, in one expression — see
-   * {@link OrdersService.findOrder}.
-   *
-   * Deliberately on this interface and on **no** member of {@link OrderView}.
-   * It is not a fact about the order the shopper is looking at; it is a fact
-   * about an inbox they have never heard of, true a few milliseconds at a time,
-   * and the moment it went on the wire some client would start branching on it.
-   * {@link toOrderView} never sees it — the mapper takes this row and drops it,
-   * which is the same arrangement `code` has one field up.
-   */
-  readonly hasPendingEvents: boolean;
-}
-
-/**
- * Row → wire body, and the one place the "a key only exists on a delivered
- * order" rule turns from SQL into a type.
- *
- * The two branches are the two members of {@link OrderView}. Note what each one
- * does with `code`:
- *
- *   - **`delivered`** — hands back `row.code`, and refuses to answer at all if
- *     it is `null`. That state is unreachable (`delivering → delivered` commits
- *     in the same transaction as the `deliveries` insert, so one `SELECT` sees
- *     both or neither), and if it ever happens the shop has a paid order whose
- *     key it cannot find — worth a `500` and a stack trace, not a `200` with a
- *     `code` field the type says is a string and the value says is `null`.
- *   - **anything else** — returns the literal `null`, never `row.code`. So even
- *     if the `CASE` in the query were one day edited away, this branch still
- *     cannot publish a key for an order that has not been delivered. Two
- *     independent stops on the same leak, which is the arrangement the project
- *     uses everywhere a guarantee matters.
- */
-function toOrderView(row: OrderViewRow): OrderView {
-  const core = {
-    id: row.id,
-    sku: row.sku,
-    product_name: row.productName,
-    // Brands the raw integer column as kopecks — same crossing as
-    // `toCreatedOrder` above (`packages/contracts/src/money.ts`).
-    amount_minor: minorUnits(row.amountMinor),
-    currency: toCurrency(row.currency),
-  };
-
-  if (row.status === OrderStatus.Delivered) {
-    if (row.code === null) {
-      throw new Error(`orders: order ${row.id} is "delivered" but has no delivery row`);
-    }
-
-    return { ...core, status: row.status, code: row.code };
-  }
-
-  return { ...core, status: row.status, code: null };
-}
-
 @Injectable()
 export class OrdersService {
   constructor(
@@ -373,14 +249,6 @@ export class OrdersService {
      * (`./order-created-notifier.service.ts`).
      */
     private readonly orderCreated: OrderCreatedNotifier,
-    /**
-     * Told when a status read finds unapplied events for an order that can
-     * still move — see the end of {@link findOrder}. A publisher on exactly the
-     * same terms as the one above: this service cannot ask it a question, waits
-     * for nothing it does, and behaves identically if nobody is subscribed
-     * (`./order-pending-events-notifier.service.ts`).
-     */
-    private readonly pendingEvents: OrderPendingEventsNotifier,
   ) {}
 
   /**
@@ -674,214 +542,5 @@ export class OrdersService {
     }
 
     return { outcome: CreateOrderOutcome.AlreadyCreated, order: toExistingOrder(existing) };
-  }
-
-  /**
-   * The status page's whole view of one order — **one statement, always**.
-   *
-   * ---------------------------------------------------------------------------
-   * THIS IS THE POLLED PATH
-   * ---------------------------------------------------------------------------
-   * `apps/web` calls this once a second per open order page while the order is
-   * in flight (technical-considerations §2.6). So the cost of the read is the
-   * cost of watching an order, and "fetch the order, then fetch its product,
-   * then fetch its delivery" — three round trips that each look harmless — is
-   * three times the traffic and three times the connection time, on the one
-   * endpoint that runs in a loop. It is a single `SELECT` with two joins, and it
-   * stays one.
-   *
-   * Emitted SQL (copied from `.toSQL()`; per the project's raw-SQL rule,
-   * `architecture.md` §2, "Documentation convention"):
-   *
-   *   select "orders"."id", "orders"."status", "orders"."sku", "products"."name",
-   *          "orders"."amount_minor", "orders"."currency",
-   *          case when "orders"."status" = $1 then "deliveries"."code" end as "code",
-   *          case when "orders"."status" = ANY($2) then exists (
-   *            select 1 from "payment_events"
-   *            where "payment_events"."order_id" = "orders"."id"
-   *              and "payment_events"."processed_at" is null
-   *          ) else false end as "has_pending_events"
-   *   from "orders"
-   *   left join "products" on "products"."sku" = "orders"."sku"
-   *   left join "deliveries" on "deliveries"."order_id" = "orders"."id"
-   *   where "orders"."id" = $3;
-   *   -- $1 the literal 'delivered', $2 `inFlightOrderStatuses` as a text[],
-   *   -- $3 the id from the URL.
-   *   -- 1 row  => the order exists. `code` is the key, or NULL.
-   *   -- 0 rows => no order with that id => 404 (functional spec §2.6).
-   *
-   * Three joins' worth of index lookups and nothing else: `orders.id` is the
-   * primary key, `products.sku` is UNIQUE (`products_sku_key`) and
-   * `deliveries.order_id` is UNIQUE (`deliveries_order_id_key`, invariant I3).
-   * The last one is also why no `LIMIT` is needed to guarantee a single row —
-   * neither join can multiply it, because both join keys are unique.
-   *
-   * ### Why `CASE WHEN status = 'delivered'` rather than an `if` in TypeScript
-   *
-   * Both would answer correctly. The difference is where the key is when the
-   * decision is made: with the `CASE`, an undelivered order's key is never sent
-   * from Postgres to this process, so it cannot reach a log line, a stack trace,
-   * an error reporter or a response by any route at all. Filtering after the
-   * fact leaves it sitting in a local variable that something downstream might
-   * one day serialise.
-   *
-   * It is also read as one consistent snapshot. A single statement sees one
-   * version of the database, so `orders.status` and `deliveries.code` cannot
-   * disagree — whereas two separate reads could straddle the transaction that
-   * commits the delivery and land on `delivered` with no key.
-   *
-   * ### LEFT, not INNER, on both sides
-   *
-   * An INNER JOIN to `products` would `404` an order whose catalogue row was
-   * withdrawn, and an INNER JOIN to `deliveries` would `404` every order that
-   * has not been delivered — which is all of them until Slice 5. Functional spec
-   * §2.6 wants a `404` for exactly one reason: *there is no such order*.
-   *
-   * ### What Slice 5 changed here: nothing
-   *
-   * `deliveries` now has a writer — `IssuanceService` binds a key with
-   * `INSERT ... ON CONFLICT (order_id) DO NOTHING`
-   * (`../issuance/issuance.service.ts`) — and this statement started returning
-   * codes without a character changing. The shape, the joins and `OrderView`
-   * were already right, which was the point of writing the `LEFT JOIN` and the
-   * `CASE` before there was anything to join to.
-   *
-   * ---------------------------------------------------------------------------
-   * PROCESSING TRIGGER 3 IS THE SECOND `CASE`, AND IT ADDS NO STATEMENT
-   * ---------------------------------------------------------------------------
-   * `architecture.md` §4's third trigger is *"the order status poll
-   * opportunistically drains that order's pending events"* — the one that makes
-   * a shopper's own page nudge their own order forward when the webhook's
-   * continuation was lost.
-   *
-   * The obvious implementation is trigger 2's: call `drainOrder` on every read.
-   * On *this* endpoint that is a standing load rather than a one-off, because
-   * the page polls once a second per open order and a drain that finds nothing
-   * is still `BEGIN` / `SELECT … FOR UPDATE SKIP LOCKED` / `COMMIT` — three
-   * round trips holding this instance's only pooled connection (`max: 1`),
-   * every second, for every viewer, for as long as an order sits in `created`
-   * waiting for a shopper to decide to pay.
-   *
-   * So the trigger is **gated on the database's own answer**, and the gate
-   * rides along in the statement that was already running:
-   *
-   *   - `EXISTS` against `payment_events_unprocessed_order_idx (order_id)
-   *     WHERE processed_at IS NULL` — a partial index holding *only* unapplied
-   *     events, so it is a handful of entries however large the table grows.
-   *     Not a join: a join could multiply the row (an order may have N pending
-   *     events), and this statement's single-row guarantee is load-bearing.
-   *     `EXISTS` stops at the first match and cannot change the row count.
-   *   - wrapped in `CASE WHEN status = ANY($2)` — the in-flight states. A
-   *     settled order (`delivered`, `payment_failed`, `out_of_stock`) does not
-   *     probe the index at all, and `EXPLAIN (ANALYZE)` says so: the SubPlan
-   *     reports `never executed`.
-   *
-   * Only when it comes back true does {@link OrderPendingEventsNotifier} fire,
-   * and the subscriber schedules the drain off this response path
-   * (`../payments/order-status-poll-drain.ts`, which argues the policy in full,
-   * including why a settled order is deliberately left to the admin sweep).
-   *
-   * ### Why the predicate names another module's table, which is a real cost
-   *
-   * `payment_events` belongs to `payments`, and `./order-created-notifier.service.ts`
-   * states the principle this rubs against: *`orders` has no business knowing
-   * that a payment inbox exists.* Three things make it the right trade here,
-   * and it is worth being explicit that it *is* a trade:
-   *
-   *   - **It is a read, in one statement, exactly as `products` and
-   *     `deliveries` already are.** Those tables belong to `catalog` and
-   *     `issuance`, and this statement joins both — for precisely this reason:
-   *     on the polled endpoint, a fact worth having is worth having without a
-   *     second round trip. A fourth table read the same way is the same trade,
-   *     not a new one.
-   *   - **No module edge is created.** The import is `paymentEvents` from
-   *     `@game-shop/db`, the shared schema. `OrdersModule` imports nothing new,
-   *     there is no cycle, and `SchedulingModule`'s distance from the root is
-   *     untouched.
-   *   - **The alternative costs the thing this trigger is trying to save.**
-   *     Keeping the predicate inside `payments` means publishing every in-flight
-   *     read and letting the subscriber ask — which is a round trip per poll per
-   *     viewer, i.e. the load the gate exists to remove.
-   *
-   * What is *not* traded away: this service still cannot do anything to a
-   * payment event. It reads one boolean and announces it. The claim, the apply
-   * and the settle stay in `payments`, behind `PaymentEventDrainService`.
-   */
-  async findOrder(orderId: string): Promise<FindOrderResult> {
-    const [row] = await this.database.db
-      .select({
-        id: orders.id,
-        status: orders.status,
-        sku: orders.sku,
-        productName: products.name,
-        amountMinor: orders.amountMinor,
-        currency: orders.currency,
-        // The rule, evaluated by Postgres. `${OrderStatus.Delivered}` is bound
-        // as a parameter, not inlined, so the status list stays owned by
-        // `@game-shop/contracts` rather than being retyped into a SQL string.
-        code: sql<string | null>`case when ${orders.status} = ${OrderStatus.Delivered} then ${deliveries.code} end`.as(
-          "code",
-        ),
-        // Trigger 3's gate, evaluated by Postgres inside the round trip this
-        // read was making anyway — see the header.
-        //
-        // `sql.param` binds the whole status list as ONE parameter, which is
-        // what `ANY` needs; interpolating the array directly would make Drizzle
-        // expand it into a row constructor `(a, b, c)`, which Postgres rejects
-        // here. Same binding as `OrderTransitionService`'s guard, and the list
-        // is imported from `@game-shop/contracts` rather than retyped into a
-        // SQL string, so "still moving" means the same thing here, in the
-        // frontend's stop condition and in the processor's settle rule.
-        //
-        // `else false`, never `else null`: the column is read as a boolean by
-        // the mapper below and a three-valued answer would make "no pending
-        // work" and "did not look" the same value.
-        hasPendingEvents: sql<boolean>`case when ${orders.status} = ANY(${sql.param([...inFlightOrderStatuses])}) then exists (select 1 from ${paymentEvents} where ${paymentEvents.orderId} = ${orders.id} and ${paymentEvents.processedAt} is null) else false end`.as(
-          "has_pending_events",
-        ),
-      })
-      .from(orders)
-      .leftJoin(products, eq(products.sku, orders.sku))
-      .leftJoin(deliveries, eq(deliveries.orderId, orders.id))
-      .where(eq(orders.id, orderId));
-
-    if (row === undefined) {
-      return { outcome: FindOrderOutcome.NotFound, orderId };
-    }
-
-    if (row.hasPendingEvents) {
-      // ######################################################################
-      // # AFTER THE READ, UNAWAITED, AND ONLY WHEN THERE IS SOMETHING TO DO.
-      // ######################################################################
-      //
-      // `architecture.md` §4's third processing trigger hangs off this line.
-      // Four properties, each deliberate:
-      //
-      //   - **Gated by the statement above.** False on every poll of an order
-      //     with an empty queue, and on every poll of a settled order — which
-      //     is all but a handful of the reads this endpoint serves. That is the
-      //     whole cost argument; see the header.
-      //   - **After the statement, never inside it.** This method opens no
-      //     transaction, and a drain opens transactions of its own against a
-      //     `max: 1` pool — a drain started from inside one would wait for a
-      //     connection its own caller is holding
-      //     (`../payments/payment-event-drain.service.ts`, `runPass`).
-      //   - **Synchronous and unawaited.** `notify` returns `void`, so the poll
-      //     cannot be made to wait on what a listener does — and what today's
-      //     listener does is a drain that reaches a supplier over HTTP. A page
-      //     that polls once a second must not be behind a supplier round trip;
-      //     the listener schedules that work instead
-      //     (`../payments/order-status-poll-drain.ts`).
-      //   - **Advisory, never an instruction.** By the time a listener runs,
-      //     another worker may already have claimed that row. A drain that
-      //     finds nothing is an ordinary outcome, not a contradiction.
-      //
-      // Losing this call entirely would cost latency and never a key: the event
-      // stays pending, in the partial index, for the next poll a second later
-      // and for the admin sweep behind it.
-      this.pendingEvents.notify(row.id);
-    }
-
-    return { outcome: FindOrderOutcome.Found, order: toOrderView(row) };
   }
 }

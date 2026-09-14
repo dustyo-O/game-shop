@@ -36,7 +36,8 @@
     "race:before-order": "pnpm race before-order",
     "race:recover-refusal": "pnpm race recover-refusal",
     "race:recover-timeout": "pnpm race recover-timeout",
-    "race:recover-out-of-stock": "pnpm race recover-out-of-stock"
+    "race:recover-out-of-stock": "pnpm race recover-out-of-stock",
+    "race:promo": "pnpm race promo"
   },
   "devDependencies": {
     "@types/node": "^22.18.8",

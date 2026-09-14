@@ -1,6 +1,7 @@
 // @layer: unit
 // @spec: 002-single-issuance-under-races
 // @spec: 003-failure-and-recovery
+// @spec: 005-promo-codes-with-enforced-limits
 // @regression
 /**
  * Functional spec §2.8's one testable fact for this phase: *"When the shopper
@@ -22,6 +23,31 @@
  * The second `@spec` line above is deliberate — this file now carries
  * regression coverage for both specs' §2.8/§2.9, and `/awos:regression`'s
  * grep for either spec's tag finds it.
+ *
+ * ---------------------------------------------------------------------------
+ * EXTENDED AGAIN FOR SPEC 005 §2.7 — THE PROMO FORM'S `text` TABLE
+ * ---------------------------------------------------------------------------
+ * Spec 005 adds a third table: `apps/web/src/features/apply-promo/ui/
+ * promo-form.ts`'s `const text = { … } as const` — the field's placeholder
+ * (which is also its `aria-label`), the «Применить» button, and the three
+ * refusal sentences plus the shared «Заказ не найден…» (technical-
+ * considerations §2.4). Functional spec 005 §2.7 names exactly these: *"the
+ * field, the button, … the three messages"*. The web has no sweep of its own
+ * (its vitest suite is DOM-free reducers and timers), so this file is
+ * extended a third time rather than a sibling started: same read-as-text
+ * technique, same stance, a third `describe`.
+ *
+ * The table's keys are plain identifiers rather than `[OrderStatus.X]`, so
+ * it has its own extractor — `extractTextTable` isolates the `const text`
+ * literal and reads each `key: "…"` line inside it. Doc comments inside the
+ * literal do not match (no `key: "` shape), and code outside it is never read.
+ *
+ * Two of the checks here are about the *shape* of the table, not its script:
+ * the three refusal sentences must differ from one another (a shopper must be
+ * able to tell "no such code" from "no uses left"), and the source must not
+ * mark the input with the browser's mandatory-field attribute — that attribute
+ * is the one way an English sentence («Please fill out this field») reaches
+ * this page without passing through any `text` table at all.
  *
  * ---------------------------------------------------------------------------
  * WHY THIS IS WORTH A TEST NOW, WHEN SPEC 001'S SUITE ONLY "VERIFIED BY
@@ -98,6 +124,24 @@ const ORDER_RECOVERY_EXPLANATION_FILE = resolve(
 );
 
 /**
+ * `apps/web/src/features/apply-promo/ui/promo-form.ts` — the same `apps/`
+ * root, then the feature's `ui` segment (spec 005 technical-considerations
+ * §2.4).
+ */
+const PROMO_FORM_FILE = resolve(
+  TEST_DIR,
+  "..",
+  "..",
+  "..",
+  "web",
+  "src",
+  "features",
+  "apply-promo",
+  "ui",
+  "promo-form.ts",
+);
+
+/**
  * Every `[OrderStatus.X]: "…"` entry in the object literal, in file order.
  * Deliberately does not care about the key names — see the file header on
  * why this is independent of `@game-shop/contracts`'s own naming — only that
@@ -110,6 +154,27 @@ const CYRILLIC_PATTERN = /[Ѐ-ӿ]/;
 
 function extractLabels(source: string): readonly string[] {
   return [...source.matchAll(LABEL_ENTRY_PATTERN)].map((match) => match[1] ?? "");
+}
+
+/** The whole of a feature's `const text = { … } as const;` literal, and nothing outside it. */
+const TEXT_TABLE_PATTERN = /const text = \{([\s\S]*?)\} as const;/;
+
+/** One `key: "…"` line inside that literal — a doc-comment line has no such shape and is skipped. */
+const TEXT_ENTRY_PATTERN = /^\s*(\w+):\s*"([^"]*)",?\s*$/gm;
+
+/**
+ * Every `key: "…"` entry of a feature's `text` table, keyed, in file order.
+ * Throws rather than returning an empty map when the literal is not found, so
+ * a renamed table fails loudly instead of passing on zero entries.
+ */
+function extractTextTable(source: string, file: string): ReadonlyMap<string, string> {
+  const literal = TEXT_TABLE_PATTERN.exec(source)?.[1];
+
+  if (literal === undefined) {
+    throw new Error(`no \`const text = { … } as const;\` literal found in ${file}`);
+  }
+
+  return new Map([...literal.matchAll(TEXT_ENTRY_PATTERN)].map((match) => [match[1] ?? "", match[2] ?? ""]));
 }
 
 describe("functional spec §2.8 — every order status label is in Russian", () => {
@@ -236,5 +301,68 @@ describe(
         }
       },
     );
+  },
+);
+
+/**
+ * What spec 005 technical-considerations §2.4 says the promo form's table
+ * holds, by key: the field (placeholder = `aria-label`), the button, the three
+ * refusal sentences and the shared not-found sentence. Transcribed here rather
+ * than imported, per the file header.
+ */
+const PROMO_FORM_TEXT_KEYS = ["placeholder", "apply", "unknown", "exhausted", "notFound", "failed"] as const;
+
+/** The three sentences a shopper can read after a refused code — they must be told apart. */
+const PROMO_FORM_REFUSAL_KEYS = ["unknown", "exhausted", "failed"] as const;
+
+/**
+ * The attribute that would let the browser show its own (English) bubble on an
+ * empty submit. Matched as an attribute entry (`required: "…"` inside the
+ * `attributes` object), not as a word — the file may well *discuss* the
+ * attribute in a comment.
+ */
+const MANDATORY_FIELD_ATTRIBUTE_PATTERN = /^\s*"?required"?\s*:\s*"/m;
+
+describe(
+  "functional spec 005 §2.7 — the promo form's field, button and the three messages are in Russian " +
+    "and tell the refusals apart",
+  () => {
+    const source = readFileSync(PROMO_FORM_FILE, "utf8");
+    const table = extractTextTable(source, PROMO_FORM_FILE);
+
+    // @regression
+    it("the text table defines exactly the six entries §2.4 names — the field, the button, three refusals, not-found", () => {
+      expect([...table.keys()], `entries in ${PROMO_FORM_FILE}`).toEqual([...PROMO_FORM_TEXT_KEYS]);
+    });
+
+    // @regression
+    it("every entry is non-empty and contains a Cyrillic character — not English, not a blank placeholder", () => {
+      for (const [key, value] of table) {
+        expect(value.length, `text.${key} ("${value}") is empty`).toBeGreaterThan(0);
+        expect(CYRILLIC_PATTERN.test(value), `text.${key} ("${value}") has no Cyrillic character`).toBe(true);
+      }
+    });
+
+    // @regression
+    it("the three refusal sentences differ from one another — a shopper can tell 'no such code' from 'no uses left'", () => {
+      const refusals = PROMO_FORM_REFUSAL_KEYS.map((key) => table.get(key) ?? "");
+      expect(new Set(refusals).size, `refusals: ${JSON.stringify(refusals)}`).toBe(refusals.length);
+    });
+
+    // @regression
+    it("the not-found sentence is the same one the rest of the order page uses for a 404", () => {
+      // `pages/order/ui/order-page.ts` and `features/simulate-payment` both
+      // say this for a `404`; a third wording for the same situation would be
+      // a third thing for a shopper to learn.
+      expect(table.get("notFound")).toBe("Заказ не найден. Проверьте адрес страницы.");
+    });
+
+    // @regression
+    it("negative — the input is not marked mandatory for the browser, so no native English bubble can appear", () => {
+      expect(
+        MANDATORY_FIELD_ATTRIBUTE_PATTERN.test(source),
+        `${PROMO_FORM_FILE} sets the browser's mandatory-field attribute on an element`,
+      ).toBe(false);
+    });
   },
 );
