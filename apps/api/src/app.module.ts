@@ -3,6 +3,7 @@ import { Module } from "@nestjs/common";
 import { AdminModule } from "./admin/admin.module.js";
 import { CatalogModule } from "./catalog/catalog.module.js";
 import { ConfigModule } from "./config/config.module.js";
+import { DemoModule } from "./demo/demo.module.js";
 import { HealthController } from "./health.controller.js";
 import { OrdersModule } from "./orders/orders.module.js";
 import { PaymentsModule } from "./payments/payments.module.js";
@@ -66,6 +67,19 @@ import { SupplierBehaviourModule } from "./suppliers/supplier-behaviour.module.j
   // neither moves, `SchedulingModule` stays at 2 and the destroy order above
   // is untouched.
   //
+  // `DemoModule` carries `POST /api/admin/demo/reset` — spec 006 §2.3's
+  // whole-shop reset, behind the same admin token as `AdminModule` and
+  // deliberately not inside it: `AdminModule`'s header argues it can write
+  // one column and cannot write `orders.status` by any route, and a six-table
+  // delete is what that argument excludes. Its licence to write both sides of
+  // the supplier boundary is the seed's — the loader, not a participant
+  // (`./demo/demo.module.ts`). It exports nothing. At distance 2 its imports
+  // (`ConfigModule` at 4, `DatabaseModule` at 3) are each offered 3, which is
+  // not strictly deeper than where either sits, so neither moves,
+  // `SchedulingModule` stays at 2 and the destroy order above is untouched —
+  // read out of the container after boot, not assumed (that module's header
+  // has the table).
+  //
   // `SupplierAModule` and `SupplierBModule` are the odd ones out and should stay
   // that way: they are not part of the shop, they are the two simulated
   // suppliers hosted in the same function (architecture.md §6). They answer at
@@ -104,6 +118,7 @@ import { SupplierBehaviourModule } from "./suppliers/supplier-behaviour.module.j
     PaymentsModule,
     AdminModule,
     PromoModule,
+    DemoModule,
     SupplierAModule,
     SupplierBModule,
     SupplierBehaviourModule,

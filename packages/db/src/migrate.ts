@@ -6,17 +6,32 @@
  *
  *   - reads `DATABASE_URL` from the environment; it does **not** load `.env`
  *     itself — `scripts/with-env.ts` has already assembled the environment, and
- *     on Vercel/Neon the platform supplies it;
+ *     against Neon the operator exports it for the one command (below);
  *   - applies every migration not yet recorded in `drizzle.__drizzle_migrations`;
  *   - is idempotent: a second run applies nothing and exits 0;
  *   - runs with cwd = `packages/db`, but resolves the migrations folder from its
  *     own location, so it also works when invoked from anywhere else.
  *
- * Driver: `node-postgres` over plain TCP, not `drizzle-orm/neon-serverless`.
- * Migrations are run by a developer, by `db:setup`, or by a deploy step — never
- * from inside a function invocation — and Neon's pooled endpoint speaks the
- * ordinary wire protocol just as the local Docker container does. The WebSocket
- * serverless driver exists for the request path, which never migrates.
+ * Driver: the same `node-postgres` the request path uses (Phase 6 decided
+ * against a driver swap — `client.ts`'s header, "DECIDED: NO SWAP"), as a single
+ * `pg.Client` rather than the pool: one connection, one operator, one run.
+ *
+ * Operator rule — direct endpoint, from a laptop, never from a build:
+ *
+ *     DATABASE_URL=<neon-direct> pnpm db:deploy     # migrate && seed
+ *
+ * Run by a developer (`db:setup` locally, `db:deploy` against Neon), never from
+ * inside a function invocation and never from Vercel's build step. Why not the
+ * build: every preview deploy would run DDL on every PR; the build would depend
+ * on a cold compute and hold the database secret; and the seed is idempotent
+ * but not inert — a fixture that lowers `max_uses` under a live `used_count`
+ * aborts on the CHECK, which is a human's decision, not a deploy failure. Why
+ * the *direct* host and not the `-pooler` one: the migrator would work through
+ * PgBouncer (one transaction, no `CONCURRENTLY` — see below), but an operator's
+ * single connection has no pooling problem for PgBouncer to solve, the `psql`
+ * read-back that follows (`\d`, `SHOW max_connections`) is a plain session on
+ * the direct host anyway, and keeping DDL off the endpoint the function shares
+ * with fifty instances is one less thing to reason about during a demo.
  *
  * Run directly by Node's type stripping (`node src/migrate.ts`), on by default
  * from Node 22.18 — the same mechanism `scripts/with-env.ts` uses. No build step,
@@ -69,9 +84,15 @@ async function main(): Promise<void> {
     const before = await countAppliedMigrations(client);
     console.log(`migrate: ${before} migration(s) already applied`);
 
-    // Each migration file runs inside a transaction and is recorded in
-    // `drizzle.__drizzle_migrations` in that same transaction, so a failure
-    // half-way leaves neither the DDL nor the journal entry behind.
+    // All pending migrations run in ONE transaction, not one per file. Drizzle's
+    // pg dialect opens `session.transaction(...)` once and loops every pending
+    // file — each file's statements, then its `drizzle.__drizzle_migrations`
+    // insert — inside it (drizzle-orm 0.45.2, `pg-core/dialect.js`, `migrate()`
+    // at line 44; the transaction at line 60). So a failure anywhere in the run
+    // leaves neither DDL nor journal rows behind from *any* file of that run,
+    // not merely the failing one; migration 0005's header states the same
+    // boundary from the other side. It holds because no migration here uses
+    // `CREATE INDEX CONCURRENTLY`, which cannot run inside a transaction block.
     await migrate(drizzle(client), { migrationsFolder });
 
     const after = await countAppliedMigrations(client);

@@ -92,8 +92,10 @@ const continuationSchedulerProvider: Provider = {
     }
 
     if (isPlatformFunction) {
-      // Running as a Vercel function with the seam still open — see
-      // `resolveWaitUntil`. The tracked implementation is a poor substitute
+      // Running as a Vercel function with `resolveWaitUntil()` returning
+      // `undefined` — unreachable since Phase 6 closed the seam, kept so a
+      // reopened seam is loud rather than silent (see `resolveWaitUntil`).
+      // The tracked implementation is a poor substitute
       // here (there is no `SIGTERM` and the instance freezes at the response),
       // so this is loud. It is not fatal, because the other three triggers in
       // `architecture.md` §4 still complete every order; what is lost is

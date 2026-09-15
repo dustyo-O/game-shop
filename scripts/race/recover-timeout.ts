@@ -71,11 +71,54 @@ import { resolveRaceTargets } from "./support/race-targets.ts";
 
 const CHECK_NAME = "race:recover-timeout";
 
-/** `apps/api/src/config/supplier-config.ts`'s own default — read from the environment so this check tracks whatever the target actually enforces rather than assuming. */
-function readSupplierTimeoutMs(): number {
+/**
+ * The supplier deadline the TARGET enforces, and where this check learned it.
+ *
+ * The hang armed below must outlast that deadline or the check stages the
+ * *other* scenario — slow-but-successful, no timeout, nothing exercised — and
+ * passes vacuously (spec 006 R8: a `hang_ms` derived from the local `2000`
+ * against a live target running `5000` never times out). Locally the runner
+ * hands the checks the same `SUPPLIER_TIMEOUT_MS` it hands the instances, so
+ * the environment was a fair source; against a live target this process's
+ * environment says nothing about the target's. So: the target's own
+ * `GET /api/health` (`supplier_timeout_ms` — the value its issuance client
+ * actually waits, `apps/api/src/health.controller.ts`) is preferred, the
+ * environment is the fallback, and the line printed names which one was used.
+ */
+interface SupplierTimeout {
+  readonly ms: number;
+  readonly source: string;
+}
+
+/** `supplier_timeout_ms` from the first target's `/api/health`, or `undefined` when it does not publish one (an older build, or not this API). */
+async function readTargetSupplierTimeoutMs(baseUrl: string): Promise<number | undefined> {
+  try {
+    const response = await fetch(`${baseUrl}/api/health`);
+    if (!response.ok) return undefined;
+    const body = (await response.json()) as { supplier_timeout_ms?: unknown };
+    const value = body.supplier_timeout_ms;
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** `apps/api/src/config/supplier-config.ts`'s own default when the environment has nothing usable. */
+const DEFAULT_SUPPLIER_TIMEOUT_MS = 2000;
+
+async function resolveSupplierTimeout(baseUrl: string): Promise<SupplierTimeout> {
+  const fromTarget = await readTargetSupplierTimeoutMs(baseUrl);
+  if (fromTarget !== undefined) return { ms: fromTarget, source: "from target /api/health" };
+
   const raw = process.env["SUPPLIER_TIMEOUT_MS"];
   const parsed = raw === undefined || raw.trim() === "" ? Number.NaN : Number(raw);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 2000;
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return { ms: parsed, source: "from SUPPLIER_TIMEOUT_MS env — target did not report one" };
+  }
+  return {
+    ms: DEFAULT_SUPPLIER_TIMEOUT_MS,
+    source: "the 2000 default — target did not report one and SUPPLIER_TIMEOUT_MS is unset",
+  };
 }
 
 const targets = resolveRaceTargets();
@@ -95,11 +138,14 @@ console.log(
     "accounting holds — technical-considerations §12, §2.2, §7.1, §11 R1/R2.",
 );
 
-const supplierTimeoutMs = readSupplierTimeoutMs();
-// Comfortably past SUPPLIER_TIMEOUT_MS (R1's corrected inequality:
-// SUPPLIER_TIMEOUT_MS < hang_ms < ceiling) and comfortably short in absolute
-// terms — there is no platform ceiling to respect locally, only this check's
-// own patience.
+const supplierTimeout = await resolveSupplierTimeout(targets.at(0));
+const supplierTimeoutMs = supplierTimeout.ms;
+console.log(`  supplier timeout ${String(supplierTimeoutMs)} ms (${supplierTimeout.source})`);
+// Comfortably past the target's SUPPLIER_TIMEOUT_MS (R1's corrected
+// inequality: SUPPLIER_TIMEOUT_MS < hang_ms < ceiling) and comfortably short
+// in absolute terms — there is no platform ceiling to respect locally, only
+// this check's own patience. Against a live target running 5000 this lands at
+// 6500, inside Vercel's 60 s function ceiling with room for the re-probe.
 const hangMs = supplierTimeoutMs + 1_500;
 const settleTimeoutMs = Math.max(15_000, hangMs + 10_000);
 
@@ -168,7 +214,7 @@ if (adminToken === undefined) {
       orderId = order.id;
       console.log(
         `  order ${order.id} created on a fresh instance; paying it on another — the walk will hang ` +
-          `~${String(hangMs)}ms past SUPPLIER_TIMEOUT_MS=${String(supplierTimeoutMs)}ms before it resolves`,
+          `${String(hangMs)}ms, past the target's supplier timeout of ${String(supplierTimeoutMs)}ms, before it resolves`,
       );
 
       const eventId = newEventId(order.id, "recovertimeout");

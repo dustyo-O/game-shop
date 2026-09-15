@@ -89,6 +89,25 @@ import {
 const PAYMENT_WEBHOOK_URL = "PAYMENT_WEBHOOK_URL";
 
 /**
+ * How long {@link PaymentSimulatorService.deliver} waits for the webhook to
+ * answer before reporting *no answer*.
+ *
+ * On Vercel the webhook is not "the same process one hop away" — it is a
+ * second invocation of the same function, and possibly a cold one: Lambda
+ * init + Nest `init()` + first connect (+ a Neon resume) ≈ 1.5–2.5 s
+ * (technical-considerations §2.7, R1 of the Phase 6 spec). So the self-call
+ * needs a bound that is comfortably above a cold boot, and 10 s is generous
+ * on purpose: the supplier's `/issue` budget is 5 s per probe because a slow
+ * supplier must be read as `unknown` promptly, whereas nothing here retries
+ * and the only cost of waiting longer is the caller's patience. What the
+ * bound must never be is absent — without one, a cold inner invocation that
+ * never answers holds the outer one open to the platform's `maxDuration`
+ * ceiling, and a hung simulation becomes a 60 s wait that ends in the
+ * platform's own error rather than this class's honest "unknown".
+ */
+const WEBHOOK_SELF_CALL_TIMEOUT_MS = 10_000;
+
+/**
  * Which of the two things happened. Named outcomes rather than
  * `SimulatedPaymentAck | null`, matching {@link OrdersService},
  * {@link PaymentEventsService} and {@link OrderTransitionService}: the
@@ -140,9 +159,9 @@ export const WebhookDeliveryFailure = {
   Rejected: "rejected",
   /**
    * **Unknown.** There was no answer at all: connection refused, the socket
-   * died, the body was not JSON. The event may or may not have reached the
-   * inbox, and the honest report says so rather than picking the comfortable
-   * half.
+   * died, the body was not JSON, or {@link WEBHOOK_SELF_CALL_TIMEOUT_MS}
+   * expired first. The event may or may not have reached the inbox, and the
+   * honest report says so rather than picking the comfortable half.
    */
   Unreachable: "unreachable",
 } as const;
@@ -424,8 +443,10 @@ export class PaymentSimulatorService {
    *     become a row, which for an event this class built means *this class*
    *     built it wrong; that is a bug in the simulator, and it is reported as one
    *     rather than retried.
-   *   - **no answer** — unknown. The event may have been stored, and the report
-   *     says exactly that ({@link WebhookDeliveryFailure}).
+   *   - **no answer** — unknown, whether the connection failed or the webhook
+   *     simply had not answered within {@link WEBHOOK_SELF_CALL_TIMEOUT_MS}.
+   *     The event may have been stored, and the report says exactly that
+   *     ({@link WebhookDeliveryFailure}).
    *
    * ### No retry, deliberately
    *
@@ -446,12 +467,28 @@ export class PaymentSimulatorService {
         method: "POST",
         headers: { "Content-Type": "application/json", Accept: "application/json" },
         body: JSON.stringify(payload),
+        // Bounded because on Vercel the other end is a second invocation of
+        // this same function, possibly cold (≈1.5–2.5 s); without a bound a
+        // cold inner invocation could hold this one open to the platform
+        // ceiling. See the constant for why 10 s and not the supplier's 5 s.
+        signal: AbortSignal.timeout(WEBHOOK_SELF_CALL_TIMEOUT_MS),
       });
     } catch (error: unknown) {
+      // The bound expiring is the same fact as a dead socket — *no answer* —
+      // so it maps to the same outcome, not a new one. `fetch` rejects with
+      // the signal's reason: a `DOMException` named `TimeoutError` when
+      // `AbortSignal.timeout` fired, `AbortError` for any other abort. Named
+      // in the detail so the log line says "no answer within 10000 ms" rather
+      // than "could not reach", which would read as a refused connection.
+      const isAborted =
+        error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
+
       throw this.deliveryFailed(
         payload,
         WebhookDeliveryFailure.Unreachable,
-        `could not reach ${this.webhookUrl.href}: ${error instanceof Error ? error.message : String(error)}`,
+        isAborted
+          ? `no answer from ${this.webhookUrl.href} within ${String(WEBHOOK_SELF_CALL_TIMEOUT_MS)} ms`
+          : `could not reach ${this.webhookUrl.href}: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
 

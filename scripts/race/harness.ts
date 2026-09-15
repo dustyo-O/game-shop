@@ -6,10 +6,11 @@
  *
  * It asserts nothing about the shop's behaviour. It asserts that the *next*
  * check's result will mean something: that every target is really serving,
- * that each one can really reach the database, and — when a database
- * connection is available — that the targets are genuinely **separate
- * processes holding separate connections** rather than one process wearing
- * several URLs.
+ * that each one can really reach the database, and that the targets are
+ * genuinely **separate processes** rather than one process wearing several
+ * URLs — over HTTP, from the `x-instance-id` every answer carries, and, when
+ * a database connection is available, from the separate backend connections
+ * those processes hold.
  *
  * That last one is the point of the whole slice. `packages/db/src/client.ts`
  * pins the pool to `max: 1`, so concurrent requests to a single process
@@ -18,6 +19,29 @@
  * distinct keys across 1 process, 9 across 4, zero errors in both). A green
  * `race:webhooks` against one process is not evidence, and nothing in
  * `race:webhooks` itself can tell the difference. This check can.
+ *
+ * ---------------------------------------------------------------------------
+ * THE TWO WITNESSES, AND WHICH ONE COUNTS WHERE
+ * ---------------------------------------------------------------------------
+ * The `pg_stat_activity` pid count is the stronger witness — it sees the
+ * processes from the database's side — and it is the one that decides locally.
+ * A reviewer pointed at the live shop holds no database, so there the
+ * instance-id witness decides instead: N = max(8, 2 × targets) concurrent
+ * `GET /api/health`, spread round-robin, every header checked against its own
+ * body, and the distinct count read off (spec 006 §2.5). Externally it is a
+ * PASS at ≥ 2 distinct ids and a FAIL at exactly 1 — every answer from one
+ * process is the run §7 warns is worthless, and on Vercel that is what Fluid
+ * Compute produces when it is left on. Locally it is INFO only: one id per
+ * port is a tautology, the runner started those processes itself, and the
+ * pids below are the proof. `RACE_MODE` (set by the runner) is how this file
+ * tells the two apart; run by hand it assumes the external reading.
+ *
+ * What the count does not prove, printed with it: a distinct id proves a
+ * distinct process, not that those processes overlapped in time — two ids
+ * across eight answers are consistent with one instance recycled between the
+ * first and the last. It rules out the one reading that would make a live run
+ * worthless, and no more. K = 1 on a run means that run was not cross-process
+ * evidence, whatever the checks after it say.
  *
  * It is also the worked example for the other checks in this directory: read
  * it top to bottom for the shape — resolve targets, announce, run the HTTP
@@ -29,10 +53,23 @@ import {
   openRaceDatabase,
   readBaselineCounts,
 } from "./support/race-database.ts";
-import { resolveRaceTargets } from "./support/race-targets.ts";
+import {
+  collectInstanceIds,
+  INSTANCE_ID_HEADER,
+  RACE_MODE_ENV,
+  readInstanceId,
+  resolveRaceTargets,
+} from "./support/race-targets.ts";
 
 /** `application_name` every `apps/api` instance connects with — `packages/db/src/client.ts`. */
 const API_APPLICATION_NAME = "game-shop";
+
+/**
+ * The floor on the concurrent health fan-out. Eight against one deployed
+ * origin gives the platform room to answer from more than one instance;
+ * 2 × targets keeps every local port asked at least twice.
+ */
+const MIN_INSTANCE_WITNESS_REQUESTS = 8;
 
 const targets = resolveRaceTargets();
 targets.announce("race:harness");
@@ -61,6 +98,83 @@ for (const baseUrl of targets.baseUrls) {
     record(false, `${baseUrl} serves /api/health`, error instanceof Error ? error.message : String(error));
   }
 }
+
+// ---------------------------------------------------------------------------
+// The instance-id witness — the HTTP proof of "separate processes". See the
+// header, "THE TWO WITNESSES".
+// ---------------------------------------------------------------------------
+interface HealthAnswer {
+  readonly response: Response | undefined;
+  readonly bodyInstanceId: string | undefined;
+  readonly error: string | undefined;
+}
+
+async function fetchHealth(baseUrl: string): Promise<HealthAnswer> {
+  try {
+    const response = await fetch(`${baseUrl}/api/health`);
+    const body: unknown = response.ok ? await response.json() : undefined;
+    const bodyInstanceId = (body as { instance_id?: unknown } | undefined)?.instance_id;
+    return {
+      response,
+      bodyInstanceId: typeof bodyInstanceId === "string" ? bodyInstanceId : undefined,
+      error: undefined,
+    };
+  } catch (error: unknown) {
+    return { response: undefined, bodyInstanceId: undefined, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+const witnessRequestCount = Math.max(MIN_INSTANCE_WITNESS_REQUESTS, 2 * targets.instanceCount);
+const healthAnswers = await Promise.all(
+  Array.from({ length: witnessRequestCount }, (_, i) => fetchHealth(targets.at(i))),
+);
+
+// Header and body must agree on every answer: the header is what every other
+// check reads, the body is what a person reads, and a mismatch would mean one
+// of them is not this process's id.
+const disagreeing = healthAnswers.filter(
+  (answer) => answer.response === undefined || readInstanceId(answer.response) !== answer.bodyInstanceId,
+);
+record(
+  disagreeing.length === 0,
+  `${INSTANCE_ID_HEADER} header equals the body's instance_id on all ${String(witnessRequestCount)} concurrent health answers`,
+  disagreeing.length === 0
+    ? `${String(witnessRequestCount)} of ${String(witnessRequestCount)} agree`
+    : disagreeing
+        .slice(0, 3)
+        .map((answer) =>
+          answer.response === undefined
+            ? `fetch failed: ${answer.error ?? "unknown"}`
+            : `header=${String(readInstanceId(answer.response))} body=${String(answer.bodyInstanceId)}`,
+        )
+        .join("; ") + (disagreeing.length > 3 ? "; …" : ""),
+);
+
+const witness = collectInstanceIds(healthAnswers.map((answer) => answer.response).filter((r): r is Response => r !== undefined));
+const distinctInstanceIds = witness.distinct.length;
+const raceMode = process.env[RACE_MODE_ENV];
+
+if (raceMode === "local") {
+  // The runner started these processes on these ports itself; one id per
+  // port is a tautology. The pid count below is the local proof.
+  console.log(
+    `  INFO  ${String(targets.instanceCount)} targets, ${String(distinctInstanceIds)} distinct instance id(s) across ` +
+      `${String(witnessRequestCount)} concurrent health answers — locally an id per port is a tautology; ` +
+      "the pg_stat_activity pids below are the proof",
+  );
+} else {
+  record(
+    distinctInstanceIds >= 2,
+    `the ${String(witnessRequestCount)} concurrent health answers came from at least two distinct instances`,
+    distinctInstanceIds >= 2
+      ? `${String(distinctInstanceIds)} distinct instance id(s) across ${String(targets.instanceCount)} target(s)`
+      : `all ${String(witnessRequestCount)} answers came from one instance — re-run, or check that Fluid Compute is off`,
+  );
+}
+console.log(
+  "        A distinct id proves a distinct process, not that those processes overlapped in time.\n" +
+    "        K = 1 on a run means that run was not cross-process evidence, whatever the checks after it say.",
+);
 
 // Health answers `200` with no database at all — `apps/api` builds its pool
 // lazily — so liveness alone would let a run start against instances that
@@ -92,9 +206,10 @@ if (db === undefined) {
   console.log("  SKIP  distinct backend connections — needs DATABASE_URL");
   console.log("  SKIP  seeded baseline counts — needs DATABASE_URL");
   console.log(
-    "        Without a database route this run cannot confirm the targets are separate\n" +
-      "        processes. On a deployed target that is the platform's guarantee; locally it\n" +
-      "        is the one thing worth confirming, so run this through `pnpm race`.",
+    "        Without a database route this run cannot confirm from the database's side\n" +
+      "        that the targets are separate processes, nor that they overlapped; the\n" +
+      "        instance-id line above is the HTTP witness and no more. Locally it is the\n" +
+      "        one thing worth confirming, so run this through `pnpm race`.",
   );
 } else {
   try {

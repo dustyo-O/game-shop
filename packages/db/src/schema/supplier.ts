@@ -41,8 +41,28 @@ import {
  * `supplier_keys` — the supplier's key pool. Seeded with the fifty supplied
  * codes; exhausting it is how the `out_of_stock` scenario is produced.
  *
- * A key is claimed by exactly one request, forever. There is no "unclaim":
- * restocking is adding rows, not clearing `claimed_by_request_id`.
+ * A key is claimed by exactly one request, forever. On every production path
+ * there is no "unclaim": nothing the shop or a supplier does on a shopper's
+ * behalf ever clears `claimed_by_request_id`, and restocking a live pool is
+ * adding rows, not clearing it. _Amended in Phase 6 (spec 006
+ * technical-considerations §2.4): was the flat "there is no unclaim"; the two
+ * sentences below name what does clear it._ Two demo affordances **outside
+ * those paths** clear the claim, and each is scoped so a delivered key can
+ * never be resold:
+ *
+ *   - the test harness's cleanup (`apps/api/test/concurrency/support/db.ts`,
+ *     `cleanupTestOrders`) — only the request ids the test itself derived;
+ *   - the demo reset (`apps/api/src/demo/demo-reset.service.ts`) — every
+ *     key, but only inside the transaction that deletes every `deliveries`
+ *     row, so at `COMMIT` there is no shopper's page left holding a key
+ *     that is back in stock.
+ *
+ * `POST /internal/suppliers/keys/restock` (`apps/api/src/suppliers/
+ * supplier-key-pool.service.ts`) is narrower still: it releases only
+ * *sentinel* claims — rows `drain` wrote as `drain_<token>_<id>` — by
+ * `LIKE 'drain\_%'` with the literal-underscore escape, and a real claim,
+ * which begins `req_`, can never match it (spec 006 R15). It is not an
+ * unclaim of anything a shopper was ever shown.
  */
 export const supplierKeys = pgTable(
   "supplier_keys",
@@ -60,9 +80,11 @@ export const supplierKeys = pgTable(
     /**
      * I6 — one key → at most one request.
      *
-     * NULL means unclaimed. Once set it never changes. UNIQUE, so even a lost
-     * race cannot produce a double claim; NULLs do not collide in a Postgres
-     * unique index, so the whole unclaimed pool coexists under it.
+     * NULL means unclaimed. Once set it never changes on a production path
+     * (the table's header names the demo affordances that clear it, and how
+     * each is scoped). UNIQUE, so even a lost race cannot produce a double
+     * claim; NULLs do not collide in a Postgres unique index, so the whole
+     * unclaimed pool coexists under it.
      */
     claimedByRequestId: text("claimed_by_request_id"),
 

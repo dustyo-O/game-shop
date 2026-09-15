@@ -22,6 +22,7 @@
     "db:setup": "pnpm run db:up && pnpm run db:migrate && pnpm run db:seed",
     "db:migrate": "node scripts/with-env.ts pnpm --filter @game-shop/db run migrate",
     "db:seed": "node scripts/with-env.ts pnpm --filter @game-shop/db run seed",
+    "db:deploy": "pnpm run db:migrate && pnpm run db:seed",
     "db:psql": "node scripts/with-env.ts docker compose exec postgres sh -c 'psql -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\"'",
     "clean": "pnpm -r run clean",
     "test:concurrency": "node scripts/with-env.ts pnpm --filter @game-shop/api run test:concurrency",
@@ -37,7 +38,8 @@
     "race:recover-refusal": "pnpm race recover-refusal",
     "race:recover-timeout": "pnpm race recover-timeout",
     "race:recover-out-of-stock": "pnpm race recover-out-of-stock",
-    "race:promo": "pnpm race promo"
+    "race:promo": "pnpm race promo",
+    "demo:reset": "node scripts/with-env.ts node scripts/demo-reset.ts"
   },
   "devDependencies": {
     "@types/node": "^22.18.8",

@@ -162,8 +162,9 @@ export function deriveIssuanceRequestId(orderId: string, provider: string, attem
 
 // ---------------------------------------------------------------------------
 // The supplier's control surface — `PUT /internal/suppliers/:provider/behaviour`
-// and the operator's `POST /api/admin/orders/:orderId/retry`, both behind
-// `ADMIN_TOKEN`.
+// and `POST /internal/suppliers/keys/{drain,restock}` — the operator's
+// `POST /api/admin/orders/:orderId/retry`, and the demo's
+// `POST /api/admin/demo/reset`, all behind the same `ADMIN_TOKEN`.
 // ---------------------------------------------------------------------------
 
 /** `undefined` when unset or empty — a check reads this once and either proceeds or SKIPs; see `../README.md`'s "Adding a check", exit code 3. */
@@ -238,6 +239,72 @@ export async function putSupplierBehaviour(
 /** `POST /api/admin/orders/:orderId/retry` — no body, per `order-recovery.controller.ts`'s header (R11: no affordance that invites automation). */
 export async function postOperatorRetry(baseUrl: string, adminToken: string, orderId: string): Promise<AdminApiResult> {
   const response = await fetch(`${baseUrl}/api/admin/orders/${orderId}/retry`, {
+    method: "POST",
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
+  return parseAdminApiResponse(response);
+}
+
+// ---------------------------------------------------------------------------
+// The demo affordances (spec 006, technical-considerations §2.4). Three
+// routes, one shape: `POST`, `200`, a count of rows changed, `0` never an
+// error, `401`/`503` answers to read rather than crashes — the same
+// `AdminApiResult` every other admin call here returns, so a check turns a
+// missing affordance into the same SKIP by the same helper.
+// ---------------------------------------------------------------------------
+
+/**
+ * `POST /internal/suppliers/keys/drain` `{ token? }` → `{ token, claimed }`
+ * (`apps/api/src/suppliers/supplier-key-pool.controller.ts`). Claims every
+ * unclaimed key under `drain_<token>_<id>` so the next purchase meets an
+ * empty pool; `claimed: 0` means the pool was already empty.
+ *
+ * A caller that names the token must keep to the route's shape —
+ * `^[A-Za-z0-9-]{1,64}$`, hyphens and never underscores, because `_` is a
+ * `LIKE` wildcard inside the restock pattern and the route refuses it with a
+ * `400` rather than escaping it. `race-<check>-<uuid>` is the shape the
+ * checks use. Without a token the route mints a UUID and echoes it.
+ */
+export async function postDemoDrainKeys(baseUrl: string, adminToken: string, token?: string): Promise<AdminApiResult> {
+  const response = await fetch(`${baseUrl}/internal/suppliers/keys/drain`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify(token === undefined ? {} : { token }),
+  });
+  return parseAdminApiResponse(response);
+}
+
+/**
+ * `POST /internal/suppliers/keys/restock` `{ token? }` → `{ released }`.
+ * Releases the sentinel claims one drain made (by token) or every drain's
+ * (no token); never a real `req_…` claim (R15 — the route's own header).
+ * Idempotent: a second restock with the same token releases `0`, which is
+ * what lets a check's `finally` restock without first asking whether the
+ * deliberate restock already ran.
+ */
+export async function postDemoRestock(baseUrl: string, adminToken: string, token?: string): Promise<AdminApiResult> {
+  const response = await fetch(`${baseUrl}/internal/suppliers/keys/restock`, {
+    method: "POST",
+    headers: { "content-type": "application/json", authorization: `Bearer ${adminToken}` },
+    body: JSON.stringify(token === undefined ? {} : { token }),
+  });
+  return parseAdminApiResponse(response);
+}
+
+/**
+ * `POST /api/admin/demo/reset` — no body — → `{ removed, reset, changed, now }`
+ * (`apps/api/src/demo/demo-reset.controller.ts`): every order gone, every
+ * counter, claim and behaviour knob back to the seed, in one transaction.
+ *
+ * Not for a check's own cleanup. Locally every check tidies **its own** rows
+ * through `cleanupTestOrders` and the harness asserts the baseline after; a
+ * reset in their place would sweep a leaking application's residue into
+ * `removed` and call it a pass (`scripts/demo-reset.ts`'s header). This is
+ * here for the runner's external mode (`RACE_DEMO_RESET=1`) and for the
+ * operator between sessions.
+ */
+export async function postDemoReset(baseUrl: string, adminToken: string): Promise<AdminApiResult> {
+  const response = await fetch(`${baseUrl}/api/admin/demo/reset`, {
     method: "POST",
     headers: { authorization: `Bearer ${adminToken}` },
   });

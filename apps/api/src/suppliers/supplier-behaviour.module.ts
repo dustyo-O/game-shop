@@ -72,10 +72,19 @@ import { ConfigModule } from "../config/config.module.js";
 import { DatabaseModule } from "../database/database.module.js";
 import { SupplierBehaviourController } from "./supplier-behaviour.controller.js";
 import { SupplierBehaviourService } from "./supplier-behaviour.service.js";
+import { SupplierKeyPoolController } from "./supplier-key-pool.controller.js";
+import { SupplierKeyPoolService } from "./supplier-key-pool.service.js";
 
 @Module({
   imports: [ConfigModule, DatabaseModule],
-  controllers: [SupplierBehaviourController],
-  providers: [SupplierBehaviourService, AdminTokenGuard],
+  // Two controllers since Phase 6 (spec 006 technical-considerations §2.4):
+  // the behaviour route, and the key-pool demo affordances
+  // (`POST /internal/suppliers/keys/{drain,restock}`) that stage the empty-pool
+  // scenario. Same module because they are the same kind of thing — the
+  // supplier's control surface, on the supplier's side of the boundary, behind
+  // the same guard — and the argument in this file's header covers both: the
+  // shop must never be able to inject either service.
+  controllers: [SupplierBehaviourController, SupplierKeyPoolController],
+  providers: [SupplierBehaviourService, SupplierKeyPoolService, AdminTokenGuard],
 })
 export class SupplierBehaviourModule {}

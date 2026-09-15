@@ -156,8 +156,10 @@ const EXPECTED_PROMO_CODES = 4;
 /**
  * Throws with a precise diff unless the database is at the seeded baseline —
  * the precondition this suite needs before it will touch `supplier_keys`,
- * since the pool is a finite, non-renewable resource in production code (no
- * "unclaim" exists there on purpose — `packages/db/src/schema/supplier.ts`)
+ * since the pool is a finite, non-renewable resource on every production
+ * path (no "unclaim" exists there on purpose — `packages/db/src/schema/
+ * supplier.ts`; the two demo affordances that do clear a claim are scoped
+ * there)
  * and this suite wants a known quantity to hand back exactly.
  *
  * The promo rows are the same shape of precondition for spec 005: a use of a
@@ -290,9 +292,12 @@ export async function cleanupTestOrders(client: DatabaseClient, orderIds: readon
   // backstop doing its job, loudly, on a drift this test would otherwise have
   // had to explain from a negative count in the next baseline.
   //
-  // Only a test may do this. Nothing in apps/api ever decrements `used_count`
-  // — a use, once spent, stays spent (packages/db/src/schema/promo.ts) —
-  // exactly as nothing there ever clears `claimed_by_request_id`.
+  // Only a test may do this. Nothing in apps/api decrements `used_count` on
+  // a production path — a use, once spent, stays spent (packages/db/src/
+  // schema/promo.ts) — exactly as nothing there clears
+  // `claimed_by_request_id` on one; the demo affordances that do
+  // (`demo/demo-reset.service.ts`, `suppliers/supplier-key-pool.service.ts`)
+  // are the scoped exceptions `schema/supplier.ts` names.
   await client.pool.query(
     `with gone as (
        delete from promo_redemptions where order_id = any($1::text[]) returning promo_id
@@ -307,9 +312,11 @@ export async function cleanupTestOrders(client: DatabaseClient, orderIds: readon
   await client.pool.query(`delete from orders where id = ANY($1::text[])`, [orderIds]);
 
   // Supplier side. Direct SQL, not an application code path: nothing in
-  // apps/api ever clears claimed_by_request_id (packages/db/src/schema/
-  // supplier.ts, "There is no 'unclaim'"), and that rule is about production
-  // code, not about a test restoring the fixture it borrowed.
+  // apps/api clears claimed_by_request_id on a production path (packages/db/
+  // src/schema/supplier.ts, "On every production path there is no
+  // 'unclaim'"), and that rule is about production paths, not about a test
+  // restoring the fixture it borrowed — nor about the demo affordances the
+  // same header scopes.
   await client.pool.query(
     `update supplier_keys set claimed_by_request_id = null, claimed_at = null
        where claimed_by_request_id like any($1::text[])`,

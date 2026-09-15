@@ -26,36 +26,71 @@
  * succeeds: the order reaches `delivered`.
  *
  * ---------------------------------------------------------------------------
- * WHY THIS CHECK RESTOCKS OVER DIRECT SQL, NOT AN HTTP ENDPOINT
+ * HOW THE POOL IS EMPTIED AND REFILLED — TWO DEMO AFFORDANCES ON THE
+ * SUPPLIER'S SIDE, AND ALWAYS THOSE
  * ---------------------------------------------------------------------------
- * `technical-considerations.md` §7 describes restocking as
- * `POST /internal/suppliers/keys`, on the supplier's own side of the boundary,
- * inserting new rows rather than un-claiming existing ones. **That endpoint
- * does not exist anywhere in `apps/api/src`** — verified by enumerating every
- * `@Controller`/`@Post`/`@Put` in the tree; no task in
- * `context/spec/003-failure-and-recovery/tasks.md` (slices 1–6, all complete)
- * ever added it, and no test drives it. This is a real gap between the design
- * note and what was built, and it is out of scope for this task to close: a
- * check may only add check files and npm aliases, never production code.
+ * `POST /internal/suppliers/keys/drain` `{ token }` → `{ token, claimed }`
+ * and `POST /internal/suppliers/keys/restock` `{ token }` → `{ released }`
+ * (`apps/api/src/suppliers/supplier-key-pool.controller.ts`, spec 006
+ * technical-considerations §2.4). They sit beside the behaviour route, in
+ * its module, behind its guard, because `supplier_keys` is the supplier's
+ * inventory and no shop module may touch it: the shop learns the pool is
+ * empty by being told `out_of_stock` across HTTP, never by looking. `drain`
+ * claims every unclaimed key under `drain_<token>_<id>` in one statement;
+ * `restock` releases exactly the rows carrying that token's sentinel and
+ * can never touch a real `req_…` claim (R15 — the `LIKE 'drain\_…'` with
+ * its literal-underscore escape, quoted in the service).
  *
- * What restocking a *drained* pool actually needs — new unclaimed rows in
- * `supplier_keys` — is already how the existing Vitest concurrency suite does
- * it, directly over SQL, un-claiming the exact rows this same check claimed a
- * moment earlier to drain the pool in the first place
- * (`apps/api/test/concurrency/operator-retry-race.test.ts`'s `drainKeyPool` /
- * `restoreDrainedKeyPool`, and the schema's own note that "restoring
- * `claimed_by_request_id = NULL` is a thing only a test may do",
- * `packages/db/src/schema/supplier.ts`). This check reproduces that exact,
- * already-sanctioned technique rather than inventing a new one. If
- * `POST /internal/suppliers/keys` is ever built, this check's `drain`/
- * `restock` pair is the one place to point at the endpoint instead.
+ * Until Phase 6 this file drained and restocked over direct SQL, copying the
+ * Vitest suite's fixture, because no such route existed. It exists now, and
+ * this check uses it **with or without a database of its own**, rather than
+ * SQL locally and HTTP only when `DATABASE_URL` is absent. The reason is the
+ * README's RED table: a path exercised only against the live shop is a path
+ * no local RED run ever sees. If drain, restock or the sentinel's shape
+ * broke, a check that fell back to SQL locally would keep passing here and
+ * fail only in front of the reviewer, with nothing in the tree to point at.
+ * One path, exercised by every run, is the only shape under which "this
+ * check passed locally" says anything about the deployed run.
+ *
+ * The token is this run's own — `race-recover-oos-<uuid>`, hyphens and never
+ * underscores (the route's `^[A-Za-z0-9-]{1,64}$`: `_` is a `LIKE` wildcard
+ * inside the restock pattern and is refused, not escaped) — so two runs in a
+ * row, or one interrupted run followed by a fresh one, can never collide on
+ * a sentinel prefix, and the `finally` below can always put back exactly
+ * what this run took. It restocks by token whenever the drain answered
+ * `200`, on success and on failure alike, so a half-run never leaves the
+ * shop empty; a second restock with the same token releases `0`, which the
+ * route says is never an error.
+ *
+ * ---------------------------------------------------------------------------
+ * WHAT THE DATABASE STILL ADDS, AND WHAT SKIPS WITHOUT IT
+ * ---------------------------------------------------------------------------
+ * The whole spine is now HTTP: drain answers `claimed > 0` (a `0` is the
+ * pool already empty — a FAIL with that reason, never a silent pass), the
+ * order settles `out_of_stock` and later `delivered` as `GET /api/orders/:id`
+ * reports it, the restock answers `released === claimed`, the retry answers
+ * `delivered: true`, a second retry answers `409`. Against a deployed shop
+ * with no `DATABASE_URL`, every one of those is a real PASS or FAIL.
+ *
+ * What `GET /api/orders/:id` cannot show is *how* the order got there, and
+ * that is what the ladder's rules are about: exactly two attempt rows at the
+ * first settle point (a/1, b/2 — R12's one wasted fall-through), each
+ * `failed` with `last_error = out_of_stock`, zero deliveries and zero keys
+ * claimed for this order, no `supplier_requests` row for either refusal;
+ * then, after the retry, exactly THREE attempt rows (a/3 minted, never a/1
+ * reused — R7), `a/3` `ok`, one delivery, one key claimed under `a/3`, one
+ * `supplier_requests` row for it, and still three rows after the refused
+ * second retry. Those, plus the whole-pool reads that pair `claimed` and
+ * `released` with the count the tables actually show, need the same
+ * database the target uses. Without `DATABASE_URL` each is reported as
+ * `SKIP <name> — needs DATABASE_URL`, one line per assertion, and never
+ * counted as a pass (`support/race-database.ts`'s rule).
  *
  * ---------------------------------------------------------------------------
  * WHY THE ASSERTIONS ARE SCOPED TO THIS ORDER'S OWN REQUEST IDS, NOT GLOBAL
  * ---------------------------------------------------------------------------
- * Draining the pool claims every unclaimed key under a sentinel
- * `claimed_by_request_id`, with no corresponding delivery — deliberately, and
- * exactly like the Vitest suite's own fixture. A global `claimed keys ==
+ * Draining the pool claims every unclaimed key under a sentinel, with no
+ * corresponding delivery — deliberately. A global `claimed keys ==
  * deliveries` comparison would therefore fail for the whole of the drained
  * window, for a reason that has nothing to do with the ladder. So this check
  * compares **this order's own** claimed-key count against **this order's
@@ -64,6 +99,16 @@
  * `1 == 1` at `delivered` — and separately confirms the whole pool (not just
  * this order's slice of it) returns to its starting size once the drain is
  * reversed.
+ *
+ * ---------------------------------------------------------------------------
+ * WITHOUT A DATABASE THE ORDER STAYS ON THE TARGET
+ * ---------------------------------------------------------------------------
+ * `cleanupTestOrders` is the harness's, over SQL, and runs only when a
+ * database is reachable. Otherwise this check says so in one INFO line and
+ * leaves the order where it is — `pnpm demo:reset` (or the runner's
+ * `RACE_DEMO_RESET=1`) is the deployed shop's cleanup, and a check that
+ * called the whole-shop reset for its own one order would sweep a leaking
+ * application's residue into "removed" and call it tidy.
  */
 import { randomUUID } from "node:crypto";
 
@@ -73,13 +118,15 @@ import {
   describeMissingAdminAffordance,
   isMissingAdminAffordance,
   newEventId,
+  postDemoDrainKeys,
+  postDemoRestock,
   postOperatorRetry,
   postPaidWebhook,
   putSupplierBehaviour,
   readAdminToken,
   waitUntilSettled,
 } from "./support/recovery-scenario.ts";
-import { cleanupTestOrders, openRaceDatabase, PURCHASABLE_SKU } from "./support/race-database.ts";
+import { cleanupTestOrders, openRaceDatabase, PURCHASABLE_SKU, type RaceDatabaseClient } from "./support/race-database.ts";
 import { resolveRaceTargets } from "./support/race-targets.ts";
 
 const CHECK_NAME = "race:recover-out-of-stock";
@@ -94,77 +141,145 @@ function record(ok: boolean, label: string, detail: string): void {
   if (!ok) failures.push(`${label}: ${detail}`);
 }
 
+/**
+ * One database-side assertion: a label and the read that decides it. Kept as
+ * data rather than inline `if (db !== undefined)` blocks so that the SKIP
+ * printed without a database carries **the same label** the PASS/FAIL would
+ * — the name is written once, and the transcript without `DATABASE_URL`
+ * lists exactly the assertions the one with it would have made.
+ */
+interface DatabaseAssertion {
+  readonly label: string;
+  readonly read: (db: RaceDatabaseClient) => Promise<{ readonly ok: boolean; readonly detail: string }>;
+}
+
+async function assertViaDatabase(db: RaceDatabaseClient | undefined, assertions: readonly DatabaseAssertion[]): Promise<void> {
+  for (const assertion of assertions) {
+    if (db === undefined) {
+      console.log(`  SKIP  ${assertion.label} — needs DATABASE_URL`);
+      continue;
+    }
+    const { ok, detail } = await assertion.read(db);
+    record(ok, assertion.label, detail);
+  }
+}
+
+async function countUnclaimedKeys(db: RaceDatabaseClient): Promise<number> {
+  const { rows } = await db.pool.query<{ n: number }>(`select count(*)::int as n from supplier_keys where claimed_by_request_id is null`);
+  return rows[0]?.n ?? -1;
+}
+
+async function countRows(db: RaceDatabaseClient, sqlText: string, params: readonly unknown[]): Promise<number> {
+  const { rows } = await db.pool.query<{ n: number }>(sqlText, [...params]);
+  return rows[0]?.n ?? -1;
+}
+
+interface AttemptRow {
+  readonly request_id: string;
+  readonly provider: string;
+  readonly attempt: number;
+  readonly status: string;
+  readonly last_error: string | null;
+}
+
+async function readAttempts(db: RaceDatabaseClient, orderId: string): Promise<readonly AttemptRow[]> {
+  const { rows } = await db.pool.query<AttemptRow>(
+    `select request_id, provider, attempt, status, last_error from issuance_attempts where order_id = $1 order by attempt asc`,
+    [orderId],
+  );
+  return rows;
+}
+
+function readNumber(body: Record<string, unknown> | undefined, field: string): number | undefined {
+  const value = body?.[field];
+  return typeof value === "number" ? value : undefined;
+}
+
 console.log(
   `${CHECK_NAME} — proves: an empty pool settles out_of_stock with exactly two wasted refusals ` +
     "(R12), never a lost order; restocking plus an operator retry reuses the identical claim, " +
     "lock and ladder the automatic path takes (no admin-only path into issuance); the retry " +
     "mints a THIRD attempt row rather than reusing a settled one (R7); and stock accounting " +
-    "holds at each settle point — technical-considerations §12, §2.3, §11 R7/R12.",
+    "holds at each settle point — technical-considerations §12, §2.3, §11 R7/R12. The pool is " +
+    "emptied and refilled through POST /internal/suppliers/keys/{drain,restock}, always.",
 );
 
-/** Unique per run, so two runs of this check in a row (or one interrupted run followed by a fresh one) can never collide on the same sentinel prefix. */
-const DRAIN_SENTINEL = `race_recover_oos_${randomUUID()}`;
+/**
+ * This run's token for the drain and its restock. Hyphens only — the route's
+ * token shape refuses `_` (a `LIKE` wildcard inside the restock pattern) —
+ * and unique per run, so a sentinel prefix can never be shared with another
+ * run's.
+ */
+const RUN_TOKEN = `race-recover-oos-${randomUUID()}`;
 
 const adminToken = readAdminToken();
 if (adminToken === undefined) {
   console.log(
-    `  SKIP  ${CHECK_NAME} needs ADMIN_TOKEN to call the retry endpoint and this process has ` +
-      "none. `pnpm race` sets it from the local .env for the instances it spawns and for " +
-      "itself; a deployed target must be given the same value out of band.",
+    `  SKIP  ${CHECK_NAME} needs ADMIN_TOKEN to drain and restock the pool and to call the retry ` +
+      "endpoint, and this process has none. `pnpm race` sets it from the local .env for the " +
+      "instances it spawns and for itself; a deployed target must be given the same value out of band.",
   );
   process.exitCode = 3;
 } else {
   let orderId: string | undefined;
+  /** Set the moment `drain` answers `200`; the `finally` restocks by it, on success and failure alike. */
+  let drainedToken: string | undefined;
   const db = openRaceDatabase("recover-out-of-stock");
 
   if (db === undefined) {
-    // Every assertion this check makes needs the database — draining and
-    // restocking the pool are themselves direct-SQL operations, and the
-    // scoped stock-accounting assertions are the whole point. There is no
-    // honest HTTP-only half to fall back to, unlike `webhooks.ts` or
-    // `before-order.ts`.
     console.log(
-      `  SKIP  ${CHECK_NAME} needs DATABASE_URL — draining and restocking the supplier_keys ` +
-        "pool, and every assertion this check makes, go through the database directly.",
+      `  INFO  no DATABASE_URL — the HTTP spine below (drain, out_of_stock, restock, retry, delivered) is ` +
+        "asserted for real; each database-side assertion is reported as SKIP by name and never counted as a pass.",
     );
-    process.exitCode = 3;
-  } else {
-    try {
-      const resetA = await putSupplierBehaviour(targets.at(0), adminToken, "a");
-      if (isMissingAdminAffordance(resetA)) {
-        console.log(`  SKIP  ${CHECK_NAME} — ${describeMissingAdminAffordance(resetA)}`);
+  }
+
+  try {
+    const resetA = await putSupplierBehaviour(targets.at(0), adminToken, "a");
+    if (isMissingAdminAffordance(resetA)) {
+      console.log(`  SKIP  ${CHECK_NAME} — ${describeMissingAdminAffordance(resetA)}`);
+      process.exitCode = 3;
+    } else {
+      record(resetA.ok, "provider a reset to the seeded baseline before this run", `status=${String(resetA.status)}`);
+      const resetB = await putSupplierBehaviour(targets.at(1), adminToken, "b");
+      record(resetB.ok, "provider b reset to the seeded baseline before this run", `status=${String(resetB.status)}`);
+
+      // ---------------------------------------------------------------
+      // DRAIN — through the supplier's own route, from one instance; the
+      // purchase that meets the empty pool lands on another. The sentinel
+      // lives in Postgres, which is the only reason that works.
+      // ---------------------------------------------------------------
+      const unclaimedBefore = db === undefined ? undefined : await countUnclaimedKeys(db);
+
+      const drain = await postDemoDrainKeys(targets.at(0), adminToken, RUN_TOKEN);
+      if (isMissingAdminAffordance(drain)) {
+        console.log(`  SKIP  ${CHECK_NAME} — ${describeMissingAdminAffordance(drain)}`);
         process.exitCode = 3;
       } else {
-        record(resetA.ok, "provider a reset to the seeded baseline before this run", `status=${String(resetA.status)}`);
-        const resetB = await putSupplierBehaviour(targets.at(1), adminToken, "b");
-        record(resetB.ok, "provider b reset to the seeded baseline before this run", `status=${String(resetB.status)}`);
-
-        // ---------------------------------------------------------------
-        // DRAIN. Direct SQL, deliberately — see this file's header. Every
-        // currently-unclaimed key is claimed under this run's own sentinel,
-        // so `restock` below can find and reverse exactly these rows and
-        // nothing another concurrent writer touched (moot under `pnpm race`,
-        // which runs checks one at a time, but cheap to make true anyway).
-        // ---------------------------------------------------------------
-        const poolBefore = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from supplier_keys where claimed_by_request_id is null`,
+        if (drain.status === 200) drainedToken = RUN_TOKEN;
+        record(drain.status === 200, "POST /internal/suppliers/keys/drain { token } answers 200", `status=${String(drain.status)}, body=${drain.text}`);
+        record(drain.body?.["token"] === RUN_TOKEN, "the drain echoes this run's own token", `token=${String(drain.body?.["token"])}`);
+        const claimed = readNumber(drain.body, "claimed") ?? -1;
+        record(
+          claimed > 0,
+          "the drain claimed at least one key — the pool was not already empty when this run started",
+          claimed === 0
+            ? "claimed=0: the pool was already empty, so this run cannot show that draining is what empties it (a stale drain from an interrupted run? `POST …/restock {}` sweeps every sentinel)"
+            : `claimed=${String(claimed)}`,
         );
-        const poolSize = poolBefore.rows[0]?.n ?? 0;
-        record(poolSize > 0, "precondition: the pool holds at least one unclaimed key before draining it", `${String(poolSize)} unclaimed`);
 
-        const drained = await db.pool.query(
-          `update supplier_keys
-              set claimed_by_request_id = $1 || '_' || id::text, claimed_at = now()
-            where claimed_by_request_id is null`,
-          [DRAIN_SENTINEL],
-        );
-        const drainedCount = drained.rowCount ?? 0;
-        record(drainedCount === poolSize, "the whole unclaimed pool was drained under this run's own sentinel", `drained ${String(drainedCount)} of ${String(poolSize)}`);
-
-        const poolAfterDrain = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from supplier_keys where claimed_by_request_id is null`,
-        );
-        record((poolAfterDrain.rows[0]?.n ?? -1) === 0, "the pool reads empty before paying", `${String(poolAfterDrain.rows[0]?.n)} unclaimed`);
+        await assertViaDatabase(db, [
+          {
+            label: "the drain took the whole unclaimed pool — claimed equals the unclaimed count read before it",
+            read: async () => ({ ok: unclaimedBefore === claimed, detail: `unclaimed before=${String(unclaimedBefore)}, claimed=${String(claimed)}` }),
+          },
+          {
+            label: "the pool reads empty before paying",
+            read: async (client) => {
+              const n = await countUnclaimedKeys(client);
+              return { ok: n === 0, detail: `${String(n)} unclaimed` };
+            },
+          },
+        ]);
 
         // ---------------------------------------------------------------
         // Pay into the empty pool. Both suppliers refuse; the order settles
@@ -190,73 +305,85 @@ if (adminToken === undefined) {
         const requestIdB2 = deriveIssuanceRequestId(order.id, "b", 2);
         const requestIdA3 = deriveIssuanceRequestId(order.id, "a", 3);
 
-        const attemptsEmpty = await db.pool.query<{
-          request_id: string;
-          provider: string;
-          attempt: number;
-          status: string;
-          last_error: string | null;
-        }>(`select request_id, provider, attempt, status, last_error from issuance_attempts where order_id = $1 order by attempt asc`, [
-          order.id,
+        await assertViaDatabase(db, [
+          {
+            label: "exactly two attempt rows against the drained pool (a/1, b/2 — R12's one wasted fall-through)",
+            read: async (client) => {
+              const attempts = await readAttempts(client, order.id);
+              return { ok: attempts.length === 2, detail: `found ${String(attempts.length)} row(s)` };
+            },
+          },
+          {
+            label: "a/1 reads failed with last_error out_of_stock",
+            read: async (client) => {
+              const a1 = (await readAttempts(client, order.id)).find((row) => row.request_id === requestIdA1);
+              return { ok: a1?.status === "failed" && a1.last_error === "out_of_stock", detail: JSON.stringify(a1) };
+            },
+          },
+          {
+            label: "b/2 reads failed with last_error out_of_stock — the wasted fall-through R12 predicts, not a second bug",
+            read: async (client) => {
+              const b2 = (await readAttempts(client, order.id)).find((row) => row.request_id === requestIdB2);
+              return { ok: b2?.status === "failed" && b2.last_error === "out_of_stock", detail: JSON.stringify(b2) };
+            },
+          },
+          {
+            label: "zero deliveries for the order while out of stock",
+            read: async (client) => {
+              const n = await countRows(client, `select count(*)::int as n from deliveries where order_id = $1`, [order.id]);
+              return { ok: n === 0, detail: `${String(n)} row(s)` };
+            },
+          },
+          {
+            label:
+              "stock accounting holds at the FIRST settle point — this order's claimed keys (0) == this order's deliveries (0); a refusal claims nothing",
+            read: async (client) => {
+              const n = await countRows(client, `select count(*)::int as n from supplier_keys where claimed_by_request_id = any($1::text[])`, [
+                [requestIdA1, requestIdB2],
+              ]);
+              return { ok: n === 0, detail: `claimed=${String(n)}, deliveries=0` };
+            },
+          },
+          {
+            label: "no supplier_requests rows for either refusal — an out_of_stock answer writes no ledger entry",
+            read: async (client) => {
+              const n = await countRows(client, `select count(*)::int as n from supplier_requests where request_id = any($1::text[])`, [
+                [requestIdA1, requestIdB2],
+              ]);
+              return { ok: n === 0, detail: `${String(n)} row(s)` };
+            },
+          },
         ]);
-        record(attemptsEmpty.rowCount === 2, "exactly two attempt rows against the drained pool (a/1, b/2 — R12's one wasted fall-through)", `found ${String(attemptsEmpty.rowCount)} row(s)`);
-
-        const a1 = attemptsEmpty.rows.find((row) => row.request_id === requestIdA1);
-        record(
-          a1?.status === "failed" && a1.last_error === "out_of_stock",
-          "a/1 reads failed with last_error out_of_stock",
-          `${JSON.stringify(a1)}`,
-        );
-        const b2 = attemptsEmpty.rows.find((row) => row.request_id === requestIdB2);
-        record(
-          b2?.status === "failed" && b2.last_error === "out_of_stock",
-          "b/2 reads failed with last_error out_of_stock — the wasted fall-through R12 predicts, not a second bug",
-          `${JSON.stringify(b2)}`,
-        );
-
-        const deliveriesEmpty = await db.pool.query<{ n: number }>(`select count(*)::int as n from deliveries where order_id = $1`, [
-          order.id,
-        ]);
-        record((deliveriesEmpty.rows[0]?.n ?? -1) === 0, "zero deliveries for the order while out of stock", `${String(deliveriesEmpty.rows[0]?.n)} row(s)`);
-
-        const claimedForOrderEmpty = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from supplier_keys where claimed_by_request_id = any($1::text[])`,
-          [[requestIdA1, requestIdB2]],
-        );
-        record(
-          (claimedForOrderEmpty.rows[0]?.n ?? -1) === 0,
-          "stock accounting holds at the FIRST settle point — this order's claimed keys (0) == this order's deliveries (0); a refusal claims nothing",
-          `claimed=${String(claimedForOrderEmpty.rows[0]?.n)}, deliveries=0`,
-        );
-
-        const requestsForOrderEmpty = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from supplier_requests where request_id = any($1::text[])`,
-          [[requestIdA1, requestIdB2]],
-        );
-        record(
-          (requestsForOrderEmpty.rows[0]?.n ?? -1) === 0,
-          "no supplier_requests rows for either refusal — an out_of_stock answer writes no ledger entry",
-          `${String(requestsForOrderEmpty.rows[0]?.n)} row(s)`,
-        );
 
         // ---------------------------------------------------------------
-        // RESTOCK. Reverse exactly the rows this run's own drain claimed —
-        // see this file's header for why this is direct SQL rather than the
-        // documented-but-unbuilt HTTP endpoint.
+        // RESTOCK — the same route family, by this run's token, from a
+        // third instance. Exactly what the drain claimed comes back; a real
+        // claim never can (R15).
         // ---------------------------------------------------------------
-        await db.pool.query(`update supplier_keys set claimed_by_request_id = null, claimed_at = null where claimed_by_request_id like $1`, [
-          `${DRAIN_SENTINEL}_%`,
-        ]);
-        const poolAfterRestock = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from supplier_keys where claimed_by_request_id is null`,
+        const restock = await postDemoRestock(targets.at(1), adminToken, RUN_TOKEN);
+        record(restock.status === 200, "POST /internal/suppliers/keys/restock { token } answers 200", `status=${String(restock.status)}, body=${restock.text}`);
+        const released = readNumber(restock.body, "released") ?? -1;
+        record(
+          released === claimed,
+          "the restock released exactly the keys this run's drain claimed (released == claimed)",
+          `released=${String(released)}, claimed=${String(claimed)}`,
         );
-        record((poolAfterRestock.rows[0]?.n ?? -1) === poolSize, "the pool is restocked to its full starting size", `${String(poolAfterRestock.rows[0]?.n)} of ${String(poolSize)}`);
+
+        await assertViaDatabase(db, [
+          {
+            label: "the pool is restocked to its full starting size",
+            read: async (client) => {
+              const n = await countUnclaimedKeys(client);
+              return { ok: n === unclaimedBefore, detail: `${String(n)} of ${String(unclaimedBefore)}` };
+            },
+          },
+        ]);
 
         // ---------------------------------------------------------------
         // RETRY. The operator's endpoint — the identical claim, lock and
         // ladder the automatic path uses.
         // ---------------------------------------------------------------
-        const retryResult = await postOperatorRetry(targets.at(1), adminToken, order.id);
+        const retryResult = await postOperatorRetry(targets.at(2), adminToken, order.id);
         record(retryResult.status === 200, "POST .../retry answers 200", `status=${String(retryResult.status)}, body=${retryResult.text}`);
         record(
           retryResult.body?.["outcome"] === "delivered" && retryResult.body?.["delivered"] === true,
@@ -264,53 +391,54 @@ if (adminToken === undefined) {
           JSON.stringify(retryResult.body),
         );
 
-        const settledDelivered = await waitUntilSettled(targets.at(2), order.id);
+        const settledDelivered = await waitUntilSettled(targets.at(3), order.id);
         record(settledDelivered.status === "delivered", "the order settles delivered after the retry", `status=${settledDelivered.status}`);
 
-        const attemptsAfterRetry = await db.pool.query<{
-          request_id: string;
-          provider: string;
-          attempt: number;
-          status: string;
-        }>(`select request_id, provider, attempt, status from issuance_attempts where order_id = $1 order by attempt asc`, [order.id]);
-        record(
-          attemptsAfterRetry.rowCount === 3,
-          "exactly THREE attempt rows after the retry (a/1, b/2, a/3) — the retry minted a new one rather than reusing a/1 (R7)",
-          `found ${String(attemptsAfterRetry.rowCount)} row(s)`,
-        );
-
-        const a3 = attemptsAfterRetry.rows.find((row) => row.request_id === requestIdA3);
-        record(
-          a3?.status === "ok" && a3.provider === "a" && a3.attempt === 3,
-          "a/3 reads ok, provider a, attempt 3 — never a reused a/1 or b/2",
-          `${JSON.stringify(a3)}`,
-        );
-
-        const deliveriesAfterRetry = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from deliveries where order_id = $1`,
-          [order.id],
-        );
-        record((deliveriesAfterRetry.rows[0]?.n ?? -1) === 1, "exactly one deliveries row for the order after the retry", `${String(deliveriesAfterRetry.rows[0]?.n)} row(s)`);
-
-        const claimedForOrderAfterRetry = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from supplier_keys where claimed_by_request_id = any($1::text[])`,
-          [[requestIdA1, requestIdB2, requestIdA3]],
-        );
-        record(
-          (claimedForOrderAfterRetry.rows[0]?.n ?? -1) === 1,
-          "stock accounting holds at the SECOND settle point — this order's claimed keys (1, all under a/3) == this order's deliveries (1)",
-          `claimed=${String(claimedForOrderAfterRetry.rows[0]?.n)}, deliveries=${String(deliveriesAfterRetry.rows[0]?.n)}`,
-        );
-
-        const requestsA3 = await db.pool.query<{ n: number; provider: string }>(
-          `select count(*)::int as n, min(provider) as provider from supplier_requests where request_id = $1`,
-          [requestIdA3],
-        );
-        record(
-          (requestsA3.rows[0]?.n ?? -1) === 1 && requestsA3.rows[0]?.provider === "a",
-          "exactly one supplier_requests row for a/3, against provider a",
-          `${JSON.stringify(requestsA3.rows[0])}`,
-        );
+        await assertViaDatabase(db, [
+          {
+            label: "exactly THREE attempt rows after the retry (a/1, b/2, a/3) — the retry minted a new one rather than reusing a/1 (R7)",
+            read: async (client) => {
+              const attempts = await readAttempts(client, order.id);
+              return { ok: attempts.length === 3, detail: `found ${String(attempts.length)} row(s)` };
+            },
+          },
+          {
+            label: "a/3 reads ok, provider a, attempt 3 — never a reused a/1 or b/2",
+            read: async (client) => {
+              const a3 = (await readAttempts(client, order.id)).find((row) => row.request_id === requestIdA3);
+              return { ok: a3?.status === "ok" && a3.provider === "a" && a3.attempt === 3, detail: JSON.stringify(a3) };
+            },
+          },
+          {
+            label: "exactly one deliveries row for the order after the retry",
+            read: async (client) => {
+              const n = await countRows(client, `select count(*)::int as n from deliveries where order_id = $1`, [order.id]);
+              return { ok: n === 1, detail: `${String(n)} row(s)` };
+            },
+          },
+          {
+            label: "stock accounting holds at the SECOND settle point — this order's claimed keys (1, all under a/3) == this order's deliveries (1)",
+            read: async (client) => {
+              const claimedForOrder = await countRows(
+                client,
+                `select count(*)::int as n from supplier_keys where claimed_by_request_id = any($1::text[])`,
+                [[requestIdA1, requestIdB2, requestIdA3]],
+              );
+              const deliveries = await countRows(client, `select count(*)::int as n from deliveries where order_id = $1`, [order.id]);
+              return { ok: claimedForOrder === 1 && deliveries === 1, detail: `claimed=${String(claimedForOrder)}, deliveries=${String(deliveries)}` };
+            },
+          },
+          {
+            label: "exactly one supplier_requests row for a/3, against provider a",
+            read: async (client) => {
+              const { rows } = await client.pool.query<{ n: number; provider: string | null }>(
+                `select count(*)::int as n, min(provider) as provider from supplier_requests where request_id = $1`,
+                [requestIdA3],
+              );
+              return { ok: rows[0]?.n === 1 && rows[0].provider === "a", detail: JSON.stringify(rows[0]) };
+            },
+          },
+        ]);
 
         // A second retry on an already-delivered order must refuse — zero
         // rows from every guarded UPDATE, not a fourth attempt.
@@ -320,23 +448,34 @@ if (adminToken === undefined) {
           "a further retry on the now-delivered order answers 409 (not stuck) rather than doing anything",
           `status=${String(secondRetry.status)}`,
         );
-        const attemptsAfterSecondRetry = await db.pool.query<{ n: number }>(
-          `select count(*)::int as n from issuance_attempts where order_id = $1`,
-          [order.id],
-        );
-        record(
-          (attemptsAfterSecondRetry.rows[0]?.n ?? -1) === 3,
-          "still exactly three attempt rows — the refused retry changed nothing",
-          `${String(attemptsAfterSecondRetry.rows[0]?.n)} row(s)`,
-        );
+
+        await assertViaDatabase(db, [
+          {
+            label: "still exactly three attempt rows — the refused retry changed nothing",
+            read: async (client) => {
+              const n = await countRows(client, `select count(*)::int as n from issuance_attempts where order_id = $1`, [order.id]);
+              return { ok: n === 3, detail: `${String(n)} row(s)` };
+            },
+          },
+        ]);
       }
-    } finally {
-      // Belt and braces: reverse this run's own drain sentinel even if
-      // something above threw before the deliberate restock step ran, so a
-      // failed run still leaves the pool at full size for the next one.
-      await db.pool.query(`update supplier_keys set claimed_by_request_id = null, claimed_at = null where claimed_by_request_id like $1`, [
-        `${DRAIN_SENTINEL}_%`,
-      ]);
+    }
+  } finally {
+    // Belt and braces, over the same route: put back whatever this run's
+    // drain took, whether or not the deliberate restock above ran. A second
+    // restock with the same token releases 0 — never an error — and the
+    // count is printed so a reader can see the pool was left whole.
+    if (drainedToken !== undefined) {
+      const sweep = await postDemoRestock(targets.at(0), adminToken, drainedToken);
+      console.log(
+        `  INFO  finally: POST /internal/suppliers/keys/restock { token } — status=${String(sweep.status)}, released=${String(
+          readNumber(sweep.body, "released"),
+        )} (0 when the deliberate restock already ran)`,
+      );
+      if (sweep.status !== 200) failures.push(`finally: restock by token answered ${String(sweep.status)}: ${sweep.text}`);
+    }
+
+    if (db !== undefined) {
       await db.pool.query(
         `update supplier_behaviour
            set failure_rate = 0, hang_rate = 0, hang_ms = 0, fail_next = 0, hang_next = 0,
@@ -344,6 +483,11 @@ if (adminToken === undefined) {
       );
       if (orderId !== undefined) await cleanupTestOrders(db, [orderId]);
       await db.close();
+    } else if (orderId !== undefined) {
+      console.log(
+        `  INFO  order ${orderId} stays on the target — no DATABASE_URL, so the harness's cleanup cannot run; ` +
+          "`pnpm demo:reset` (or the runner's RACE_DEMO_RESET=1) is the deployed shop's cleanup.",
+      );
     }
   }
 }

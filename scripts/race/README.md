@@ -17,7 +17,9 @@ and stops all four afterwards — on success, on failure, and on Ctrl-C.
 | `pnpm race webhooks same-event` | Only the named checks. |
 | `pnpm race promo` (alias `pnpm race:promo`) | Spec 005's check: twenty simultaneous `LIMIT3` and ten `ONCEONLY` applications across the four instances — exactly 3 and exactly 1 apply, the rest `409 exhausted`, none `5xx`. Locally it hands back the uses it spent through the database; against a deployed target with no `DATABASE_URL` it resets the counters through `POST /api/admin/promo-codes/reset` afterwards and says so. |
 | `pnpm race --list` | The checks that exist. Runs nothing, needs nothing running. |
-| `RACE_BASE_URLS=https://game-shop.vercel.app pnpm race` | The deployed target. Builds nothing, spawns nothing, stops nothing. |
+| `RACE_BASE_URLS=https://game-shop.vercel.app ADMIN_TOKEN=<the demo token> pnpm race` | **The reviewer's command.** The deployed target: builds nothing, spawns nothing, stops nothing, sees no database — every database-side assertion is SKIP by name, the HTTP spine is asserted for real. See "External mode". |
+| `RACE_BASE_URLS=… ADMIN_TOKEN=… RACE_DEMO_RESET=1 pnpm race` | The same, ending with `POST /api/admin/demo/reset` on the first target so the transcript ends at baseline. The README's recorded run uses it. |
+| `RACE_BASE_URLS=… ADMIN_TOKEN=… RACE_DATABASE_URL=<the target's database> pnpm race` | **The author's full run.** The target's own database forwarded to the checks as `DATABASE_URL`: no SKIPs, every check cleans up after itself. |
 | `RACE_BASE_URLS=… node scripts/race/webhooks.ts` | One check, by hand, exactly as the runner invokes it. |
 
 Exit code: `0` all passed, `1` a check failed, `2` the command or the
@@ -56,6 +58,141 @@ anything else runs.
 
 ---
 
+## External mode — the runner against a target it did not start
+
+`RACE_BASE_URLS` set means somebody else owns the instances: the deployed shop,
+or a stack already running locally. The runner then builds nothing, spawns
+nothing and stops nothing — and, since spec 006, it also takes care that what
+the checks *see* is the target and not the laptop. Phase 6's sentence is what
+this mode exists to earn: *passing the race checks on Vercel, where every
+request is its own process, is evidence that the guarantees live in Postgres
+and not in memory.*
+
+**The two commands.**
+
+```sh
+# The reviewer: no database in hand. HTTP assertions real, database-side ones SKIP by name.
+RACE_BASE_URLS=https://<the alias> ADMIN_TOKEN=<the demo token> RACE_DEMO_RESET=1 pnpm race
+
+# The author: the target's own database forwarded. No SKIPs; every check cleans up.
+RACE_BASE_URLS=https://<the alias> ADMIN_TOKEN=<the demo token> RACE_DATABASE_URL=$NEON_DIRECT_URL pnpm race
+```
+
+**The mode line.** The first thing an external run prints names the targets and
+answers the one question that decides what the transcript means:
+
+```
+race: external target(s) https://… — database: none (assertions SKIP by name)
+race: external target(s) https://… — database: RACE_DATABASE_URL forwarded
+```
+
+**Environment hygiene (R7).** `scripts/with-env.ts` merges `.env.example` into
+the runner's environment, so without care an external run would hand every
+check `DATABASE_URL=…localhost:5433…` — the *local* database — while the target
+writes to its own. The database half of every check would then fail on
+`ECONNREFUSED` or, worse, assert against a database the target never touched.
+External mode therefore builds the checks' environment **without
+`DATABASE_URL`**, and puts one back only from `RACE_DATABASE_URL`. Local mode is
+untouched: its children get the runner's own environment plus the two markers,
+exactly as before.
+
+`ADMIN_TOKEN` is forwarded as-is — the recover checks arm the supplier with it —
+and when it is still `.env.example`'s default the runner says so once
+(`race: ADMIN_TOKEN is the local default — export the target's token or the
+admin-guarded checks will answer 401`), because the alternative is three checks
+SKIPping on a `401` with no line explaining why.
+
+**Warm-up.** Before the first check: `GET /api/products` on the first target
+until it answers `200`, six attempts five seconds apart, each printed
+(`race: warm-up — GET …/api/products → 200 in 53ms (attempt 1 of 6)`). The
+catalogue and not `/api/health`, because health builds its pool lazily and
+answers `200` with no database at all — it proves nothing about a Neon branch
+resuming from autosuspend, and a cold first check would otherwise fail on
+timing rather than on an assertion. A target that never answers ends the run
+there with exit `2`.
+
+**One banner, not nine lines.** With no database the runner prints, once:
+
+```
+race: ┌─ no DATABASE_URL for this run ──────────────────────────────────────────
+race: │ every database-side assertion below is reported as SKIP by name — never counted as a pass;
+race: │ orders these checks create stay on the target. Run `pnpm demo:reset` when the run ends,
+race: │ or set RACE_DEMO_RESET=1 to have this runner call POST /api/admin/demo/reset after the last check.
+race: └──────────────────────────────────────────────────────────────────────────
+```
+
+Each check then names its own skipped assertions where they would have run
+(the rule in "Which assertions need database access" below); in the smoke run
+against four hand-started local instances that is 39 `SKIP` lines across the
+nine checks, and `9/9 passed` — the ratio counts only what ran.
+
+**`RACE_DEMO_RESET=1`.** External mode only. After the last check and before
+the summary the runner calls `POST /api/admin/demo/reset` on the first target
+with `ADMIN_TOKEN` and prints what came back:
+
+```
+race: RACE_DEMO_RESET — POST https://…/api/admin/demo/reset
+race:   removed  orders 38 · deliveries 6 · issuance_attempts 9 · promo_redemptions 4 · payment_events 55 · supplier_requests 6
+race:   reset    promo_codes 0 · supplier_keys 6 · supplier_behaviour 1
+race:   now      products 12 · keys_total 50 · keys_unclaimed 50 · orders 0 · …
+```
+
+A refused reset (`401`, `503`) is printed with the reason and the run exits
+`2`: a transcript that was asked to end at baseline and did not must not exit
+`0`. In local mode the variable is ignored with one line — local checks clean
+up their own rows through `cleanupTestOrders` and the harness asserts the
+baseline; a reset in their place would sweep a leaking application's residue
+into `removed` and call it a pass. The runner's reset function throws if it is
+ever reached in local mode, so that stays true by construction.
+
+**`recover-timeout` reads the target's timeout (R8).** The trap check arms a
+hang that must *outlast* the target's `SUPPLIER_TIMEOUT_MS`; against a live
+target running `5000` a hang derived from the local `2000` would land on the
+slow-but-successful side and the check would pass having exercised nothing. It
+now prefers `supplier_timeout_ms` from the first target's `GET /api/health` and
+prints which source it used:
+
+```
+supplier timeout 2000 ms (from target /api/health)
+supplier timeout 2000 ms (from SUPPLIER_TIMEOUT_MS env — target did not report one)
+```
+
+### The instance-id witness — what the harness can prove over HTTP
+
+Every response the API sends carries `x-instance-id`, one random UUID per
+process (`apps/api/src/instance-identity.ts`). Locally the harness proves
+"separate processes" from the database's side — one backend pid per instance
+in `pg_stat_activity` — and a reviewer pointed at the live shop holds no
+database, so the process has to say who it is over HTTP instead.
+
+`race:harness` fires N = max(8, 2 × targets) concurrent `GET /api/health`,
+spread round-robin, and asserts two things: every answer's header equals its
+own body's `instance_id`, and — externally — **at least two distinct ids were
+seen**. Exactly one is a `FAIL` with the reason spelled out:
+
+```
+FAIL  the 8 concurrent health answers came from at least two distinct instances — all 8 answers came from one instance — re-run, or check that Fluid Compute is off
+```
+
+Locally the same count is an `INFO` line: one id per port is a tautology when
+the runner started those processes itself, and the pid count decides. The
+runner sets `RACE_MODE` (`local` | `external`) for its children so the harness
+can tell which reading applies; run by hand it assumes the external one.
+`webhooks`, `same-event` and `promo` print the same count for their own batch
+— `INFO  answers came from 4 distinct instance(s) — 50 answer(s)` — so a
+reader can see whether the fifty reports were spread across processes.
+
+**What the number does not prove, and the harness prints with it:** a distinct
+id proves a distinct process, *not* that those processes overlapped in time —
+two ids across eight answers are consistent with one instance recycled between
+the first and the last. It rules out the one reading that would make a live run
+worthless (every answer from one process, one `max: 1` pool), and no more. K = 1
+on a given run means that run was not cross-process evidence, whatever the
+checks after it say; the root README records the K of the author's run rather
+than assuming it.
+
+---
+
 ## RED validation — every check, deliberately broken
 
 Functional spec §2.6: *"Given a check has passed, when the mechanism it defends
@@ -72,14 +209,14 @@ produces a convincing lie, and it is the first thing to rule out.
 
 | Check | Weakening | What the check reported |
 | --- | --- | --- |
-| `harness` | No source change — pointed at two origins that are secretly one process: `RACE_BASE_URLS=http://localhost:4301,http://127.0.0.1:4301` | `FAIL  targets hold separate database connections — 1 distinct backend pid(s) as 'game-shop', need >= 2`. Both `/api/health` and `/api/products` assertions still passed — "serving" and "separate" are exactly the two things this check refuses to conflate. |
+| `harness` | No source change — pointed at two origins that are secretly one process: `RACE_BASE_URLS=http://localhost:4301,http://127.0.0.1:4301` | `FAIL  targets hold separate database connections — 1 distinct backend pid(s) as 'game-shop', need >= 2`. Both `/api/health` and `/api/products` assertions still passed — "serving" and "separate" are exactly the two things this check refuses to conflate. **Phase 6, the HTTP witness:** external mode pointed at one hand-started instance (`RACE_BASE_URLS=http://127.0.0.1:4601 ADMIN_TOKEN=… pnpm race harness`, no database) — `PASS  x-instance-id header equals the body's instance_id on all 8 concurrent health answers — 8 of 8 agree`, then `FAIL  the 8 concurrent health answers came from at least two distinct instances — all 8 answers came from one instance — re-run, or check that Fluid Compute is off`; `race: 0/1 passed against 1 instance(s).`, exit `1`. The same four instances listed as four targets: `PASS … — 4 distinct instance id(s) across 4 target(s)`. |
 | `create-order` | `orders.service.ts` — deleted `.onConflictDoNothing({ target: orders.clientRequestId })` | `FAIL  all 20 concurrent Buy attempts answered 2xx — 500 {"statusCode":500,…}` ×19, with `constraint: 'orders_client_request_id_key'`, `routine: '_bt_check_unique'` in the instance log. The `INFO` line moved from `201: 1, 200: 19` to `201: 1, 200: 0`. |
 | `same-event` | `payment-events.service.ts` — deleted `.onConflictDoNothing({ target: paymentEvents.eventId })` | `FAIL  all 20 concurrent redeliveries answered 2xx — 500 …` ×19, and `FAIL  exactly one of the concurrent copies was stored as first sight … — stored=1, duplicate=0, unrecognised=19`. |
 | `webhooks` | `order-transitions.ts` — `beginIssuance.from` widened from `[Paid]` to `[Paid, Delivering]`, removing the guard's exclusivity | `FAIL  webhooks  exited 1` on `error: update or delete on table "orders" violates foreign key constraint "deliveries_order_id_orders_id_fk"` during cleanup, because **50** workers logged `claimed the order for issuance` (against **1** with the guard intact) and the stragglers were still writing after the check had finished. Reproduced three times. |
 | `before-order` | `payment-event-processor.service.ts` — added `await this.markProcessed(event);` to `applyPaid`'s `OrderNotFound` branch, so `deferred_order_missing` settles the early event instead of leaving it pending | `Error: order ord_race_beforeorder_… did not settle within 15000ms (status=created)`. The event was discarded, so neither drain ever found it and the order never left `created`. |
 | `recover-refusal` | `issuance/issuance-ladder.ts` — the `fallThrough` rung's `requestId` read off the newest failed row (`req_{order}_a_1`) instead of `deriveIssuanceRequestId(orderId, untried, max(attempt)+1)`: a re-probe of a settled request wearing a fall-through's clothes, the exact shape the file's header names | 6 of 18 assertions. `FAIL  exactly two attempt rows for the order — found 1 row(s)`; `FAIL  a/1 reads failed with last_error supplier_rejected … — {…,"status":"ok","last_error":"supplier_rejected"}`; `FAIL  b/2 reads ok — the fall-through's own new request id … — undefined`; `FAIL  no supplier_requests row for a/1 … — 1 row(s)`; `FAIL  exactly one supplier_requests row for b/2, against provider b — {"n":0,"provider":null}`; `FAIL  exactly one supplier_keys row claimed by b/2's request id — 0 row(s)`. B was asked A's question: `reserveWithin`'s `ON CONFLICT (request_id) DO NOTHING` swallowed the insert, B's success was written over A's row, and the record now says a refusal succeeded. |
 | `recover-timeout` | `issuance/issuance-ladder.ts` — `isDefinitelySettled` widened to admit `unknown`, so the outstanding guard (branches 2 and 3) never fires and `fallThrough` runs past a timed-out attempt. Slice 3's own RED, repeated against the shipped check | 5 of 16 assertions, and they are R2's: `FAIL  stock accounting holds after this run (claimed keys == deliveries, R2) … — claimed=2, deliveries=1`; `FAIL  exactly one more key claimed and exactly one more delivery than before this run — claimed +2, deliveries +1`; `FAIL  no issuance_attempts row for provider b — the hard rule held, B was never asked — 1 row(s)`; `FAIL  exactly ONE attempt row for the order … — found 2 row(s)`; `FAIL  a/1 reads status=ok, probe_count=2 … — {…,"status":"unknown","probe_count":1,"last_error":null}`. **Still `PASS`:** `the order settles delivered`, `exactly one deliveries row for the order`, `exactly one supplier_keys row claimed by a/1's request id`. |
-| `recover-out-of-stock` | `issuance/issuance-ladder.ts` — the `IssuanceRound.Fresh` branch deleted, i.e. the pre-slice-5 ladder: an operator's opening turn recomputes `settleRefused` from the two refusals already on file | 9 of 25 assertions, every one of them after the restock. `POST …/retry` answered `200 {"outcome":"still_out_of_stock",…,"detail":"every supplier was asked and has nothing to issue (a: out_of_stock; b: out_of_stock)","delivered":false}` against a pool the check had just restocked to 50 — nobody was asked. `FAIL  exactly THREE attempt rows after the retry (a/1, b/2, a/3) … — found 2 row(s)`; `FAIL  a/3 reads ok, provider a, attempt 3 … — undefined`; `FAIL  the order settles delivered after the retry — status=out_of_stock`; `FAIL  a further retry on the now-delivered order answers 409 … — status=200`. The sixteen assertions up to and including the restock all passed: the automatic path is untouched by this weakening, which is what the two settle points are for. |
+| `recover-out-of-stock` | `issuance/issuance-ladder.ts` — the `IssuanceRound.Fresh` branch deleted, i.e. the pre-slice-5 ladder: an operator's opening turn recomputes `settleRefused` from the two refusals already on file. Re-run in Phase 6 after the check switched its drain and restock from direct SQL to `POST /internal/suppliers/keys/{drain,restock}` (the supplier's demo affordances, used on every run, with or without `DATABASE_URL`): same cut, rebuilt `dist/`, four instances, the local database present so no assertion SKIPped | 9 of 29 assertions, every one of them after the restock. `POST …/retry` answered `200 {"outcome":"still_out_of_stock",…,"detail":"every supplier was asked and has nothing to issue (a: out_of_stock; b: out_of_stock)","delivered":false}` against a pool the check had just restocked to 50 — nobody was asked. `FAIL  the retry report says delivered: true — {…"delivered":false}`; `FAIL  the order settles delivered after the retry — status=out_of_stock`; `FAIL  exactly THREE attempt rows after the retry (a/1, b/2, a/3) … — found 2 row(s)`; `FAIL  a/3 reads ok, provider a, attempt 3 … — undefined`; `FAIL  exactly one deliveries row for the order after the retry — 0 row(s)`; `FAIL  stock accounting holds at the SECOND settle point … — claimed=0, deliveries=0`; `FAIL  exactly one supplier_requests row for a/3, against provider a — {"n":0,"provider":null}`; `FAIL  a further retry on the now-delivered order answers 409 … — status=200`; `FAIL  still exactly three attempt rows … — 2 row(s)`. The twenty assertions up to and including the restock all passed — among them `PASS  POST /internal/suppliers/keys/drain { token } answers 200 — … "claimed":50`, `PASS  the pool reads empty before paying — 0 unclaimed`, `PASS  POST /internal/suppliers/keys/restock { token } answers 200 — … {"released":50}`, `PASS  the restock released exactly the keys this run's drain claimed (released == claimed) — released=50, claimed=50`: the automatic path and the staging around it are untouched by this weakening, which is what the two settle points are for. The check's `finally` then restocked by token once more (`released=0`) and the baseline held after. |
 | `promo` | `promo/promo-redemption.service.ts` — the I7 statement (`UPDATE promo_codes SET used_count = used_count + 1 WHERE id = $1 AND used_count < max_uses`) replaced by a read-then-increment, in the two shapes spec 005's tech spec §4 predicts: (a) `SET used_count = $computed` from a prior `SELECT`; (b) `SET used_count = used_count + 1` with the `WHERE used_count < max_uses` dropped | **(a)** `INFO  response shape — 200: 9, 409 exhausted: 11` for `LIMIT3` and `200: 3, 409 exhausted: 7` for `ONCEONLY`. `FAIL  exactly 3 × 200 — the cap's worth, no more — 9 × 200`; `FAIL  exactly 17 × 409 exhausted — every other shopper told no, in words — 11 × 409 exhausted`; `FAIL  exactly 3 promo_redemptions row(s) among this run's 20 orders, all for LIMIT3 — the ledger half of I8 — 9 row(s)`, and the `ONCEONLY` trio the same way (`3 × 200`, `7 × 409 exhausted`, `3 row(s)`). **Still `PASS`:** `used_count = 3 for LIMIT3 — the counter half of I7 — used_count = 3` and `used_count = 1 for ONCEONLY` — the counter under-reports the ledger, which *is* the race; `zero 5xx` also still passed, since every write was `$read + 1` with `$read ≤ 2`. Nine rather than twenty: each process's `max: 1` pool caps the overlap at four transactions, so each wave of four reads one committed value and writes the same `read + 1` — the counter moves once per wave, the ledger once per winner. Then the check crashed in its own `finally`: `error: new row for relation "promo_codes" violates check constraint "promo_codes_used_count_range"` with `detail: 'Failing row contains (3, LIMIT3, percent, 25, null, 3, -6).'` at `cleanupTestOrders (…/support/db.ts:296:3)` — the decrement-by-what-it-deleted (9) taken from a counter of 3; `FAIL  promo  exited 1 (1838ms)`, `race: 0/1 passed`. Cleaned by hand with a counter reset, the one time that is honest. **(b)** `INFO  response shape — 200: 3, 500: 17` and `200: 1, 500: 9`. `PASS  exactly 3 × 200`; `FAIL  exactly 17 × 409 exhausted — every other shopper told no, in words — 0 × 409 exhausted`; `FAIL  zero 5xx — a guard weakened to an unconditional increment trips the CHECK as 500s while the counter still reads the cap (R2) — 17 × 5xx: 500 {"statusCode":500,"message":"Internal server error"}; …`; the same pair for `ONCEONLY` (`0 × 409 exhausted`, `9 × 5xx`). **Still `PASS`:** `used_count = 3 for LIMIT3`, `exactly 3 promo_redemptions row(s)`, `the ledger's order_id set equals the 200s'`, `the 3 winners carry amount_minor 96750 and the other 17 still carry 129000`, and the `ONCEONLY` equivalents — every database-side assertion, which is R2 exactly. In the instance log, 26 times (17 + 9): `ERROR [ExceptionsHandler] DrizzleQueryError: Failed query: update "promo_codes" set "used_count" = "promo_codes"."used_count" + 1 where "promo_codes"."id" = $1 returning "used_count"` / `cause: error: new row for relation "promo_codes" violates check constraint "promo_codes_used_count_range"` / `code: '23514'`, `detail: 'Failing row contains (3, LIMIT3, percent, 25, null, 3, 4).'`, `constraint: 'promo_codes_used_count_range'`, `routine: 'ExecConstraints'`. `race:promo FAILED (4)`; `FAIL  promo  exited 1 (1487ms)`. Its own cleanup ran clean — counter and ledger agreed at 3 — and the baseline was intact after. Also recorded, in the test file's header rather than here: with `lockOrder`'s `FOR UPDATE` removed this check stays `passed` — it races distinct orders only; the same-order case is `promo-limit-race.test.ts`'s third test. |
 
 The mechanism weakened for `before-order` is an *absence* — `payment_events.order_id`
@@ -161,9 +298,13 @@ equality is asserted only on settled outcomes.
 **`recover-out-of-stock`: everything up to the restock passed.** The
 weakening removes the operator's fresh round and nothing else, so the automatic
 walk into an empty pool — two refusals, `out_of_stock`, zero keys — was
-exactly right. The break is confined to what happens after a person presses
-retry, and the retry's own report says so in words: *"every supplier was asked"*
-against a pool that had just been refilled, with no supplier call made.
+exactly right, and so was the staging around it: the drain and the restock are
+HTTP calls to the supplier's own routes on every run (`claimed=50`,
+`released=50`, the same numbers the table showed), which is what lets this row
+be produced locally for a path the reviewer will exercise against the live
+shop. The break is confined to what happens after a person presses retry, and
+the retry's own report says so in words: *"every supplier was asked"* against a
+pool that had just been refilled, with no supplier call made.
 
 ---
 
@@ -193,6 +334,10 @@ const responses = await Promise.all(
 | `targets.instanceCount` | How many separate base URLs there are. `1` is legal — see below. |
 | `targets.baseUrls` | The whole list, normalised. |
 | `targets.announce(name)` | Prints the banner, plus the single-instance warning when it applies. |
+| `readInstanceId(response)` | The `x-instance-id` header of one response, or `undefined`. Read it inside the helper that consumes the body and keep it on the result. |
+| `collectInstanceIds(responses)` | Distinct ids across a batch — from `Response`s, or from result objects carrying an `instanceId`. Returns `{ distinct, answers, unlabelled }`. |
+| `describeInstanceIds(witness)` | The one `INFO  answers came from K distinct instance(s) — N answer(s)` line to print after a concurrent batch; flags K = 1 in the line itself. |
+| `RACE_MODE_ENV` | `"RACE_MODE"` — set by the runner (`local` \| `external`), read by the harness. Not for checks to set. |
 
 Every base URL is an **origin with no trailing slash**, so you always write
 `` `${base}/api/orders` `` and never think about it. `parseRaceBaseUrls(raw)` is
@@ -262,11 +407,37 @@ deployed shop.
 - the order's status read back from `GET /api/orders/:id`
 - the delivered key as the shopper sees it
 - all N responses naming the same order id (§2.1's idempotent create)
+- the supplier's demo affordances and what they answer —
+  `POST /internal/suppliers/keys/drain { token }` → `claimed > 0`,
+  `POST …/restock { token }` → `released == claimed` — and the walk they
+  stage, `out_of_stock` → retry → `delivered` (`recover-out-of-stock`, which
+  drains and restocks through those routes on every run, with or without a
+  database; the routes are the supplier's, so a shop that could not stage the
+  scenario is a FAIL there, not a SKIP)
+- the promo counters' reset, `POST /api/admin/promo-codes/reset` — `promo`
+  calls it *only* when it has no database to hand back its uses through, and
+  says so (the ledger keeps its rows; counter and ledger disagree afterwards by
+  design)
+- the `x-instance-id` header on every answer — `collectInstanceIds` above; the
+  harness's PASS/FAIL externally, an INFO line in every check that fires a batch
+- **not** a check's to call: `POST /api/admin/demo/reset`. The runner calls it
+  once, after the last check, under `RACE_DEMO_RESET=1` in external mode; a
+  check that reset the whole demo in place of its own cleanup would hide what
+  it leaked (`support/recovery-scenario.ts`, `postDemoReset`)
 
 **Needs `DATABASE_URL` pointing at the same database the target uses:**
 
 - `deliveries` row count for an order — the headline assertion
 - `supplier_keys` claimed count
+- `issuance_attempts` rows for an order — how many, which request ids, which
+  `status`/`last_error` (the recover checks' `a/1`, `b/2`, `a/3`: R7's "a
+  third row, never a reused first" is only visible here)
+- `supplier_requests` rows for a request id — a refusal writes none, a
+  success exactly one
+- the whole-pool reads that pair a drain's `claimed` and a restock's
+  `released` with what the table actually shows (`recover-out-of-stock`:
+  "the pool reads empty before paying", "restocked to its full starting
+  size")
 - `payment_events` row count for one `event_id`, and `processed_at`
 - `orders` row count for one `client_request_id`
 - `promo_codes.used_count` and the `promo_redemptions` rows for a run's orders
@@ -304,11 +475,16 @@ Under `pnpm race`, by the time your first line executes:
    current source, so a deliberately weakened mechanism is genuinely the code
    running. This is what makes RED validation meaningful: the spawned processes
    run `dist/main.js`, so an un-rebuilt edit would not reach them.
-4. `DATABASE_URL` is set and has accepted a `select 1`.
+4. `DATABASE_URL` is set and has accepted a `select 1` — **in local mode.** In
+   external mode it is set only when `RACE_DATABASE_URL` was given, and is
+   otherwise deliberately absent (see "External mode"); `openRaceDatabase`
+   returns `undefined` and your database half SKIPs by name.
+5. `RACE_MODE` is `local` or `external`, so a check that must read the two
+   differently (the harness) can.
 
 Run on its own against a deployed target, only (1) still holds — this module
-validates on every call. (2) is the platform's job, (3) is irrelevant, and (4)
-may simply be false.
+validates on every call. (2) is the platform's job, (3) is irrelevant, (4) may
+simply be false, and (5) is unset.
 
 ---
 
@@ -436,10 +612,13 @@ All optional, all with working defaults.
 | --- | --- | --- |
 | `RACE_BASE_URLS` | unset | Set → external mode: use these targets, build and spawn nothing. Unset → local mode. |
 | `RACE_INSTANCES` | `4` | Local instances to start — the number `architecture.md` §7's measurement used. |
-| `RACE_BASE_PORT` | `4601` | First port. Clear of `pnpm dev` (3000, 5173) and every port the Vitest suites bind (4101–4104, 4201, 4301, 4401–4402, 4501–4504, 4701–4704, 4801–4804, 4901, 5201–5204 — `test/concurrency/promo-limit-race.test.ts` — and 5301 — `test/acceptance/promo-codes.test.ts`) and 5101–5102 (the web e2e). Moved from 4201 in Phase 2 when it turned out to collide with `test/acceptance/purchase-and-key-delivery.test.ts`, which binds that exact port — and this list lagged again in Phase 3, when `test/concurrency/supplier-refusal-and-recovery.test.ts` bound 4601–4604 for two slices before the acceptance slice noticed; that suite moved to 4701. |
+| `RACE_BASE_PORT` | `4601` | First port. Clear of `pnpm dev` (3000, 5173) and every port the Vitest suites bind (4101–4104, 4201, 4301, 4401–4402, 4501–4504, 4701–4704, 4801–4804, 4901, 5201–5204 — `test/concurrency/promo-limit-race.test.ts` — 5301 — `test/acceptance/promo-codes.test.ts` — 5401 — `test/acceptance/vercel-entry.test.ts` — and 5402 — `test/acceptance/demo-routes.test.ts`) and 5101–5102 (the web e2e). Moved from 4201 in Phase 2 when it turned out to collide with `test/acceptance/purchase-and-key-delivery.test.ts`, which binds that exact port — and this list lagged again in Phase 3, when `test/concurrency/supplier-refusal-and-recovery.test.ts` bound 4601–4604 for two slices before the acceptance slice noticed; that suite moved to 4701. |
 | `RACE_SKIP_BUILD` | unset | Skip the rebuild. Faster to iterate, and **wrong for RED validation** — the spawned processes run `dist/`. |
 | `RACE_CHECK_TIMEOUT_MS` | `180000` | Per check. A hung check is killed and reported as a failure rather than hanging the run. |
 | `RACE_VERBOSE` | unset | Stream each instance's stdout too, not just its stderr. |
+| `RACE_DATABASE_URL` | unset | **External mode only.** The target's own database, forwarded to the checks as `DATABASE_URL` — the author's full run. Without it external mode strips `DATABASE_URL` from the checks' environment so nothing asserts against the local database (R7). |
+| `RACE_DEMO_RESET` | unset | **External mode only;** ignored with one line locally. Non-empty → `POST /api/admin/demo/reset` on the first target after the last check, counts printed. A refused reset exits `2`. |
+| `RACE_MODE` | — | **Not a knob.** Set by the runner for the checks it spawns — `local` or `external` — and read by the harness to decide whether a distinct-instance count is a PASS/FAIL or an INFO line. Unset when a check is run by hand (the external reading applies). |
 
 Do not put `RACE_BASE_URLS` in `.env` or `.env.example`: `scripts/with-env.ts`
 would then export it on every run, and `pnpm race` would permanently stop

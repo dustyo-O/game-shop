@@ -34,15 +34,19 @@
  * guarantee than deployment gets; the system is designed not to need it.
  *
  * ---------------------------------------------------------------------------
- * PHASE 6 SEAM — READ {@link resolveWaitUntil} BEFORE DEPLOYING
+ * WHERE `waitUntil` COMES FROM — THE PHASE 6 SEAM, NOW CLOSED
  * ---------------------------------------------------------------------------
- * This class is complete. What is not wired is where its `waitUntil` comes
- * from, because `@vercel/functions` is deliberately **not** a dependency of
- * this workspace yet — Phase 6 owns deployment, and a dependency added three
- * phases early is one that gets version-bumped by a bot before anything has
- * ever imported it. See {@link resolveWaitUntil} for the exact two-line change.
+ * `@vercel/functions` is a dependency of `apps/api` since Phase 6, pinned
+ * exact, and {@link resolveWaitUntil} returns its `waitUntil`. It was
+ * deliberately *not* one before: Phase 2 wrote this class and the whole of the
+ * deployment path with the import left as the single absent piece, because
+ * Phase 6 owned deployment and a dependency added three phases early is one
+ * that gets version-bumped by a bot before anything has ever imported it. The
+ * seam outlived its closing on purpose — see {@link resolveWaitUntil} for what
+ * it still separates.
  */
 import { Logger } from "@nestjs/common";
+import { waitUntil } from "@vercel/functions";
 
 import {
   guardContinuation,
@@ -53,55 +57,76 @@ import {
 /**
  * The shape of `waitUntil` from `@vercel/functions`.
  *
- * Declared here rather than imported so that this file compiles, and this class
- * is testable, without the package being installed. The signature is the
- * platform's, narrowed to what is actually used: it accepts any promise and
- * returns nothing.
+ * This file's own alias rather than `typeof waitUntil` from the package, and
+ * kept that way after the package arrived. It was first declared here so the
+ * file compiled, and the class was testable, with the package not installed;
+ * what keeps it now is that the constructor's contract is this file's to
+ * state. The signature is the platform's, narrowed to what is actually used:
+ * it accepts any promise and returns nothing. The package declares `void |
+ * undefined`, which is assignable here without a cast.
  */
 export type WaitUntil = (promise: Promise<unknown>) => void;
 
 /**
- * Obtain the platform's `waitUntil`, or `undefined` if this build has none.
+ * Obtain the platform's `waitUntil`.
  *
  * ###########################################################################
- * # THIS IS A SEAM, NOT AN IMPLEMENTATION. IT RETURNS `undefined` TODAY.
+ * # THE SEAM IS CLOSED: THIS RETURNS `@vercel/functions`'s `waitUntil`.
  * ###########################################################################
  *
- * Phase 2 does not deploy, so Phase 2 does not install a deployment
- * dependency. The whole of the deployment path is therefore written and
- * type-checked, and exactly one thing is absent: the import. **Phase 6 makes it
- * live with two edits and no redesign:**
+ * Until Phase 6 this returned `undefined`. Phase 2 wrote the deployment path
+ * without deploying it, so it did not install a deployment dependency: the
+ * whole path was written and type-checked, and exactly one thing was absent —
+ * the import. This function was the promised closing point, and the promised
+ * two edits are what happened: `pnpm --filter @game-shop/api add
+ * @vercel/functions` (exact pin, lockfile committed — technical-considerations
+ * §2.7 and R13 of the Phase 6 spec), and the `import` above with the `return`
+ * below. Nothing else changed — not the interface, not the module, not a
+ * caller — which was the point of a seam over a `TODO`.
  *
- *   1. `pnpm --filter @game-shop/api add @vercel/functions`
- *   2. In this file:
+ * ### The import is unconditional, and that is fine
  *
- *          import { waitUntil } from "@vercel/functions";
- *          …
- *          export function resolveWaitUntil(): WaitUntil | undefined {
- *            return waitUntil;
- *          }
+ * The `import` at the top of this file runs at module load in every process
+ * that loads the scheduling module — `pnpm dev`, the harness's four instances,
+ * every test — not only on Vercel. It is safe because `@vercel/functions` does
+ * no platform work at import time: its `waitUntil` looks the request context
+ * up on `globalThis` (`Symbol.for("@vercel/request-context")`) at *call* time,
+ * and when there is no context it does nothing at all. Importing it
+ * off-platform therefore cannot throw, and even calling it there would be a
+ * silent no-op rather than an error — which is why the seam did not need to
+ * become a dynamic import to close.
  *
- * Nothing else changes — not the interface, not the module, not a caller.
+ * ### What keeps local behaviour identical is the caller, not the package
  *
- * Returning `undefined` rather than throwing is what keeps the seam honest in
- * both directions: locally it is the *expected* answer and selection falls
- * through to the tracked implementation with no noise, while on Vercel
- * `./scheduling.module.ts` turns the same answer into a loud boot-time line
- * saying the deployment is running without its continuation guarantee. A throw
- * would refuse to boot a deployment over a feature the drains already cover;
- * silence would let it ship unnoticed. A log is the honest middle.
+ * `./scheduling.module.ts` consults this function only when `VERCEL === "1"`
+ * and builds `TrackedContinuationScheduler` otherwise, without ever calling
+ * this. So `waitUntil` is imported everywhere, resolved only on the platform,
+ * and *called* only through {@link WaitUntilContinuationScheduler}, which the
+ * platform branch alone constructs. Locally, this file's import line is the
+ * whole of the package's footprint.
+ *
+ * ### Why the return type still admits `undefined`
+ *
+ * `undefined` is no longer reachable from this body, and the type keeps it
+ * anyway, for the reason it was chosen: it is the honest answer for a build
+ * that has no `waitUntil`, and `./scheduling.module.ts` turns that answer into
+ * a loud boot-time line saying the deployment is running without its
+ * continuation guarantee — rather than a throw, which would refuse to boot
+ * over a feature the drains already cover, or silence, which would let it ship
+ * unnoticed. Narrowing the type would delete the branch that reports it.
  */
 export function resolveWaitUntil(): WaitUntil | undefined {
-  return undefined;
+  return waitUntil;
 }
 
 /**
  * The deployment {@link ContinuationScheduler}.
  *
- * The `waitUntil` function is a constructor argument rather than a module-level
- * import, which is what makes this class independent of whether the package is
- * installed — and, not incidentally, what lets a test hand it a spy and assert
- * that a rejecting continuation reaches the platform as a *fulfilled* promise.
+ * The `waitUntil` function is a constructor argument rather than a use of the
+ * module-level import, which is what keeps this class independent of where
+ * its `waitUntil` came from — and, not incidentally, what lets a test hand it
+ * a spy and assert that a rejecting continuation reaches the platform as a
+ * *fulfilled* promise.
  */
 export class WaitUntilContinuationScheduler implements ContinuationScheduler {
   private readonly logger = new Logger(WaitUntilContinuationScheduler.name);

@@ -45,7 +45,7 @@
 import { randomUUID } from "node:crypto";
 
 import { PURCHASABLE_SKU, cleanupTestOrders, deriveTestRequestId, openRaceDatabase } from "./support/race-database.ts";
-import { resolveRaceTargets } from "./support/race-targets.ts";
+import { collectInstanceIds, describeInstanceIds, readInstanceId, resolveRaceTargets } from "./support/race-targets.ts";
 
 const targets = resolveRaceTargets();
 targets.announce("race:same-event");
@@ -98,6 +98,8 @@ interface WebhookResult {
   readonly status: number;
   readonly outcome: string | undefined;
   readonly error: string | undefined;
+  /** The answering process's `x-instance-id` — `collectInstanceIds` counts the distinct ones after the batch. */
+  readonly instanceId: string | undefined;
 }
 
 /** Same payload contract as `./webhooks.ts` — `parsePaymentWebhookPayload` in `payment-webhook.controller.ts`. */
@@ -123,9 +125,21 @@ async function postPaidWebhook(baseUrl: string, eventId: string, orderId: string
     } catch {
       outcome = undefined;
     }
-    return { ok: response.ok, status: response.status, outcome, error: response.ok ? undefined : text };
+    return {
+      ok: response.ok,
+      status: response.status,
+      outcome,
+      error: response.ok ? undefined : text,
+      instanceId: readInstanceId(response),
+    };
   } catch (error) {
-    return { ok: false, status: 0, outcome: undefined, error: error instanceof Error ? error.message : String(error) };
+    return {
+      ok: false,
+      status: 0,
+      outcome: undefined,
+      error: error instanceof Error ? error.message : String(error),
+      instanceId: undefined,
+    };
   }
 }
 
@@ -181,6 +195,10 @@ try {
   const results = await Promise.all(
     Array.from({ length: REDELIVERY_COUNT }, (_, i) => postPaidWebhook(targets.at(i), eventId, order.id)),
   );
+
+  // Who answered — the HTTP witness of "separate processes" for THIS batch
+  // (spec 006 §2.5). Informational: the harness decides on it.
+  console.log(`  ${describeInstanceIds(collectInstanceIds(results))}`);
 
   const allOk = results.every((result) => result.ok);
   record(

@@ -69,7 +69,7 @@
  * in hand the reset is never called; the verify task greps for that.
  */
 import { PURCHASABLE_SKU, cleanupTestOrders, openRaceDatabase } from "./support/race-database.ts";
-import { resolveRaceTargets } from "./support/race-targets.ts";
+import { collectInstanceIds, describeInstanceIds, readInstanceId, resolveRaceTargets } from "./support/race-targets.ts";
 import {
   type AdminApiResult,
   describeMissingAdminAffordance,
@@ -182,6 +182,8 @@ interface ApplyPromoResult {
   /** `{ reason }` on a refusal. */
   readonly reason: string | undefined;
   readonly error: string | undefined;
+  /** The answering process's `x-instance-id` — `collectInstanceIds` counts the distinct ones after the race. */
+  readonly instanceId: string | undefined;
 }
 
 function readAppliedView(body: unknown): AppliedView | undefined {
@@ -219,6 +221,7 @@ async function postApplyPromo(baseUrl: string, orderId: string, code: string): P
       view: response.ok ? readAppliedView(body) : undefined,
       reason,
       error: response.ok ? undefined : text,
+      instanceId: readInstanceId(response),
     };
   } catch (error: unknown) {
     return {
@@ -227,6 +230,7 @@ async function postApplyPromo(baseUrl: string, orderId: string, code: string): P
       view: undefined,
       reason: undefined,
       error: error instanceof Error ? error.message : String(error),
+      instanceId: undefined,
     };
   }
 }
@@ -364,6 +368,9 @@ async function runScenario(scenario: PromoScenario): Promise<ScenarioRun> {
   const other = results.filter((result) => classify(result) === ResponseKind.Other);
 
   console.log(`  INFO  response shape — ${histogram(results)}`);
+  // Who answered the applications — the HTTP witness of "separate processes"
+  // for THIS race (spec 006 §2.5). Informational: the harness decides on it.
+  console.log(`  ${describeInstanceIds(collectInstanceIds(results))}`);
 
   // Step 3 — the shape of the responses. The order of these four lines is
   // the order a reader needs them in: how many got it, how many were told
@@ -558,7 +565,10 @@ try {
     // No database to decrement through. The next run needs LIMIT3 and
     // ONCEONLY back at zero, and the only handle this process has on a
     // deployed shop is the admin reset — R15, and the file header. This
-    // branch is unreachable under `pnpm race`, which always has a database.
+    // branch is unreachable under `pnpm race` in local mode, which always has
+    // a database; external mode without `RACE_DATABASE_URL` reaches it on
+    // every run (the reviewer's command), which is why the demo reset that
+    // follows reports `promo_codes 0` beside a non-zero `promo_redemptions`.
     const adminToken = readAdminToken();
     if (adminToken === undefined) {
       console.log(

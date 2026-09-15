@@ -14,9 +14,21 @@
  *   pnpm race webhooks same-event      only those checks
  *   pnpm race --list                   what checks exist, without running them
  *
- *   RACE_BASE_URLS=https://game-shop.vercel.app pnpm race
+ *   RACE_BASE_URLS=https://game-shop.vercel.app ADMIN_TOKEN=<the demo token> pnpm race
  *                                      the deployed target: nothing is spawned,
- *                                      nothing is built, the checks run as-is
+ *                                      nothing is built, the checks run as-is;
+ *                                      no database, so database-side assertions
+ *                                      are SKIP by name — the reviewer's command
+ *
+ *   RACE_BASE_URLS=… ADMIN_TOKEN=… RACE_DATABASE_URL=<the target's database> pnpm race
+ *                                      the author's full run: every assertion,
+ *                                      cleanup included — the URL is forwarded
+ *                                      to the checks as DATABASE_URL
+ *
+ *   RACE_BASE_URLS=… ADMIN_TOKEN=… RACE_DEMO_RESET=1 pnpm race
+ *                                      after the last check, POST
+ *                                      /api/admin/demo/reset on the first target
+ *                                      so the transcript ends at baseline
  *
  * Exit code: `0` every check passed, `1` at least one failed, `2` the command
  * or the configuration was wrong.
@@ -36,8 +48,11 @@
  *      against this target at all (see EXIT_CHECK_SKIPPED below). Nothing else
  *      is inspected — not stdout, not a report file.
  *   4. A check cleans up what it wrote (`cleanupTestOrders` in
- *      `./support/race-database.ts`), so `pnpm race` twice in a row works with
- *      no manual tidying. Functional spec §2.6 makes that a criterion.
+ *      `./support/race-database.ts`) when it has a database, so `pnpm race`
+ *      twice in a row works with no manual tidying. Functional spec §2.6 makes
+ *      that a criterion. Without one (external mode, no `RACE_DATABASE_URL`)
+ *      the orders stay on the target and the banner names the tidying:
+ *      `pnpm demo:reset`, or `RACE_DEMO_RESET=1` on the run itself.
  *   5. `<name>` becomes the check's name here and should match the npm alias
  *      its author adds, e.g. `scripts/race/webhooks.ts` ←→ `pnpm race:webhooks`.
  *
@@ -78,6 +93,40 @@
  *   RACE_CHECK_TIMEOUT_MS Per check. Default 180000.
  *   RACE_VERBOSE          Non-empty → stream each instance's stdout too, not
  *                         just its stderr.
+ *   RACE_DATABASE_URL     External mode only. Forwarded to the checks as
+ *                         DATABASE_URL — the target's own database, for the
+ *                         author's full run. Without it external mode STRIPS
+ *                         DATABASE_URL from the checks' environment: see
+ *                         "EXTERNAL MODE — ENVIRONMENT HYGIENE" below.
+ *   RACE_DEMO_RESET       External mode only; ignored (with one line) locally.
+ *                         Non-empty → POST /api/admin/demo/reset on the first
+ *                         target after the last check, counts printed.
+ *   RACE_MODE             Not a knob — SET BY THIS RUNNER for the checks it
+ *                         spawns: `local` or `external`. `harness.ts` reads it
+ *                         to decide whether a distinct-instance count is a
+ *                         PASS/FAIL (external) or an INFO line (local).
+ *
+ * =========================================================================
+ * EXTERNAL MODE — ENVIRONMENT HYGIENE (spec 006 §2.6, R7)
+ * =========================================================================
+ * `scripts/with-env.ts` merges `.env.example` into this process's environment,
+ * so an external run would otherwise hand every check
+ * `DATABASE_URL=…localhost:5433…` — the LOCAL database — while the target
+ * writes to its own. The database half of every check would then either fail
+ * on `ECONNREFUSED` or, worse, assert against a database the target never
+ * touched and report it. So in external mode the child environment is built
+ * WITHOUT `DATABASE_URL` unless `RACE_DATABASE_URL` names the target's own,
+ * and the mode line says which of the two this run is. Without a database the
+ * checks report every database-side assertion as SKIP by name (never as a
+ * pass — `support/race-database.ts`), and the orders they create stay on the
+ * target: hence the banner, `pnpm demo:reset`, and `RACE_DEMO_RESET=1`.
+ *
+ * `ADMIN_TOKEN` is forwarded as-is — the recover checks arm the supplier with
+ * it — but `.env.example`'s local default is almost certainly not the
+ * target's, so a hint is printed when the two would collide as a `401`.
+ *
+ * Local mode is untouched by any of this: the child environment is the
+ * runner's own plus `RACE_BASE_URLS` and `RACE_MODE=local`, exactly as before.
  */
 import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -89,8 +138,14 @@ import {
   startApiInstance,
   stopAllApiInstances,
 } from "../../apps/api/test/concurrency/support/api-instance.ts";
-import { RACE_BASE_URLS_ENV, parseRaceBaseUrls } from "./support/race-targets.ts";
+import { RACE_BASE_URLS_ENV, RACE_MODE_ENV, parseRaceBaseUrls } from "./support/race-targets.ts";
 import { openRaceDatabase } from "./support/race-database.ts";
+import {
+  describeMissingAdminAffordance,
+  isMissingAdminAffordance,
+  postDemoReset,
+  readAdminToken,
+} from "./support/recovery-scenario.ts";
 
 const RACE_DIR = dirname(fileURLToPath(import.meta.url));
 /** The repository root — where `pnpm` workspace filters resolve from. */
@@ -124,6 +179,29 @@ const DEFAULT_INSTANCE_COUNT = 4;
  */
 const DEFAULT_BASE_PORT = 4601;
 const DEFAULT_CHECK_TIMEOUT_MS = 180_000;
+
+/**
+ * `.env.example`'s `ADMIN_TOKEN`, transcribed. External mode compares the
+ * token it is about to forward against this: a reviewer who exported nothing
+ * inherits it through `with-env.ts`, and every admin-guarded check would then
+ * SKIP on a `401` without saying why the token was wrong.
+ */
+const LOCAL_DEFAULT_ADMIN_TOKEN = "local-dev-admin-token-not-a-secret";
+
+/**
+ * The warm-up: `GET /api/products` on the first target until it answers 200.
+ * `/api/health` would not do — `apps/api` builds its pool lazily, so health
+ * answers 200 with no database at all and proves nothing about a Neon branch
+ * resuming from autosuspend. Six attempts, five seconds apart: a cold
+ * function plus a cold database is a few seconds; thirty is a target that is
+ * not coming up, and the run should say so rather than spend nine checks
+ * discovering it.
+ */
+const WARM_UP_ATTEMPTS = 6;
+const WARM_UP_INTERVAL_MS = 5_000;
+const WARM_UP_REQUEST_TIMEOUT_MS = 20_000;
+
+type RaceMode = "local" | "external";
 
 const EXIT_OK = 0;
 const EXIT_CHECK_FAILED = 1;
@@ -282,6 +360,124 @@ async function preflightDatabase(): Promise<void> {
   }
 }
 
+function delay(ms: number): Promise<void> {
+  return new Promise((doneWaiting) => {
+    setTimeout(doneWaiting, ms);
+  });
+}
+
+/**
+ * External mode's first request: the catalogue, until it answers 200.
+ * Bounded — see WARM_UP_ATTEMPTS. Throws when the target never comes up,
+ * which the caller reports as a configuration error rather than nine `fetch
+ * failed`s.
+ */
+async function warmUpTarget(baseUrl: string): Promise<void> {
+  for (let attempt = 1; attempt <= WARM_UP_ATTEMPTS; attempt += 1) {
+    const startedAt = Date.now();
+    let outcome: string;
+    try {
+      const response = await fetch(`${baseUrl}/api/products`, { signal: AbortSignal.timeout(WARM_UP_REQUEST_TIMEOUT_MS) });
+      const elapsedMs = Date.now() - startedAt;
+      if (response.ok) {
+        console.log(
+          `race: warm-up — GET ${baseUrl}/api/products → ${String(response.status)} in ${String(elapsedMs)}ms ` +
+            `(attempt ${String(attempt)} of ${String(WARM_UP_ATTEMPTS)})`,
+        );
+        return;
+      }
+      outcome = `HTTP ${String(response.status)} in ${String(elapsedMs)}ms`;
+    } catch (error: unknown) {
+      const reason = error instanceof Error ? (error.cause instanceof Error ? error.cause.message : error.message) : String(error);
+      outcome = `${reason} after ${String(Date.now() - startedAt)}ms`;
+    }
+    console.log(
+      `race: warm-up — GET ${baseUrl}/api/products → ${outcome} (attempt ${String(attempt)} of ${String(WARM_UP_ATTEMPTS)})` +
+        (attempt < WARM_UP_ATTEMPTS ? `; retrying in ${String(WARM_UP_INTERVAL_MS / 1000)}s` : ""),
+    );
+    if (attempt < WARM_UP_ATTEMPTS) await delay(WARM_UP_INTERVAL_MS);
+  }
+  throw new Error(
+    `the target never answered 200 on GET ${baseUrl}/api/products in ${String(WARM_UP_ATTEMPTS)} attempts. ` +
+      "Nothing below could pass; check the URL, the deployment, and its database.",
+  );
+}
+
+/**
+ * The child environment for every check. Local mode: this process's own plus
+ * the two markers — unchanged from before external mode existed. External
+ * mode: the same minus `DATABASE_URL`, which is put back only from
+ * `RACE_DATABASE_URL`. See the header, "EXTERNAL MODE — ENVIRONMENT HYGIENE".
+ */
+function buildChildEnv(mode: RaceMode, baseUrls: readonly string[], raceDatabaseUrl: string | undefined): NodeJS.ProcessEnv {
+  const markers = { [RACE_BASE_URLS_ENV]: baseUrls.join(","), [RACE_MODE_ENV]: mode };
+  if (mode === "local") return { ...process.env, ...markers };
+
+  const { DATABASE_URL: _localDatabaseUrl, ...withoutDatabase } = process.env;
+  return raceDatabaseUrl === undefined
+    ? { ...withoutDatabase, ...markers }
+    : { ...withoutDatabase, DATABASE_URL: raceDatabaseUrl, ...markers };
+}
+
+/** `key 1 · key 2` over the numeric fields of one part of the reset report — the shape is `apps/api/src/demo/demo.types.ts`'s, read defensively. */
+function describeCounts(value: unknown): string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "(no counts)";
+  const entries = Object.entries(value as Record<string, unknown>).filter((entry): entry is [string, number] => typeof entry[1] === "number");
+  return entries.length === 0 ? "(no counts)" : entries.map(([key, count]) => `${key} ${String(count)}`).join(" · ");
+}
+
+/**
+ * `RACE_DEMO_RESET=1`, external mode only: `POST /api/admin/demo/reset` on the
+ * first target after the last check, so a transcript that created orders on
+ * a target nobody can clean through SQL still ends at baseline.
+ *
+ * The mode guard is a thrown error, not a silent return, because the local
+ * harness must never reach this: locally every check cleans up its own rows
+ * and the harness asserts the baseline after, and a reset in their place
+ * would sweep a leaking application's residue into `removed` and call it a
+ * pass (`support/recovery-scenario.ts`, `postDemoReset`). The caller only
+ * calls this in external mode; this is the assertion that it stayed so.
+ *
+ * Returns `true` when the target answered 200; `false` when it refused —
+ * reported by the caller as a configuration error, since a run that was
+ * asked to end at baseline and did not must not exit 0.
+ */
+async function resetDemoAfterRun(mode: RaceMode, baseUrl: string): Promise<boolean> {
+  if (mode !== "external") {
+    throw new Error("RACE_DEMO_RESET reached the reset in local mode — this must be unreachable; see resetDemoAfterRun");
+  }
+  const adminToken = readAdminToken();
+  console.log(`\nrace: RACE_DEMO_RESET — POST ${baseUrl}/api/admin/demo/reset`);
+  if (adminToken === undefined) {
+    console.error("race: RACE_DEMO_RESET — no ADMIN_TOKEN in this process; the reset was not attempted.");
+    return false;
+  }
+  let result: Awaited<ReturnType<typeof postDemoReset>>;
+  try {
+    result = await postDemoReset(baseUrl, adminToken);
+  } catch (error: unknown) {
+    console.error(`race: RACE_DEMO_RESET — could not reach the target: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+  if (isMissingAdminAffordance(result)) {
+    console.error(`race: RACE_DEMO_RESET — the reset did not run: ${describeMissingAdminAffordance(result)}`);
+    return false;
+  }
+  if (!result.ok || result.body === undefined) {
+    console.error(`race: RACE_DEMO_RESET — the target answered ${String(result.status)}: ${result.text}`);
+    return false;
+  }
+  const changed = result.body["changed"];
+  if (changed === false) {
+    console.log("race:   already at baseline — nothing removed, nothing reset");
+  } else {
+    console.log(`race:   removed  ${describeCounts(result.body["removed"])}`);
+    console.log(`race:   reset    ${describeCounts(result.body["reset"])}`);
+  }
+  console.log(`race:   now      ${describeCounts(result.body["now"])}`);
+  return true;
+}
+
 async function main(): Promise<number> {
   const args = process.argv.slice(2);
   const wantsList = args.includes("--list");
@@ -329,6 +525,10 @@ async function main(): Promise<number> {
   // ---------------------------------------------------------------------
   const externalTargets = process.env[RACE_BASE_URLS_ENV];
   const isExternal = externalTargets !== undefined && externalTargets.trim() !== "";
+  const mode: RaceMode = isExternal ? "external" : "local";
+  const rawRaceDatabaseUrl = process.env["RACE_DATABASE_URL"];
+  const raceDatabaseUrl = rawRaceDatabaseUrl === undefined || rawRaceDatabaseUrl.trim() === "" ? undefined : rawRaceDatabaseUrl.trim();
+  const wantsDemoReset = isEnabled("RACE_DEMO_RESET");
 
   const instances: RunningInstance[] = [];
   let activeCheck: ChildProcess | undefined;
@@ -368,9 +568,13 @@ async function main(): Promise<number> {
       // Validate here, not in each check: a typo should cost one line, not
       // four identical stack traces after a 30-second build.
       baseUrls = parseRaceBaseUrls(externalTargets);
+      // The mode line: which targets, and — the R7 question — which database
+      // the checks will see. "none" is the reviewer's run; "forwarded" the
+      // author's. Nothing else on this run touches a database.
       console.log(
-        `race: using ${String(baseUrls.length)} externally supplied target(s) — ${baseUrls.join(", ")}\n` +
-          "race: nothing built, nothing spawned, nothing stopped; the target's owner supplies the instances.",
+        `race: external target(s) ${baseUrls.join(", ")} — database: ` +
+          (raceDatabaseUrl === undefined ? "none (assertions SKIP by name)" : "RACE_DATABASE_URL forwarded") +
+          "\nrace: nothing built, nothing spawned, nothing stopped; the target's owner supplies the instances.",
       );
       if (baseUrls.length === 1) {
         console.log(
@@ -378,7 +582,36 @@ async function main(): Promise<number> {
             "race: separate instances. Locally it proves nothing — see architecture.md §7.",
         );
       }
+      if (readAdminToken() === LOCAL_DEFAULT_ADMIN_TOKEN) {
+        console.log(
+          "race: ADMIN_TOKEN is the local default — export the target's token or the admin-guarded checks will answer 401",
+        );
+      }
+
+      const [firstTarget] = baseUrls;
+      if (firstTarget === undefined) throw new Error("RACE_BASE_URLS parsed to no origins");
+      await warmUpTarget(firstTarget);
+
+      if (raceDatabaseUrl === undefined) {
+        // One banner for the whole run, not one per check: the checks each
+        // name their skipped assertions when they get there.
+        console.log(
+          "race: ┌─ no DATABASE_URL for this run ──────────────────────────────────────────\n" +
+            "race: │ every database-side assertion below is reported as SKIP by name — never counted as a pass;\n" +
+            "race: │ orders these checks create stay on the target. Run `pnpm demo:reset` when the run ends,\n" +
+            "race: │ or set RACE_DEMO_RESET=1 to have this runner call POST /api/admin/demo/reset after the last check.\n" +
+            "race: └──────────────────────────────────────────────────────────────────────────",
+        );
+      }
     } else {
+      if (wantsDemoReset) {
+        // Ignored, and said once. The reset must never run against the local
+        // harness — `resetDemoAfterRun` throws if it is ever reached here.
+        console.log(
+          "race: RACE_DEMO_RESET is set but this is local mode — ignored. Local checks clean up their own rows " +
+            "and the harness asserts the baseline; the demo reset is external mode's affordance only.",
+        );
+      }
       const instanceCount = readPositiveInt("RACE_INSTANCES", DEFAULT_INSTANCE_COUNT);
       const basePort = readPositiveInt("RACE_BASE_PORT", DEFAULT_BASE_PORT);
 
@@ -456,7 +689,7 @@ async function main(): Promise<number> {
       }
     }
 
-    const childEnv: NodeJS.ProcessEnv = { ...process.env, [RACE_BASE_URLS_ENV]: baseUrls.join(",") };
+    const childEnv = buildChildEnv(mode, baseUrls, raceDatabaseUrl);
     const timeoutMs = readPositiveInt("RACE_CHECK_TIMEOUT_MS", DEFAULT_CHECK_TIMEOUT_MS);
     const results: CheckResult[] = [];
 
@@ -478,6 +711,16 @@ async function main(): Promise<number> {
       return EXIT_CHECK_FAILED;
     }
 
+    // After the last check and before the verdict, so the transcript's
+    // last database-shaped lines are the baseline the target was left at.
+    // External mode only — see `resetDemoAfterRun`'s guard.
+    let demoResetRefused = false;
+    if (wantsDemoReset && mode === "external") {
+      const [firstTarget] = baseUrls;
+      if (firstTarget === undefined) throw new Error("RACE_BASE_URLS parsed to no origins");
+      demoResetRefused = !(await resetDemoAfterRun(mode, firstTarget));
+    }
+
     console.log(`\n${"═".repeat(72)}\nrace: summary\n${"═".repeat(72)}`);
     for (const result of results) {
       const verdict = result.skipped === true ? "SKIP" : result.ok ? "PASS" : "FAIL";
@@ -496,6 +739,10 @@ async function main(): Promise<number> {
         (skipped.length === 0 ? "." : `, ${String(skipped.length)} skipped (${skipped.map((s) => s.name).join(", ")}).`),
     );
 
+    if (demoResetRefused) {
+      console.error("race: RACE_DEMO_RESET was requested and the reset did not run — the target is not at baseline.");
+      return EXIT_USAGE;
+    }
     return failed.length === 0 && ran === checks.length ? EXIT_OK : EXIT_CHECK_FAILED;
   } finally {
     // The only place instances are stopped. Reached on success, on a failing

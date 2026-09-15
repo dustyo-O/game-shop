@@ -122,10 +122,43 @@
  * whether it has one. Against a deployed shop with no database route, a check
  * should run its HTTP half, report the database half as SKIPPED naming the
  * assertions it could not make, and **not** report a pass it did not earn.
+ *
+ * ---------------------------------------------------------------------------
+ * THE INSTANCE-ID WITNESS — `collectInstanceIds`
+ * ---------------------------------------------------------------------------
+ * Every response the API sends carries `x-instance-id`, one random UUID per
+ * process (`apps/api/src/instance-identity.ts`, spec 006 §2.5). Locally the
+ * harness proves "separate processes" with `pg_stat_activity` pids; against a
+ * deployed target nobody holds the database, so the process has to say who it
+ * is over HTTP instead. A check that has just fired N concurrent requests
+ * collects the header from its own N responses and prints how many distinct
+ * values it saw:
+ *
+ *     console.log(`  ${describeInstanceIds(collectInstanceIds(results))}`);
+ *     // INFO  answers came from 4 distinct instance(s) — 50 answer(s)
+ *
+ * What the number proves, and what it does not — `instance-identity.ts`'s
+ * own words: a distinct id proves a distinct process, **not** that those
+ * processes were alive at the same moment. K = 1 on a run means that run was
+ * not cross-process evidence, and the line says so rather than leaving a
+ * green transcript to imply otherwise. The harness (`../harness.ts`) turns the
+ * same count into a PASS/FAIL against an external target; a check only
+ * reports it.
  */
 
 /** The one environment variable this module reads. */
 export const RACE_BASE_URLS_ENV = "RACE_BASE_URLS";
+
+/**
+ * Set by `../run-checks.ts` for every check it spawns: `local` when the runner
+ * started the instances itself, `external` when `RACE_BASE_URLS` named them.
+ * Unset when a check is run by hand. The harness reads it to decide whether a
+ * distinct-instance count is a PASS/FAIL or an INFO line — see `../harness.ts`.
+ */
+export const RACE_MODE_ENV = "RACE_MODE";
+
+/** The header `apps/api/src/create-app.ts` sets on every response — `INSTANCE_ID_HEADER` there, transcribed. */
+export const INSTANCE_ID_HEADER = "x-instance-id";
 
 export interface RaceTargets {
   /** Normalised origins, in the order they were listed. Never empty. */
@@ -296,4 +329,66 @@ export function resolveRaceTargets(raw: string | undefined = process.env[RACE_BA
       if (baseUrls.length === 1) console.warn(SINGLE_INSTANCE_WARNING);
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// The instance-id witness.
+// ---------------------------------------------------------------------------
+
+/** What `collectInstanceIds` counts from: a `Response`, or a check's own result object carrying an id `readInstanceId` already read. */
+export type InstanceIdSource = Pick<Response, "headers"> | { readonly instanceId: string | undefined };
+
+export interface InstanceIdWitness {
+  /** Every distinct `x-instance-id` seen, in first-seen order. */
+  readonly distinct: readonly string[];
+  /** How many sources were counted, labelled or not. */
+  readonly answers: number;
+  /** Sources with no `x-instance-id` at all — a `fetch` that threw, or a target that is not this API. */
+  readonly unlabelled: number;
+}
+
+/** The `x-instance-id` header of one response, or `undefined` when it carries none. Read it inside a helper that consumes the body, and keep it on the result. */
+export function readInstanceId(response: Pick<Response, "headers">): string | undefined {
+  const value = response.headers.get(INSTANCE_ID_HEADER);
+  return value === null || value === "" ? undefined : value;
+}
+
+/**
+ * Distinct `x-instance-id` values across a batch of answers. Accepts the
+ * `Response`s themselves, or result objects whose `instanceId` a helper read
+ * with `readInstanceId` before consuming the body — the three checks that
+ * wrap `fetch` in a never-throwing helper keep the id on the result.
+ */
+export function collectInstanceIds(sources: Iterable<InstanceIdSource>): InstanceIdWitness {
+  const distinct: string[] = [];
+  const seen = new Set<string>();
+  let answers = 0;
+  let unlabelled = 0;
+  for (const source of sources) {
+    answers += 1;
+    const id = "headers" in source ? readInstanceId(source) : source.instanceId;
+    if (id === undefined) {
+      unlabelled += 1;
+      continue;
+    }
+    if (!seen.has(id)) {
+      seen.add(id);
+      distinct.push(id);
+    }
+  }
+  return { distinct, answers, unlabelled };
+}
+
+/**
+ * The one INFO line a check prints after its concurrent batch. K = 1 is
+ * flagged in the line itself: every answer from one process is exactly the
+ * run `architecture.md` §7 warns is not evidence.
+ */
+export function describeInstanceIds(witness: InstanceIdWitness): string {
+  const k = witness.distinct.length;
+  return (
+    `INFO  answers came from ${String(k)} distinct instance(s) — ${String(witness.answers)} answer(s)` +
+    (witness.unlabelled > 0 ? `, ${String(witness.unlabelled)} without an ${INSTANCE_ID_HEADER} header` : "") +
+    (k === 1 ? "; a single id means this run was not cross-process evidence" : "")
+  );
 }

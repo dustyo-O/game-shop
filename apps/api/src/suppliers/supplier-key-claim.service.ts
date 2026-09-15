@@ -245,9 +245,9 @@ const MAX_CAUSE_DEPTH = 8;
  *
  * Structural rather than `instanceof pg.DatabaseError`: `apps/api` talks to
  * Postgres through Drizzle and does not depend on the driver package, and
- * Phase 6 swaps `pg` for `@neondatabase/serverless` underneath
- * (`packages/db/src/client.ts`). The SQLSTATE is the stable part of that
- * contract; the error class is not.
+ * the driver is `packages/db/src/client.ts`'s decision, not this module's
+ * (Phase 6 weighed a swap to `@neondatabase/serverless` and kept `pg`). The
+ * SQLSTATE is the stable part of that contract; the error class is not.
  */
 function isUniqueViolation(error: unknown): boolean {
   let current: unknown = error;

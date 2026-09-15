@@ -79,29 +79,65 @@
  * client has.)
  *
  * ---------------------------------------------------------------------------
- * PHASE 6 — SWAPPING IN NEON
+ * PHASE 6 — DECIDED: NO SWAP
  * ---------------------------------------------------------------------------
- * Today this speaks the ordinary Postgres wire protocol over TCP, which is what
- * the Docker Compose container serves. Neon's serverless driver tunnels the
- * same protocol over a WebSocket so it works from an edge/serverless runtime,
- * and it deliberately mirrors node-postgres' `Pool` API. The migration is
- * therefore confined to this file, and to two lines of it:
+ * Until Phase 6 this header planned to replace `pg` with
+ * `@neondatabase/serverless` — the same protocol tunnelled over a WebSocket,
+ * mirroring node-postgres' `Pool` API — when the shop went live. Decided
+ * against (spec 006, technical-considerations §2.3). What runs on Vercel is
+ * this file, unchanged: `pg` over TCP to Neon's **pooled** endpoint, the host
+ * with `-pooler` in it, with `sslmode=verify-full` (why not `require`:
+ * `.env.example`). Only `DATABASE_URL` differs between a laptop and production.
  *
- *     -import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
- *     -import pg from "pg";
- *     +import { drizzle, type NeonDatabase } from "drizzle-orm/neon-serverless";
- *     +import { Pool } from "@neondatabase/serverless";
+ *   - TCP is available. `apps/api` is a Vercel **Node** function — the Node
+ *     runtime with Fluid Compute off (architecture.md §5), not the Edge runtime
+ *     — and a socket to port 5432 is an ordinary thing for it to open. The
+ *     WebSocket driver exists for runtimes that cannot.
+ *   - One driver keeps two measurements honest. architecture.md §7's
+ *     four-process table was measured with *this* pool and *this* `max: 1`,
+ *     and the prepared-statement argument above is about *this* driver's
+ *     named-versus-unnamed parse. Swapping drivers at the deployment boundary
+ *     would leave both true locally and merely assumed live — the opposite of
+ *     what the deployment is for.
+ *   - PgBouncer transaction mode, audited against this codebase rather than
+ *     assumed. The pooler hands the backend back at every COMMIT, so anything
+ *     that lives on a *session* — `SET`/`SET SESSION`, `search_path`,
+ *     `set_config`, advisory locks, `LISTEN`/`NOTIFY`, cursors, named prepared
+ *     statements — silently lands on the wrong backend later. The check:
  *
- * plus the `Database` alias below and the `pool` property's type. `max`,
- * `idleTimeoutMillis`, `connectionTimeoutMillis` and `application_name` carry
- * over unchanged; `Transaction` is derived from `Database`, so it follows on its
- * own. Nothing outside this file — no call site, no import of `@game-shop/db` —
- * changes, and `DATABASE_URL` moves from the Compose container to Neon's
- * **pooled** endpoint (the host with `-pooler` in it; the direct endpoint would
- * defeat the whole policy above).
+ *       grep -rnE "SET LOCAL|SET SESSION|search_path|set_config|pg_advisory|LISTEN|NOTIFY|\.prepare\(" \
+ *         apps packages scripts --include='*.ts'
  *
- * `./migrate.ts` stays on plain node-postgres over TCP on purpose and is not
- * part of this swap — see its header.
+ *     Result: `.prepare(` five times, each a comment forbidding it (this
+ *     header and its `dist/` copy, `schema/shop.ts`,
+ *     `admin/undelivered-orders.service.ts`); `LISTEN` four times, all
+ *     `LISTENER`/`LISTENS` in `apps/web` DOM-event comments — browser code,
+ *     which has no database. Re-run with `\bLISTEN\b|\bNOTIFY\b`, and for
+ *     `CURSOR|pg-cursor`: zero hits. Everything else on the list: zero. (Run
+ *     again after this header was written, the grep also matches the header
+ *     itself and its `dist/` copy — comments, by inspection.)
+ *   - `transaction()` below checks out one client for `BEGIN … COMMIT`. That is
+ *     exactly the unit the pooler pins to one backend, so every `FOR UPDATE`,
+ *     `SKIP LOCKED` and status-guarded update in a transaction reaches the
+ *     backend that holds its locks. A statement outside a transaction is
+ *     self-contained by construction — nothing here relies on the *next*
+ *     statement seeing the previous one's session.
+ *   - `application_name` survives the pooler: PgBouncer tracks it per client
+ *     and applies it to whichever backend it lends, so `pg_stat_activity`
+ *     reads keep meaning live.
+ *   - The `pg_prepared_statements` audit above does *not* survive it — the view
+ *     is session-local, and through the pooler an auditor never gets the
+ *     application's session. Run that audit locally or on the direct endpoint.
+ *   - The one `SET` that will exist: the demo reset (`apps/api/src/demo/`,
+ *     spec 006 slice 3) opens its transaction with `SET LOCAL lock_timeout`.
+ *     `SET LOCAL` is transaction-scoped — it dies at COMMIT or ROLLBACK, before
+ *     the backend goes back to the pool — so nothing leaks onto the next
+ *     borrower. A session-level `SET` in the same place would leak, which is
+ *     why the grep above lists `SET SESSION` and the demo reset must never use
+ *     it.
+ *
+ * `./migrate.ts` and the seed use the **direct** endpoint, run from an
+ * operator's machine — see `migrate.ts`'s header for why never from a build.
  */
 import { drizzle, type NodePgDatabase } from "drizzle-orm/node-postgres";
 import pg from "pg";
@@ -142,15 +178,16 @@ type Schema = typeof schema;
 /**
  * The Drizzle handle every caller works against.
  *
- * Callers name *this* type, never the driver's, so Phase 6 rewrites the right
- * hand side here and nothing else. See the header.
+ * Callers name *this* type, never the driver's, so a driver change — should one
+ * ever be needed; Phase 6 decided against one, see the header — rewrites the
+ * right-hand side here and nothing else.
  */
 export type Database = NodePgDatabase<Schema>;
 
 /**
  * The handle passed to a `transaction()` callback: the same query API as
  * `Database`, bound to the open transaction. Derived from `Database` rather
- * than named directly, so the Phase 6 swap carries it along for free.
+ * than named directly, so it follows the alias above wherever it points.
  */
 export type Transaction = Parameters<Parameters<Database["transaction"]>[0]>[0];
 
