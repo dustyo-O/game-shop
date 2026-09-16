@@ -37,6 +37,7 @@
  * ever passes one.
  */
 import { randomUUID } from "node:crypto";
+import { describeFetchError } from "./fetch-failure.ts";
 
 // ---------------------------------------------------------------------------
 // Order lifecycle — the same shape `../before-order.ts` and `../webhooks.ts`
@@ -95,7 +96,7 @@ export async function postPaidWebhook(baseUrl: string, eventId: string, orderId:
     }
     return { ok: response.ok, status: response.status, outcome, error: response.ok ? undefined : text };
   } catch (error) {
-    return { ok: false, status: 0, outcome: undefined, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, status: 0, outcome: undefined, error: describeFetchError(error) };
   }
 }
 

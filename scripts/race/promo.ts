@@ -69,6 +69,7 @@
  * in hand the reset is never called; the verify task greps for that.
  */
 import { PURCHASABLE_SKU, cleanupTestOrders, openRaceDatabase } from "./support/race-database.ts";
+import { describeFetchError } from "./support/fetch-failure.ts";
 import { collectInstanceIds, describeInstanceIds, readInstanceId, resolveRaceTargets } from "./support/race-targets.ts";
 import {
   type AdminApiResult,
@@ -162,7 +163,7 @@ async function postCreateOrder(baseUrl: string, sku: string): Promise<CreatedOrd
     const amountMinor = isJsonObject(body) && typeof body["amount_minor"] === "number" ? body["amount_minor"] : undefined;
     return { status: response.status, id, amountMinor, error: response.ok ? undefined : text };
   } catch (error: unknown) {
-    return { status: 0, id: undefined, amountMinor: undefined, error: error instanceof Error ? error.message : String(error) };
+    return { status: 0, id: undefined, amountMinor: undefined, error: describeFetchError(error) };
   }
 }
 
@@ -229,7 +230,7 @@ async function postApplyPromo(baseUrl: string, orderId: string, code: string): P
       status: 0,
       view: undefined,
       reason: undefined,
-      error: error instanceof Error ? error.message : String(error),
+      error: describeFetchError(error),
       instanceId: undefined,
     };
   }
@@ -264,7 +265,7 @@ async function postPromoCodesReset(baseUrl: string, adminToken: string): Promise
       }));
     return { ok: response.ok, status: response.status, body, text, counters };
   } catch (error: unknown) {
-    return { ok: false, status: 0, body: undefined, text: error instanceof Error ? error.message : String(error), counters: undefined };
+    return { ok: false, status: 0, body: undefined, text: describeFetchError(error), counters: undefined };
   }
 }
 

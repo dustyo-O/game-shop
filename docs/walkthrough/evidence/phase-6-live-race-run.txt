@@ -1,0 +1,285 @@
+
+> game-shop@0.0.0 race /Users/dusty/projects/test-tasks/game-shop
+> node scripts/with-env.ts node scripts/race/run-checks.ts
+
+race: external target(s) https://game-shop-ochre.vercel.app — database: none (assertions SKIP by name)
+race: nothing built, nothing spawned, nothing stopped; the target's owner supplies the instances.
+race: one target. Correct for a deployed shop, where the platform supplies the
+race: separate instances. Locally it proves nothing — see architecture.md §7.
+race: warm-up — GET https://game-shop-ochre.vercel.app/api/products → 200 in 195ms (attempt 1 of 6)
+race: ┌─ no DATABASE_URL for this run ──────────────────────────────────────────
+race: │ every database-side assertion below is reported as SKIP by name — never counted as a pass;
+race: │ orders these checks create stay on the target. Run `pnpm demo:reset` when the run ends,
+race: │ or set RACE_DEMO_RESET=1 to have this runner call POST /api/admin/demo/reset after the last check.
+race: └──────────────────────────────────────────────────────────────────────────
+
+────────────────────────────────────────────────────────────────────────
+race: harness
+────────────────────────────────────────────────────────────────────────
+race:harness — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+  PASS  https://game-shop-ochre.vercel.app serves /api/health — HTTP 200, status="ok"
+  PASS  x-instance-id header equals the body's instance_id on all 8 concurrent health answers — 8 of 8 agree
+  PASS  the 8 concurrent health answers came from at least two distinct instances — 5 distinct instance id(s) across 1 target(s)
+        A distinct id proves a distinct process, not that those processes overlapped in time.
+        K = 1 on a run means that run was not cross-process evidence, whatever the checks after it say.
+  PASS  https://game-shop-ochre.vercel.app reaches its database — GET /api/products → HTTP 200, 12 product(s)
+  SKIP  distinct backend connections — needs DATABASE_URL
+  SKIP  seeded baseline counts — needs DATABASE_URL
+        Without a database route this run cannot confirm from the database's side
+        that the targets are separate processes, nor that they overlapped; the
+        instance-id line above is the HTTP witness and no more. Locally it is the
+        one thing worth confirming, so run this through `pnpm race`.
+race:harness passed.
+
+────────────────────────────────────────────────────────────────────────
+race: before-order
+────────────────────────────────────────────────────────────────────────
+race:before-order — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:before-order — proves: architecture.md §4's out-of-order tolerance (payment_events.order_id carries no foreign key) plus the order-creation and status-poll drains that apply a pending event once its order exists. Invariant: a "paid" report delivered for order ord_race_beforeorder_d25a8d2e-2154-4def-a083-818d6167da0c before it exists is stored pending, applied once the order is created (on a DIFFERENT instance), and yields exactly one key — with no action from the shopper beyond watching the order page.
+  PASS  the early webhook (delivered before the order exists) answers 2xx — status=200, outcome=stored
+  PASS  the early webhook is acknowledged as first sight ("stored"), not a duplicate — outcome=stored
+  SKIP  the event is stored with processed_at IS NULL — needs DATABASE_URL
+  PASS  GET /api/orders/:id answers 404 before the order is created — found=false
+  PASS  creating the order (with the pre-chosen id, on a different instance) answers 201 — status=201
+  PASS  the created order's id is the one this script chose — requested=ord_race_beforeorder_d25a8d2e-2154-4def-a083-818d6167da0c, got=ord_race_beforeorder_d25a8d2e-2154-4def-a083-818d6167da0c
+  PASS  the order settles delivered, with no action beyond watching the order page — status=delivered
+  SKIP  exactly one deliveries row for the order — needs DATABASE_URL
+  SKIP  exactly one supplier_keys row claimed — needs DATABASE_URL
+  SKIP  the unclaimed supplier_keys pool moved by exactly one — needs DATABASE_URL
+  SKIP  the order row reads delivered in the database — needs DATABASE_URL
+  SKIP  the pending event is now settled (processed_at IS NOT NULL) — needs DATABASE_URL
+        Without a database route this run cannot confirm the headline claim — see the split in scripts/race/README.md, "Which assertions need database access".
+race:before-order passed.
+
+────────────────────────────────────────────────────────────────────────
+race: create-order
+────────────────────────────────────────────────────────────────────────
+race:create-order — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:create-order — proves: I1, orders.client_request_id UNIQUE + INSERT ... ON CONFLICT DO NOTHING (architecture.md §3.1). Invariant: 20 concurrent Buy attempts carrying one Idempotency-Key produce ONE order, not one per click.
+  PASS  all 20 concurrent Buy attempts answered 2xx — every response 2xx
+  PASS  all 20 responses name the same order id — 1 distinct id(s) seen: ord_01M2N0ZEV2RJCDZVHBR00KK0AW
+  INFO  response codes — 201 (this call created it): 1, 200 (this call found it): 19, of 20
+  SKIP  exactly one orders row for that client_request_id — needs DATABASE_URL
+        Without a database route this run cannot confirm the database agrees with the responses — see the split in scripts/race/README.md, "Which assertions need database access".
+  PASS  a fresh Idempotency-Key still creates a NEW order (201, not a merge into the shared one) — status=201
+  PASS  the fresh-key order is a different id from the shared-key order — fresh=ord_01M2N0ZF298CADT0MWC1W5PPNN, shared=ord_01M2N0ZEV2RJCDZVHBR00KK0AW
+race:create-order passed.
+
+────────────────────────────────────────────────────────────────────────
+race: promo
+────────────────────────────────────────────────────────────────────────
+race:promo — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:promo — proves: I7, one conditional UPDATE ... WHERE used_count < max_uses decides the limit (architecture.md §3.1), and I8's ledger row names who got it. Invariant: of N simultaneous applications of a code capped at K, exactly K answer 200, the rest 409 exhausted, none 5xx — and the database says the same three things.
+
+  LIMIT3 — max_uses 3, 20 simultaneous applications on 20 fresh orders across 1 instance(s): expect 3 × 200, 17 × 409 exhausted, 0 × 5xx
+  PASS  all 20 orders created (201) — 20 order(s)
+  PASS  every order starts at the list price 129000 — yes
+  INFO  response shape — 200: 3, 409 exhausted: 17
+  INFO  answers came from 18 distinct instance(s) — 20 answer(s)
+  PASS  exactly 3 × 200 — the cap's worth, no more — 3 × 200
+  PASS  exactly 17 × 409 exhausted — every other shopper told no, in words — 17 × 409 exhausted
+  PASS  zero 5xx — a guard weakened to an unconditional increment trips the CHECK as 500s while the counter still reads the cap (R2) — none
+  PASS  no other status at all — 200 and 409 exhausted are the only two answers this race admits — none
+  PASS  every 200 carries promo { code: LIMIT3, discount_minor: 32250, list_amount_minor: 129000 } and amount_minor 96750 on the order it was asked on — 3 view(s) agree
+  PASS  the 200s name distinct orders — one use per order, never two on one — 3 distinct of 3
+  SKIP  used_count = 3 for LIMIT3; 3 promo_redemptions row(s) matching the 200s; the winners repriced and the rest at the list price — needs DATABASE_URL
+
+  ONCEONLY — max_uses 1, 10 simultaneous applications on 10 fresh orders across 1 instance(s): expect 1 × 200, 9 × 409 exhausted, 0 × 5xx
+  PASS  all 10 orders created (201) — 10 order(s)
+  PASS  every order starts at the list price 129000 — yes
+  INFO  response shape — 200: 1, 409 exhausted: 9
+  INFO  answers came from 10 distinct instance(s) — 10 answer(s)
+  PASS  exactly 1 × 200 — the cap's worth, no more — 1 × 200
+  PASS  exactly 9 × 409 exhausted — every other shopper told no, in words — 9 × 409 exhausted
+  PASS  zero 5xx — a guard weakened to an unconditional increment trips the CHECK as 500s while the counter still reads the cap (R2) — none
+  PASS  no other status at all — 200 and 409 exhausted are the only two answers this race admits — none
+  PASS  every 200 carries promo { code: ONCEONLY, discount_minor: 64500, list_amount_minor: 129000 } and amount_minor 64500 on the order it was asked on — 1 view(s) agree
+  PASS  the 200s name distinct orders — one use per order, never two on one — 1 distinct of 1
+  SKIP  used_count = 1 for ONCEONLY; 1 promo_redemptions row(s) matching the 200s; the winners repriced and the rest at the list price — needs DATABASE_URL
+  PASS  the admin reset answered 200 with every used_count at 0 — WELCOME10=0, GG500=0, LIMIT3=0, ONCEONLY=0
+  INFO  counters reset through the admin endpoint; the ledger keeps the rows — a database was not reachable to clean up
+race:promo passed.
+
+────────────────────────────────────────────────────────────────────────
+race: recover-out-of-stock
+────────────────────────────────────────────────────────────────────────
+race:recover-out-of-stock — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:recover-out-of-stock — proves: an empty pool settles out_of_stock with exactly two wasted refusals (R12), never a lost order; restocking plus an operator retry reuses the identical claim, lock and ladder the automatic path takes (no admin-only path into issuance); the retry mints a THIRD attempt row rather than reusing a settled one (R7); and stock accounting holds at each settle point — technical-considerations §12, §2.3, §11 R7/R12. The pool is emptied and refilled through POST /internal/suppliers/keys/{drain,restock}, always.
+  INFO  no DATABASE_URL — the HTTP spine below (drain, out_of_stock, restock, retry, delivered) is asserted for real; each database-side assertion is reported as SKIP by name and never counted as a pass.
+  PASS  provider a reset to the seeded baseline before this run — status=200
+  PASS  provider b reset to the seeded baseline before this run — status=200
+  PASS  POST /internal/suppliers/keys/drain { token } answers 200 — status=200, body={"token":"race-recover-oos-3218e79c-7a72-4db0-9339-ab6f71bc4813","claimed":49}
+  PASS  the drain echoes this run's own token — token=race-recover-oos-3218e79c-7a72-4db0-9339-ab6f71bc4813
+  PASS  the drain claimed at least one key — the pool was not already empty when this run started — claimed=49
+  SKIP  the drain took the whole unclaimed pool — claimed equals the unclaimed count read before it — needs DATABASE_URL
+  SKIP  the pool reads empty before paying — needs DATABASE_URL
+  order ord_01M2N0ZGVJB7ES4SGC9ZYV6BW5 created against a drained pool on one instance; paying it on another
+  PASS  the paid webhook answers 2xx — status=200
+  PASS  the paid webhook is acknowledged as first sight ("stored") — outcome=stored
+  PASS  the order settles out_of_stock against the drained pool — status=out_of_stock
+  SKIP  exactly two attempt rows against the drained pool (a/1, b/2 — R12's one wasted fall-through) — needs DATABASE_URL
+  SKIP  a/1 reads failed with last_error out_of_stock — needs DATABASE_URL
+  SKIP  b/2 reads failed with last_error out_of_stock — the wasted fall-through R12 predicts, not a second bug — needs DATABASE_URL
+  SKIP  zero deliveries for the order while out of stock — needs DATABASE_URL
+  SKIP  stock accounting holds at the FIRST settle point — this order's claimed keys (0) == this order's deliveries (0); a refusal claims nothing — needs DATABASE_URL
+  SKIP  no supplier_requests rows for either refusal — an out_of_stock answer writes no ledger entry — needs DATABASE_URL
+  PASS  POST /internal/suppliers/keys/restock { token } answers 200 — status=200, body={"released":49}
+  PASS  the restock released exactly the keys this run's drain claimed (released == claimed) — released=49, claimed=49
+  SKIP  the pool is restocked to its full starting size — needs DATABASE_URL
+  PASS  POST .../retry answers 200 — status=200, body={"outcome":"delivered","order_id":"ord_01M2N0ZGVJB7ES4SGC9ZYV6BW5","status":"delivered","provider":"a","request_id":"req_ord_01M2N0ZGVJB7ES4SGC9ZYV6BW5_a_3","outstanding_request_id":null,"detail":"supplier a issued a key for this order","delivered":true}
+  PASS  the retry report says delivered: true — {"outcome":"delivered","order_id":"ord_01M2N0ZGVJB7ES4SGC9ZYV6BW5","status":"delivered","provider":"a","request_id":"req_ord_01M2N0ZGVJB7ES4SGC9ZYV6BW5_a_3","outstanding_request_id":null,"detail":"supplier a issued a key for this order","delivered":true}
+  PASS  the order settles delivered after the retry — status=delivered
+  SKIP  exactly THREE attempt rows after the retry (a/1, b/2, a/3) — the retry minted a new one rather than reusing a/1 (R7) — needs DATABASE_URL
+  SKIP  a/3 reads ok, provider a, attempt 3 — never a reused a/1 or b/2 — needs DATABASE_URL
+  SKIP  exactly one deliveries row for the order after the retry — needs DATABASE_URL
+  SKIP  stock accounting holds at the SECOND settle point — this order's claimed keys (1, all under a/3) == this order's deliveries (1) — needs DATABASE_URL
+  SKIP  exactly one supplier_requests row for a/3, against provider a — needs DATABASE_URL
+  PASS  a further retry on the now-delivered order answers 409 (not stuck) rather than doing anything — status=409
+  SKIP  still exactly three attempt rows — the refused retry changed nothing — needs DATABASE_URL
+  INFO  finally: POST /internal/suppliers/keys/restock { token } — status=200, released=0 (0 when the deliberate restock already ran)
+  INFO  order ord_01M2N0ZGVJB7ES4SGC9ZYV6BW5 stays on the target — no DATABASE_URL, so the harness's cleanup cannot run; `pnpm demo:reset` (or the runner's RACE_DEMO_RESET=1) is the deployed shop's cleanup.
+race:recover-out-of-stock passed.
+
+────────────────────────────────────────────────────────────────────────
+race: recover-refusal
+────────────────────────────────────────────────────────────────────────
+race:recover-refusal — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:recover-refusal — proves: a definite refusal from supplier A falls through to B with a new request id (the ladder's fallThrough rung), the shopper still gets exactly one key, and stock accounting (claimed keys == deliveries) holds throughout — technical-considerations §12, functional spec §2.1 and §2.7.
+  PASS  provider a reset to the seeded baseline before arming — status=200
+  PASS  provider b reset to the seeded baseline before arming — status=200
+  SKIP  stock accounting before this run — needs DATABASE_URL
+  PASS  arming A's one-shot refusal (fail_next: 1) answers 200 — status=200
+  PASS  the stored row echoes fail_next: 1 with every other field at baseline — {"provider":"a","failure_rate":0,"hang_rate":0,"hang_ms":0,"fail_next":1,"hang_next":0,"hang_before_claim":false,"updated_at":"2026-09-16T11:52:36.774Z"}
+  order ord_01M2N0ZJQ3GDBJEN2RE3D7XXV8 created on a fresh instance; paying it on another
+  PASS  the paid webhook answers 2xx — status=200
+  PASS  the paid webhook is acknowledged as first sight ("stored") — outcome=stored
+  PASS  the order settles delivered despite A's refusal — status=delivered
+  SKIP  every database assertion below — needs DATABASE_URL
+race:recover-refusal passed.
+
+────────────────────────────────────────────────────────────────────────
+race: recover-timeout
+────────────────────────────────────────────────────────────────────────
+race:recover-timeout — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:recover-timeout — proves: a hang placed AFTER the key claim commits produces an 'unknown' attempt, never 'failed'; the ladder re-probes the SAME supplier under the SAME request id inside one invocation (technical-considerations §1.4); B is never asked; and stock accounting holds — technical-considerations §12, §2.2, §7.1, §11 R1/R2.
+  supplier timeout 5000 ms (from target /api/health)
+  PASS  provider a reset to the seeded baseline before arming — status=200
+  PASS  provider b reset to the seeded baseline before arming — status=200
+  SKIP  stock accounting before this run — needs DATABASE_URL
+  PASS  arming A's one-shot hang (hang_next: 1, hang_ms: 6500) answers 200 — status=200
+  PASS  the stored row echoes the exact hang armed, placed AFTER the claim, with no refusal armed alongside it — {"provider":"a","failure_rate":0,"hang_rate":0,"hang_ms":6500,"fail_next":0,"hang_next":1,"hang_before_claim":false,"updated_at":"2026-09-16T11:52:37.983Z"}
+  order ord_01M2N0ZKX0CK7TT1Y57P8RAF05 created on a fresh instance; paying it on another — the walk will hang 6500ms, past the target's supplier timeout of 5000ms, before it resolves
+  PASS  the paid webhook answers 2xx immediately (the hang is scheduled work, not this request) — status=200
+  PASS  the paid webhook is acknowledged as first sight ("stored") — outcome=stored
+  PASS  the order settles delivered — the re-probe found A's own ledger already held a code — status=delivered
+  SKIP  every database assertion below — needs DATABASE_URL
+race:recover-timeout passed.
+
+────────────────────────────────────────────────────────────────────────
+race: same-event
+────────────────────────────────────────────────────────────────────────
+race:same-event — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:same-event — proves: I2, payment_events.event_id PRIMARY KEY + INSERT ... ON CONFLICT (event_id) DO NOTHING (architecture.md §3.1). Distinct from race:webhooks: that check fires many DIFFERENT reports of one payment; this one fires ONE report delivered 20 times concurrently — the shape a provider's at-least-once retry produces when it never hears our 200 back. Invariant: redelivery is a no-op, never a second issuance.
+  order ord_01M2N0ZSE1HK8NNPZAM0GXP5D8 created; delivering event evt_race_same_event_ord_01M2N0ZSE1HK8NNPZAM0GXP5D8_28def3bf-a146-4458-854b-cf8cb8d0784d 20 times concurrently
+  INFO  answers came from 9 distinct instance(s) — 20 answer(s)
+  PASS  all 20 concurrent redeliveries answered 2xx — every response 2xx
+  PASS  exactly one of the concurrent copies was stored as first sight; every other one was acknowledged as a duplicate — stored=1, duplicate=19, unrecognised=0
+  PASS  the order settles delivered — status=delivered
+  SKIP  exactly one payment_events row for this event_id — needs DATABASE_URL
+  SKIP  exactly one deliveries row for the order — needs DATABASE_URL
+  SKIP  exactly one supplier_keys row claimed — needs DATABASE_URL
+  SKIP  unclaimed supplier_keys pool moved by exactly one — needs DATABASE_URL
+  SKIP  the order row reads delivered in the database — needs DATABASE_URL
+        Without a database route this run cannot confirm storage was race-safe — see the split in scripts/race/README.md, "Which assertions need database access".
+race:same-event passed.
+
+────────────────────────────────────────────────────────────────────────
+race: webhooks
+────────────────────────────────────────────────────────────────────────
+race:webhooks — 1 instance: https://game-shop-ochre.vercel.app
+  WARNING: 1 instance. This run CANNOT prove a race against a local target.
+  packages/db pins the pool to max: 1, so concurrent requests to one process
+  serialise in Node before Postgres sees them, and a shop with no locking at
+  all passes (architecture.md §7: 20 distinct keys across 1 process, 9 across 4).
+  This is correct ONLY against a deployed target, where the platform supplies
+  the separate instances. Locally, run `pnpm race` instead.
+race:webhooks — proves: I4, SELECT ... FOR UPDATE on the order row plus the status-guarded paid -> delivering UPDATE (architecture.md §3.1). Invariant: 50 DISTINCT simultaneous reports of one payment still leave exactly one key claimed.
+  order ord_01M2N0ZT8F2AN1RHJT3KCX5DF7 created; delivering 50 distinct "paid" reports for it at once
+  PASS  50 distinct event_ids minted for this run — 50 distinct of 50
+  INFO  answers came from 30 distinct instance(s) — 50 answer(s)
+  PASS  every one of the 50 webhook responses is 2xx — every response 2xx
+  PASS  all 50 reports were acknowledged as first sight ("stored") — 50 of 50 — I2 must not treat a distinct event_id as a duplicate
+  PASS  the order settles delivered — status=delivered
+  SKIP  exactly one deliveries row for the order — needs DATABASE_URL
+  SKIP  exactly one supplier_keys row claimed — needs DATABASE_URL
+  SKIP  unclaimed supplier_keys pool moved by exactly one — needs DATABASE_URL
+  SKIP  the order row reads delivered in the database — needs DATABASE_URL
+        Without a database route this run cannot confirm the headline claim — see the split in scripts/race/README.md, "Which assertions need database access".
+race:webhooks passed.
+
+race: RACE_DEMO_RESET — POST https://game-shop-ochre.vercel.app/api/admin/demo/reset
+race:   removed  orders 38 · deliveries 6 · issuance_attempts 9 · promo_redemptions 4 · payment_events 55 · supplier_requests 6
+race:   reset    promo_codes 0 · supplier_keys 6 · supplier_behaviour 1
+race:   now      products 12 · keys_total 50 · keys_unclaimed 50 · orders 0 · payment_events 0 · deliveries 0 · issuance_attempts 0 · supplier_requests 0 · promo_codes 4 · promo_used_count 0 · promo_redemptions 0 · supplier_behaviour_baseline 2
+
+════════════════════════════════════════════════════════════════════════
+race: summary
+════════════════════════════════════════════════════════════════════════
+  PASS  harness                  passed (782ms)
+  PASS  before-order             passed (1108ms)
+  PASS  create-order             passed (992ms)
+  PASS  promo                    passed (1060ms)
+  PASS  recover-out-of-stock     passed (1919ms)
+  PASS  recover-refusal          passed (1158ms)
+  PASS  recover-timeout          passed (6005ms)
+  PASS  same-event               passed (843ms)
+  PASS  webhooks                 passed (1539ms)
+race: 9/9 passed against 1 instance(s).

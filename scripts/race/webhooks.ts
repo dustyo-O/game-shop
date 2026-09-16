@@ -64,6 +64,7 @@
 import { randomUUID } from "node:crypto";
 
 import { PURCHASABLE_SKU, cleanupTestOrders, deriveTestRequestId, openRaceDatabase } from "./support/race-database.ts";
+import { describeFetchError } from "./support/fetch-failure.ts";
 import { collectInstanceIds, describeInstanceIds, readInstanceId, resolveRaceTargets } from "./support/race-targets.ts";
 
 const targets = resolveRaceTargets();
@@ -157,7 +158,7 @@ async function postPaidWebhook(baseUrl: string, eventId: string, orderId: string
       ok: false,
       status: 0,
       outcome: undefined,
-      error: error instanceof Error ? error.message : String(error),
+      error: describeFetchError(error),
       instanceId: undefined,
     };
   }

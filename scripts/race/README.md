@@ -322,7 +322,7 @@ pool that had just been refilled, with no supplier call made.
 
 ## The interface, for someone writing a check
 
-Two modules, both in `scripts/race/support/`. Read their headers — they carry
+Three modules, all in `scripts/race/support/`. Read their headers — they carry
 the detail; this is the map.
 
 ### Targets — `support/race-targets.ts`
@@ -407,6 +407,27 @@ It re-exports the Vitest concurrency suite's database helpers unchanged —
 `requireRaceDatabase(role, assertions)` is the variant for a check with no
 meaningful HTTP-only half: it throws, naming the assertions that were lost,
 instead of returning `undefined`.
+
+### A `fetch` that threw — `support/fetch-failure.ts`
+
+```ts
+import { describeFetchError } from "./support/fetch-failure.ts";
+
+} catch (error: unknown) {
+  return { ok: false, status: 0, ..., error: describeFetchError(error) };
+}
+```
+
+Every never-throwing HTTP helper in a check records a transport failure as a
+`status: 0` result, and the string it records is this. Node's `fetch` reports
+every such failure as `TypeError: fetch failed` and puts the reason one level
+down on `cause` — `ECONNRESET`, `UND_ERR_SOCKET`, `ETIMEDOUT` — so
+`error.message` alone loses the only part worth reading. The helper appends
+`(cause: <code ?? name>: <message>)` per level, four deep at most:
+
+```
+fetch failed (cause: ECONNREFUSED: connect ECONNREFUSED 127.0.0.1:65500)
+```
 
 ### Which assertions need database access
 

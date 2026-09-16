@@ -53,6 +53,7 @@ import {
   openRaceDatabase,
   readBaselineCounts,
 } from "./support/race-database.ts";
+import { describeFetchError } from "./support/fetch-failure.ts";
 import {
   collectInstanceIds,
   INSTANCE_ID_HEADER,
@@ -95,7 +96,7 @@ for (const baseUrl of targets.baseUrls) {
       `HTTP ${String(response.status)}, status=${JSON.stringify(status)}`,
     );
   } catch (error) {
-    record(false, `${baseUrl} serves /api/health`, error instanceof Error ? error.message : String(error));
+    record(false, `${baseUrl} serves /api/health`, describeFetchError(error));
   }
 }
 
@@ -120,7 +121,7 @@ async function fetchHealth(baseUrl: string): Promise<HealthAnswer> {
       error: undefined,
     };
   } catch (error: unknown) {
-    return { response: undefined, bodyInstanceId: undefined, error: error instanceof Error ? error.message : String(error) };
+    return { response: undefined, bodyInstanceId: undefined, error: describeFetchError(error) };
   }
 }
 
@@ -131,9 +132,12 @@ const healthAnswers = await Promise.all(
 
 // Header and body must agree on every answer: the header is what every other
 // check reads, the body is what a person reads, and a mismatch would mean one
-// of them is not this process's id.
-const disagreeing = healthAnswers.filter(
-  (answer) => answer.response === undefined || readInstanceId(answer.response) !== answer.bodyInstanceId,
+// of them is not this process's id. A request that never got an answer is a
+// failure too — a transport error is not agreement — and the detail names
+// which request (`i`, the same `i` as `targets.at(i)`, so a re-run sends it to
+// the same instance) and the cause undici nested under `fetch failed`.
+const disagreeing = healthAnswers.flatMap((answer, index) =>
+  answer.response === undefined || readInstanceId(answer.response) !== answer.bodyInstanceId ? [{ index, answer }] : [],
 );
 record(
   disagreeing.length === 0,
@@ -142,10 +146,10 @@ record(
     ? `${String(witnessRequestCount)} of ${String(witnessRequestCount)} agree`
     : disagreeing
         .slice(0, 3)
-        .map((answer) =>
+        .map(({ index, answer }) =>
           answer.response === undefined
-            ? `fetch failed: ${answer.error ?? "unknown"}`
-            : `header=${String(readInstanceId(answer.response))} body=${String(answer.bodyInstanceId)}`,
+            ? `request #${String(index)} → ${targets.at(index)}: ${answer.error ?? "fetch failed"}`
+            : `request #${String(index)} → ${targets.at(index)}: header=${String(readInstanceId(answer.response))} body=${String(answer.bodyInstanceId)}`,
         )
         .join("; ") + (disagreeing.length > 3 ? "; …" : ""),
 );
@@ -192,7 +196,7 @@ for (const baseUrl of targets.baseUrls) {
       `GET /api/products → HTTP ${String(response.status)}, ${String(count)} product(s)`,
     );
   } catch (error) {
-    record(false, `${baseUrl} reaches its database`, error instanceof Error ? error.message : String(error));
+    record(false, `${baseUrl} reaches its database`, describeFetchError(error));
   }
 }
 

@@ -49,6 +49,7 @@
  * same two situations.
  */
 import { parseRaceBaseUrls, RACE_BASE_URLS_ENV } from "./race/support/race-targets.ts";
+import { describeFetchError } from "./race/support/fetch-failure.ts";
 import { describeMissingAdminAffordance, readAdminToken } from "./race/support/recovery-scenario.ts";
 
 const EXIT_REFUSED = 1;
@@ -176,8 +177,7 @@ try {
     headers: { authorization: `Bearer ${adminToken}` },
   });
 } catch (error: unknown) {
-  const reason = error instanceof Error ? (error.cause instanceof Error ? error.cause.message : error.message) : String(error);
-  console.error(`demo:reset: could not reach ${target}: ${reason}`);
+  console.error(`demo:reset: could not reach ${target}: ${describeFetchError(error)}`);
   process.exit(EXIT_REFUSED);
 }
 

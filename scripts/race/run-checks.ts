@@ -139,6 +139,7 @@ import {
   stopAllApiInstances,
 } from "../../apps/api/test/concurrency/support/api-instance.ts";
 import { RACE_BASE_URLS_ENV, RACE_MODE_ENV, parseRaceBaseUrls } from "./support/race-targets.ts";
+import { describeFetchError } from "./support/fetch-failure.ts";
 import { openRaceDatabase } from "./support/race-database.ts";
 import {
   describeMissingAdminAffordance,
@@ -388,8 +389,7 @@ async function warmUpTarget(baseUrl: string): Promise<void> {
       }
       outcome = `HTTP ${String(response.status)} in ${String(elapsedMs)}ms`;
     } catch (error: unknown) {
-      const reason = error instanceof Error ? (error.cause instanceof Error ? error.cause.message : error.message) : String(error);
-      outcome = `${reason} after ${String(Date.now() - startedAt)}ms`;
+      outcome = `${describeFetchError(error)} after ${String(Date.now() - startedAt)}ms`;
     }
     console.log(
       `race: warm-up — GET ${baseUrl}/api/products → ${outcome} (attempt ${String(attempt)} of ${String(WARM_UP_ATTEMPTS)})` +
@@ -456,7 +456,7 @@ async function resetDemoAfterRun(mode: RaceMode, baseUrl: string): Promise<boole
   try {
     result = await postDemoReset(baseUrl, adminToken);
   } catch (error: unknown) {
-    console.error(`race: RACE_DEMO_RESET — could not reach the target: ${error instanceof Error ? error.message : String(error)}`);
+    console.error(`race: RACE_DEMO_RESET — could not reach the target: ${describeFetchError(error)}`);
     return false;
   }
   if (isMissingAdminAffordance(result)) {

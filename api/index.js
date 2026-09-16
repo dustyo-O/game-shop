@@ -80,10 +80,13 @@
  *                           `/api/whatever` is Nest's JSON 404 and never a
  *                           200 HTML page.
  *
- * Not in `vercel.json`, because they are not keys: Fluid Compute is OFF (a
- * dashboard toggle — concurrent requests must land in separate processes, or
- * the live race proves nothing about Postgres), Node is 22.x (resolved from
- * the root `engines.node`, the version everything was measured on), and
+ * Not in `vercel.json`, because they are not keys: Fluid Compute is OFF (on
+ * by default for a new project; a project setting — `resourceConfig.fluid`
+ * through the API, or the dashboard — because concurrent requests must land
+ * in separate processes, or the live race proves nothing about Postgres),
+ * Node is 22.x (the project setting, pinned in the same API call, and what
+ * the root `engines.node` range admits — the version everything was measured
+ * on), and
  * `NODE_ENV` is never set as a project variable (it would drop the
  * devDependencies the build runs on: `typescript`, `vite`, `@nestjs/cli`).
  */

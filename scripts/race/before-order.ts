@@ -85,6 +85,7 @@
 import { randomUUID } from "node:crypto";
 
 import { PURCHASABLE_SKU, cleanupTestOrders, deriveTestRequestId, openRaceDatabase } from "./support/race-database.ts";
+import { describeFetchError } from "./support/fetch-failure.ts";
 import { resolveRaceTargets } from "./support/race-targets.ts";
 
 const targets = resolveRaceTargets();
@@ -150,7 +151,7 @@ async function postPaidWebhook(baseUrl: string): Promise<WebhookResult> {
     }
     return { ok: response.ok, status: response.status, outcome, error: response.ok ? undefined : text };
   } catch (error) {
-    return { ok: false, status: 0, outcome: undefined, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, status: 0, outcome: undefined, error: describeFetchError(error) };
   }
 }
 
@@ -185,7 +186,7 @@ async function createOrderWithId(baseUrl: string): Promise<CreateOrderResult> {
     }
     return { ok: response.ok, status: response.status, id, error: response.ok ? undefined : text };
   } catch (error) {
-    return { ok: false, status: 0, id: undefined, error: error instanceof Error ? error.message : String(error) };
+    return { ok: false, status: 0, id: undefined, error: describeFetchError(error) };
   }
 }
 
