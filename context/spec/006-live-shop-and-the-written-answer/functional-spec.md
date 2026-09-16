@@ -26,12 +26,12 @@ The whole shop — the storefront, the order page, the operator's view, and the 
 
 - **As a** reviewer, **I want to** open the shop in my browser from a link, **so that** I can see it work without cloning or installing anything.
   - **Acceptance Criteria:**
-    - [ ] When the reviewer opens the live address, then the storefront appears with its five interactions working exactly as they do locally.
-    - [ ] When the reviewer presses «Купить» on a product card at the live address, then they land on that order's page at the same address, showing the product, the amount, and «Ожидает оплаты».
-    - [ ] Given an order awaiting payment on the live shop, when the reviewer presses «Оплатить успешно», then within 15 seconds the page shows «Ключ выдан» and a key.
-    - [ ] Given an order awaiting payment on the live shop, when the reviewer applies `LIMIT3`, then the amount to pay becomes a quarter less, exactly as it does locally.
-    - [ ] Given the operator's demo token from the README, when the reviewer opens the operator's view at the live address, then the list of paid-but-undelivered orders and the retry action work as they do locally.
-    - [ ] When the reviewer returns to the live address the next day, then the same orders and keys are still there — the shop's memory is the hosted database, not the process that served the last request.
+    - [x] When the reviewer opens the live address, then the storefront appears with its five interactions working exactly as they do locally.
+    - [x] When the reviewer presses «Купить» on a product card at the live address, then they land on that order's page at the same address, showing the product, the amount, and «Ожидает оплаты».
+    - [x] Given an order awaiting payment on the live shop, when the reviewer presses «Оплатить успешно», then within 15 seconds the page shows «Ключ выдан» and a key.
+    - [x] Given an order awaiting payment on the live shop, when the reviewer applies `LIMIT3`, then the amount to pay becomes a quarter less, exactly as it does locally.
+    - [x] Given the operator's demo token from the README, when the reviewer opens the operator's view at the live address, then the list of paid-but-undelivered orders and the retry action work as they do locally.
+    - [x] When the reviewer returns to the live address the next day, then the same orders and keys are still there — the shop's memory is the hosted database, not the process that served the last request.
 
 ### 2.2 The checks run against the live shop, and the result is on record
 
@@ -39,10 +39,10 @@ The shop's own adversarial checks accept the live address as their target. Point
 
 - **As a** reviewer, **I want to** run the shop's checks against the live address with one command, **so that** I can see the five scenarios hold on a system where no two requests share a process.
   - **Acceptance Criteria:**
-    - [ ] Given the reviewer has the repository and the live address, when they run the checks with the address as the target, then every check runs, reports pass or fail, and the run ends with a one-line summary of how many passed.
-    - [ ] When a check cannot verify something because it has no access to the live database, then it says so by name in its output rather than passing silently or failing.
-    - [ ] When the reviewer runs the checks against the live address twice in a row, then the second run reports the same verdicts as the first, with no manual tidying in between.
-    - [ ] When the reviewer reads the README, then they find the author's own run of the checks against the live address — the command, the date, and the output — and the sentence explaining why passing there is evidence that the guarantees do not depend on a single running process.
+    - [x] Given the reviewer has the repository and the live address, when they run the checks with the address as the target, then every check runs, reports pass or fail, and the run ends with a one-line summary of how many passed.
+    - [x] When a check cannot verify something because it has no access to the live database, then it says so by name in its output rather than passing silently or failing.
+    - [x] When the reviewer runs the checks against the live address twice in a row, then the second run reports the same verdicts as the first, with no manual tidying in between.
+    - [x] When the reviewer reads the README, then they find the author's own run of the checks against the live address — the command, the date, and the output — and the sentence explaining why passing there is evidence that the guarantees do not depend on a single running process.
 
 ### 2.3 The demo can be reset
 
@@ -50,10 +50,10 @@ The live shop starts with a fixed supply of keys, and every purchase and every c
 
 - **As the** operator of the demo, **I want** one action that restores the live shop to its starting state, **so that** every reviewer, and every repeated check run, starts from the same shop.
   - **Acceptance Criteria:**
-    - [ ] Given the live shop has sold keys, spent promo uses, and holds test orders, when the operator performs the reset action named in the README, then the storefront shows the full catalogue, all keys are back in stock, every promo code can be used its full number of times again, and the test orders are gone.
-    - [ ] When the operator performs the reset action twice in a row, then the second run changes nothing and reports that.
-    - [ ] When a shopper or reviewer without the operator's token attempts the reset, then it is refused and the shop is unchanged.
-    - [ ] When the reset has run, then the checks pointed at the live address pass in full again — including the out-of-stock recovery scenario, which needs keys to be available.
+    - [x] Given the live shop has sold keys, spent promo uses, and holds test orders, when the operator performs the reset action named in the README, then the storefront shows the full catalogue, all keys are back in stock, every promo code can be used its full number of times again, and the test orders are gone.
+    - [x] When the operator performs the reset action twice in a row, then the second run changes nothing and reports that.
+    - [x] When a shopper or reviewer without the operator's token attempts the reset, then it is refused and the shop is unchanged.
+    - [x] When the reset has run, then the checks pointed at the live address pass in full again — including the out-of-stock recovery scenario, which needs keys to be available.
 
 ### 2.4 The written answer
 
@@ -72,14 +72,14 @@ It contains, in this order or close to it:
 
 - **As a** reviewer, **I want** one document that answers the assignment's questions in the order the assignment asks them, **so that** I can evaluate the submission without hunting.
   - **Acceptance Criteria:**
-    - [ ] When a reviewer with a clean machine follows the README's local startup section step by step, then they reach a working shop in their browser without needing any instruction the README does not give.
-    - [ ] When the reviewer follows the README's "reproduce the race checks" section locally, then all nine checks run and pass on their machine with the commands as written.
-    - [ ] When the reviewer reads the single-issuance explanation, then it is at most a short paragraph, names the mechanism in plain words, and links to the fuller account.
-    - [ ] When the reviewer looks for any of the assignment's five required items — live link or startup, sources, race reproduction, single-issuance explanation, time spent — then each has its own heading in the README.
-    - [ ] When the reviewer reads the decisions section, then every decision is paired with what it cost or what it excluded — no decision is presented as free.
-    - [ ] When the reviewer reads the two maps, then every one of the five scenarios and every one of the five interactions points at something they can run by name.
-    - [ ] When the reviewer reads the README, then everything in it is in Russian, except commands, addresses, file names, and the codes and messages quoted exactly as the shop shows them.
-    - [ ] When the reviewer opens any address or file the README refers to, then it exists.
+    - [x] When a reviewer with a clean machine follows the README's local startup section step by step, then they reach a working shop in their browser without needing any instruction the README does not give.
+    - [x] When the reviewer follows the README's "reproduce the race checks" section locally, then all nine checks run and pass on their machine with the commands as written.
+    - [x] When the reviewer reads the single-issuance explanation, then it is at most a short paragraph, names the mechanism in plain words, and links to the fuller account.
+    - [x] When the reviewer looks for any of the assignment's five required items — live link or startup, sources, race reproduction, single-issuance explanation, time spent — then each has its own heading in the README.
+    - [x] When the reviewer reads the decisions section, then every decision is paired with what it cost or what it excluded — no decision is presented as free.
+    - [x] When the reviewer reads the two maps, then every one of the five scenarios and every one of the five interactions points at something they can run by name.
+    - [x] When the reviewer reads the README, then everything in it is in Russian, except commands, addresses, file names, and the codes and messages quoted exactly as the shop shows them.
+    - [x] When the reviewer opens any address or file the README refers to, then it exists.
 
 ### 2.5 Actual time spent, honestly
 
@@ -87,9 +87,9 @@ The assignment asks for the actual time spent. The figure is derived from the re
 
 - **As the** author, **I want** the reported time to be reconstructed from evidence and confirmed by me, **so that** the number in the README is honest rather than remembered.
   - **Acceptance Criteria:**
-    - [ ] When the time figure is first produced, then it is presented to the author as a per-phase table with the sources it was derived from, and nothing is published until the author confirms or corrects it.
-    - [ ] When the reviewer reads the time section, then they see a per-phase breakdown, a total, and one sentence on how it was measured and what it excludes.
-    - [ ] When the roadmap's original estimates are compared to the reported figures, then the README shows both side by side rather than only the estimate.
+    - [x] When the time figure is first produced, then it is presented to the author as a per-phase table with the sources it was derived from, and nothing is published until the author confirms or corrects it.
+    - [x] When the reviewer reads the time section, then they see a per-phase breakdown, a total, and one sentence on how it was measured and what it excludes.
+    - [x] When the roadmap's original estimates are compared to the reported figures, then the README shows both side by side rather than only the estimate.
 
 ### 2.6 Sources published
 
@@ -97,16 +97,16 @@ The repository is published publicly. The README's repository link resolves; the
 
 - **As a** reviewer, **I want** the sources at a public address, **so that** I can read and run them without asking for access.
   - **Acceptance Criteria:**
-    - [ ] When the reviewer opens the repository address from the README, then the repository opens without signing in and its README is the same document.
-    - [ ] When the reviewer clones the repository and follows the README, then nothing is missing that the README relies on — no file that exists only on the author's machine.
-    - [ ] When the repository is searched for credentials, then the only token in it is the demo operator token, and the README says why it is there.
+    - [x] When the reviewer opens the repository address from the README, then the repository opens without signing in and its README is the same document.
+    - [x] When the reviewer clones the repository and follows the README, then nothing is missing that the README relies on — no file that exists only on the author's machine.
+    - [x] When the repository is searched for credentials, then the only token in it is the demo operator token, and the README says why it is there.
 
 ### 2.7 Understanding what was deployed
 
 - **As the** author preparing to present this work, **I want** a written walkthrough of what it took to put the shop on a public address and what the live run showed, **so that** I can explain it unaided when questioned.
   - **Acceptance Criteria:**
-    - [ ] When this phase is finished, then a written walkthrough accompanies it that explains, in plain language, why running each request in a separate process strengthens the single-issuance claim, what had to change for the shop to run that way, and what the recorded live run showed.
-    - [ ] When someone who has never seen the source reads the walkthrough, then they can follow every entry without opening the code.
+    - [x] When this phase is finished, then a written walkthrough accompanies it that explains, in plain language, why running each request in a separate process strengthens the single-issuance claim, what had to change for the shop to run that way, and what the recorded live run showed.
+    - [x] When someone who has never seen the source reads the walkthrough, then they can follow every entry without opening the code.
 
 ---
 
