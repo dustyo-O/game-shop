@@ -8,8 +8,10 @@
  * matching `./migrate.ts`:
  *
  *   - reads `DATABASE_URL` from the environment; it does **not** load `.env` —
- *     `scripts/with-env.ts` has already assembled the environment, and on
- *     Vercel/Neon the platform supplies it;
+ *     `scripts/with-env.ts` has already assembled the environment, and
+ *     against Neon the operator exports it for the one command
+ *     (`DATABASE_URL=<neon-direct> pnpm db:deploy` — this script never runs
+ *     on Vercel);
  *   - runs with cwd = `packages/db`, but depends on nothing in the working
  *     directory (the data is imported, not read from disk);
  *   - **is safe to run twice.** `pnpm db:setup` runs migrate-then-seed on every

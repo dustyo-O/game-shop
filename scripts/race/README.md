@@ -68,6 +68,18 @@ this mode exists to earn: *passing the race checks on Vercel, where every
 request is its own process, is evidence that the guarantees live in Postgres
 and not in memory.*
 
+**One local instance against a hosted database is not a supported target.**
+Measured in Phase 6 (spec 006, slice 2): a single `dist/main.js` on a laptop
+with `DATABASE_URL` pointed at Neon (~30 ms per round trip) took the fifty
+webhooks fine and then starved on its own `max: 1` pool — fifty continuations
+queued behind one connection at WAN latency, the supplier stub in the same
+process waited on the same pool and timed out at 2 000 ms, and the waiters
+hit `connectionTimeoutMillis` (10 s) as `500`s. Exactly one key per order,
+still — the guarantees held; the *check* could not complete. That is the
+single-process shape architecture §7 warns about, made visible by latency.
+Four local instances on Docker Postgres, or the deployed shop where every
+request is its own process, are the two shapes these checks are written for.
+
 **The two commands.**
 
 ```sh

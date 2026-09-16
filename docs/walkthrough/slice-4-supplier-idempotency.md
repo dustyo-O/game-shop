@@ -386,7 +386,7 @@ Drizzle wraps every driver error. The outer `DrizzleQueryError` carries the fail
 
 The failure mode is the nasty kind: the guard did not throw, did not warn, and did not look wrong. `error.code` was simply `undefined`, `undefined !== "23505"` is true, and every collision took the rethrow branch. A guard that silently never matches is indistinguishable from a guard that matches and finds nothing to do — until you look at what came back over the wire.
 
-So `isUniqueViolation` walks the `cause` chain instead, bounded to eight levels so a cyclic `cause` cannot spin, and matches structurally on the SQLSTATE rather than on `instanceof pg.DatabaseError`. That is deliberate too: `apps/api` talks to Postgres through Drizzle and does not depend on the driver package, and Phase 6 swaps `pg` for `@neondatabase/serverless` underneath. **The SQLSTATE is the stable part of that contract; the error class is not.**
+So `isUniqueViolation` walks the `cause` chain instead, bounded to eight levels so a cyclic `cause` cannot spin, and matches structurally on the SQLSTATE rather than on `instanceof pg.DatabaseError`. That is deliberate too: `apps/api` talks to Postgres through Drizzle and does not depend on the driver package, and Phase 6 weighed a swap to `@neondatabase/serverless` and kept `pg`; the argument does not depend on which. **The SQLSTATE is the stable part of that contract; the error class is not.**
 
 Two lessons worth carrying, and the second is the more important one.
 
