@@ -1,7 +1,7 @@
 # Technical Specification: Live Shop and the Written Answer
 
 - **Functional Specification:** `context/spec/006-live-shop-and-the-written-answer/functional-spec.md`
-- **Status:** Draft
+- **Status:** Completed
 - **Author(s):** Alexander Shleyko
 
 ---

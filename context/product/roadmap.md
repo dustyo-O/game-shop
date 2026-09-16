@@ -100,11 +100,11 @@ _Concepts to walk away able to explain: why a read-then-increment is a race, and
 
 _Submission. The assignment specifies exactly what the response must contain, and deploying turns the concurrency claims into something the reviewer can verify without cloning anything._
 
-- [ ] **Live and Reproducible** _(~1h)_
-  - [ ] **Deployed to Vercel:** A live URL backed by hosted Postgres. Because serverless functions run as separate processes, passing the race scenarios against the deployed system is itself evidence that correctness lives in the database and not in one process's memory.
-  - [ ] **Race Checks Against the Live System:** The Phase 2 and 5 scripts pointed at the deployed URL, closing the loop on the claim above.
+- [x] **Live and Reproducible** _(~1h)_
+  - [x] **Deployed to Vercel:** A live URL backed by hosted Postgres. Because serverless functions run as separate processes, passing the race scenarios against the deployed system is itself evidence that correctness lives in the database and not in one process's memory.
+  - [x] **Race Checks Against the Live System:** The Phase 2 and 5 scripts pointed at the deployed URL, closing the loop on the claim above.
 
-- [ ] **The Written Answer** _(~1h)_
-  - [ ] **README:** Startup instructions, how to reproduce the race checks, and the short explanation of how single issuance was guaranteed — all explicitly required in the response.
-  - [ ] **Key Decisions and Trade-Offs:** A brief account of the choices made and what was consciously left out. Stating trade-offs reads better than implying none exist.
-  - [ ] **Actual Time Spent:** Reported honestly, as the assignment requires.
+- [x] **The Written Answer** _(~1h)_
+  - [x] **README:** Startup instructions, how to reproduce the race checks, and the short explanation of how single issuance was guaranteed — all explicitly required in the response.
+  - [x] **Key Decisions and Trade-Offs:** A brief account of the choices made and what was consciously left out. Stating trade-offs reads better than implying none exist.
+  - [x] **Actual Time Spent:** Reported honestly, as the assignment requires.

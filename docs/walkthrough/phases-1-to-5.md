@@ -11,6 +11,24 @@
 > Nothing here is new evidence. Every number is quoted from the walkthrough named beside it, which records
 > how it was captured. No source file was read for measurements and none was modified.
 
+> **▸ Phase 6, and what it does to this map.** Phase 6 adds no new argument. It moves the shop to where
+> every request is its own process — one Node function on Vercel with Fluid Compute off, its memory in a
+> Neon Postgres — and runs the **same nine checks** there, unchanged, so it is the **third measurement** of
+> §7's four-process rule (after Phase 2's 20-vs-9 keys and Phase 5's 9-of-20 promo shape): fifty
+> simultaneous reports of one payment answered by `30 distinct instance(s)`, one key; twenty promo
+> applications by 18, three winners; `9/9` twice in a row, with the caveat printed beside every count that a
+> distinct id proves a distinct process and not that the processes overlapped. What it adds beside the
+> measurement is not argument but apparatus: the demo affordances (a one-transaction reset, drain and
+> restock under a sentinel) that make "twice in a row" true against a shop the reviewer cannot `psql` into,
+> a runner that reports what it could not assert as `SKIP` by name, the written answer (`README.md`, in
+> Russian, in the assignment's order), and the time report reconstructed from evidence. So the spine, the
+> answers, the nine joint proofs and the memorised sentences stand as written, and there is **no new
+> appendix**: the one ▸ clause in §1 puts the deployed measurement beside the spine's sentence about
+> "separate processes", which until now was a description of the hosting and is now a number read off it.
+> Everything else — the keystone in plain language, what had to change to run there, the five attempts
+> honestly, the time method, what is not finished — is `phase-6.md`, with the five slice walkthroughs
+> beside it and the recorded transcript in `evidence/`.
+
 > **▸ Phase 4, and what it does to this map.** Phase 4 changes nothing in the concurrency argument. It adds a
 > **face** — the storefront the assignment asked for on its first page, structurally close to the mockup, with
 > exactly five graded interactions and everything else static on instruction — and a **testing layer**: Vitest
@@ -75,7 +93,11 @@ thing the two processes share is Postgres, so Postgres is the only place a decis
 is that rule's second, independent instance — a limit on a counter rather than a key in a pool, one conditional
 `UPDATE … WHERE used_count < max_uses` rather than `FOR UPDATE SKIP LOCKED`, the same broken shape measured the
 same way: nine of twenty for a limit of three across four processes, and exactly three against one (Appendix D,
-Q59–Q61).
+Q59–Q61). **▸** Phase 6 measured the sentence where it is literally true: on the deployed shop, with
+Fluid Compute off, fifty simultaneous reports of one payment were answered by `30 distinct instance(s)`
+that shared nothing but Postgres and produced one key — the third measurement of this rule, with the
+caveat that a distinct id proves a distinct process and not that the processes overlapped (`phase-6.md`
+§3).
 
 Phases 1 and 2 applied that rule to things the shop *can* know: whether this order already has a delivery,
 whether this report has been seen, whether this click is the same intent as the last one. Phase 3 applied it

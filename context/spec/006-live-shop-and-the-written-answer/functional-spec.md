@@ -1,7 +1,7 @@
 # Functional Specification: Live Shop and the Written Answer
 
 - **Roadmap Item:** Phase 6 — Live and Reproducible; The Written Answer
-- **Status:** Draft
+- **Status:** Completed
 - **Author:** Alexander Shleyko
 
 ---
