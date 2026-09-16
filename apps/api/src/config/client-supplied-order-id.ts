@@ -54,6 +54,16 @@
  * `log`, not a `warn` and not silence — visible in a startup transcript if
  * someone goes looking for it, invisible in the sense that matters: nothing
  * about it reads as a problem.
+ *
+ * ---------------------------------------------------------------------------
+ * THE ONE DELIBERATE EXCEPTION: THE PHASE 6 DEMO DEPLOYMENT
+ * ---------------------------------------------------------------------------
+ * The live demo on Vercel sets this flag on purpose — it has no real shoppers,
+ * `pnpm demo:reset` returns it to baseline, and the flag is set there so
+ * `pnpm race before-order` can run against it exactly as it runs against the
+ * local harness (spec 006 §2.2). The `warn` below still fires on every cold
+ * instance, and that is right: the carve-out is a named exception in a
+ * transcript, not a quieter default.
  */
 import { Logger, type Provider } from "@nestjs/common";
 
@@ -116,7 +126,9 @@ export const clientSuppliedOrderIdConfigProvider: Provider = {
           "ALLOW_CLIENT_SUPPLIED_ORDER_ID is set; POST /api/orders will honour a client-supplied " +
           '"id" field verbatim, in place of a server-minted one. This is a test affordance for ' +
           "seeds and scripts/race/before-order.ts ONLY (architecture.md §9) and MUST NEVER be set " +
-          "in an environment reachable by real shoppers.",
+          "in an environment reachable by real shoppers. The Phase 6 demo deployment is the one " +
+          "deliberate exception: no real shoppers, reset by `pnpm demo:reset`, set so " +
+          "`pnpm race before-order` runs against it (spec 006 §2.2).",
         client_supplied_order_id_enabled: true,
       });
     } else {
